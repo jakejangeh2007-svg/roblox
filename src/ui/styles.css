@@ -1,0 +1,128 @@
+/* HUD layer. Controls live above the canvas; only interactive bits enable
+   pointer events so world touches (look/mine/place) pass through elsewhere. */
+
+#crosshair {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 22px;
+  height: 22px;
+  margin: -11px 0 0 -11px;
+  pointer-events: none;
+  opacity: 0.85;
+}
+#crosshair::before,
+#crosshair::after {
+  content: '';
+  position: absolute;
+  background: #fff;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.9);
+}
+#crosshair::before {
+  left: 10px;
+  top: 2px;
+  width: 2px;
+  height: 18px;
+}
+#crosshair::after {
+  top: 10px;
+  left: 2px;
+  height: 2px;
+  width: 18px;
+}
+
+/* --- Touch joystick --- */
+.joystick-base {
+  position: absolute;
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.08);
+  pointer-events: none;
+  display: none;
+  transform: translate(-50%, -50%);
+  z-index: 20;
+}
+.joystick-knob {
+  position: absolute;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.35);
+  border: 2px solid rgba(255, 255, 255, 0.6);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  z-index: 21;
+}
+.joystick-base.active,
+.joystick-knob.active {
+  display: block;
+}
+
+/* --- Touch buttons --- */
+.touch-btn {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.14);
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  color: #fff;
+  font-size: 22px;
+  font-weight: 700;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  z-index: 25;
+}
+.touch-btn:active,
+.touch-btn.toggled {
+  background: rgba(255, 255, 255, 0.32);
+}
+.touch-btn.wide {
+  border-radius: 16px;
+}
+
+/* Right-cluster layout, offset from the safe area. */
+#btn-jump {
+  right: calc(env(safe-area-inset-right) + 24px);
+  bottom: calc(env(safe-area-inset-bottom) + 130px);
+  width: 74px;
+  height: 74px;
+}
+#btn-sneak {
+  right: calc(env(safe-area-inset-right) + 116px);
+  bottom: calc(env(safe-area-inset-bottom) + 60px);
+  width: 62px;
+  height: 62px;
+}
+#btn-action {
+  right: calc(env(safe-area-inset-right) + 30px);
+  bottom: calc(env(safe-area-inset-bottom) + 220px);
+  width: 66px;
+  height: 66px;
+}
+
+/* Only shown on touch devices. */
+body:not(.touch) .touch-only {
+  display: none !important;
+}
+body.touch #desktop-hint {
+  display: none;
+}
+#desktop-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  color: #fff;
+  font-size: 12px;
+  opacity: 0.7;
+  text-align: center;
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}

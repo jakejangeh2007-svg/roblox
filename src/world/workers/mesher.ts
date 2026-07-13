@@ -109,8 +109,14 @@ const FACES: FaceDef[] = [
   },
 ];
 
-/** Face brightness by normal — cheap directional shading (Minecraft-style). */
-const FACE_SHADE = [1.0, 0.5, 0.8, 0.8, 0.6, 0.6];
+/**
+ * Face brightness by normal — cheap directional shading (Minecraft-style).
+ * Order matches FACES: +Y, -Y, -Z, +Z, +X, -X. Sides/bottom are kept fairly
+ * bright because these meshes are unlit (MeshBasicMaterial); until Step 6 adds
+ * dynamic sky/block light, this baked value is the entire lighting model, so a
+ * too-dark floor here reads as near-black in daylight.
+ */
+const FACE_SHADE = [1.0, 0.62, 0.86, 0.86, 0.74, 0.74];
 
 export interface MeshBuffers {
   positions: Float32Array;
@@ -244,7 +250,7 @@ export function meshChunk(grid: NeighborGrid): MeshResult {
             const c = face.corners[ci]!;
             // Corner position relative to block, mapped to the two tangent dirs.
             const ao = cornerAO(grid, x, y, z, face, c);
-            const aoFactor = 0.5 + (ao / 3) * 0.5; // 0.5..1.0
+            const aoFactor = 0.62 + (ao / 3) * 0.38; // 0.62..1.0
             light[ci] = shadeBase * aoFactor;
           }
           // Flip triangulation to the brighter diagonal.

@@ -11,7 +11,10 @@ import * as THREE from 'three';
 
 const TILE = 16;
 const COLS = 16;
-const ROWS = 3; // enough for the current tile count
+// The atlas MUST be a full 16x16-tile grid (256x256) because the mesher's UV
+// math divides both axes by 16. A shorter canvas would make tiles sample
+// undrawn regions. Only the first ~3 rows are used today; the rest is spare.
+const ROWS = 16;
 const SIZE = TILE * COLS;
 
 type RGB = [number, number, number];
@@ -77,7 +80,7 @@ export function buildAtlasTexture(): THREE.Texture {
   if (cached) return cached;
   const canvas = document.createElement('canvas');
   canvas.width = SIZE;
-  canvas.height = TILE * ROWS;
+  canvas.height = TILE * ROWS; // 256x256
   const ctx = canvas.getContext('2d')!;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -194,6 +197,10 @@ export function buildAtlasTexture(): THREE.Texture {
   tex.generateMipmaps = true;
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = 1;
+  // The mesher indexes tiles from the canvas top-left (row = floor(tile/16)).
+  // Three flips V by default, which would invert that mapping and sample the
+  // wrong (undrawn) rows — so disable the flip to keep canvas Y aligned with V.
+  tex.flipY = false;
   cached = tex;
   return tex;
 }
