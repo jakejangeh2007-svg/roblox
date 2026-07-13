@@ -7,6 +7,7 @@
 import type { ToWorker, GeneratedMsg, MeshedMsg, MeshBuffersMsg } from './protocol';
 import { TerrainGenerator } from './terrain';
 import { meshChunk, type NeighborGrid, type MeshBuffers } from './mesher';
+import { computeLight } from './light';
 
 let generator: TerrainGenerator | null = null;
 
@@ -18,14 +19,14 @@ function toMsgBuffers(m: MeshBuffers | null): MeshBuffersMsg | null {
     positions: m.positions.buffer as ArrayBuffer,
     normals: m.normals.buffer as ArrayBuffer,
     uvs: m.uvs.buffer as ArrayBuffer,
-    shade: m.shade.buffer as ArrayBuffer,
+    light: m.light.buffer as ArrayBuffer,
     indices: m.indices.buffer as ArrayBuffer,
   };
 }
 
 function collectTransfers(m: MeshBuffersMsg | null, out: ArrayBuffer[]): void {
   if (!m) return;
-  out.push(m.positions, m.normals, m.uvs, m.shade, m.indices);
+  out.push(m.positions, m.normals, m.uvs, m.light, m.indices);
 }
 
 self.onmessage = (ev: MessageEvent<ToWorker>): void => {
@@ -52,7 +53,10 @@ self.onmessage = (ev: MessageEvent<ToWorker>): void => {
       const grid: NeighborGrid = {
         blocks: msg.neighbors.map((buf) => (buf ? new Uint8Array(buf) : null)),
       };
-      const result = meshChunk(grid);
+      // Compute the center chunk's light volume before meshing.
+      const center = grid.blocks[4];
+      const lightVolume = center ? computeLight(center) : null;
+      const result = meshChunk(grid, lightVolume);
       const opaque = toMsgBuffers(result.opaque);
       const transparent = toMsgBuffers(result.transparent);
       const reply: MeshedMsg = {

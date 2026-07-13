@@ -326,6 +326,115 @@
   .inv-slot .slot-icon { width: 30px; height: 30px; }
 }
 
+/* --- Status bars (hearts / shanks) --- */
+#status-bars {
+  position: absolute;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom) + 66px);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  pointer-events: none;
+  z-index: 21;
+}
+.status-row {
+  display: flex;
+  gap: 2px;
+  justify-content: center;
+}
+.heart,
+.shank {
+  width: 16px;
+  height: 16px;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.7));
+}
+/* Hearts: CSS heart via two circles + rotated square, colored by state. */
+.heart {
+  position: relative;
+  background: #3a1010;
+  clip-path: path('M8 14 L1.6 7.6 A3.6 3.6 0 1 1 8 4 A3.6 3.6 0 1 1 14.4 7.6 Z');
+}
+.heart.full {
+  background: #ff3b3b;
+}
+.heart.half {
+  background: linear-gradient(90deg, #ff3b3b 50%, #3a1010 50%);
+}
+.shank {
+  background: #33240f;
+  clip-path: path('M3 5 A3 3 0 0 1 8 5 A3 3 0 0 1 13 5 C13 10 9 12 8 14 C7 12 3 10 3 5 Z');
+}
+.shank.full {
+  background: #d98a2b;
+}
+.shank.half {
+  background: linear-gradient(270deg, #d98a2b 50%, #33240f 50%);
+}
+@media (max-width: 480px) {
+  .heart, .shank { width: 13px; height: 13px; }
+}
+
+/* --- Container screen (chest / furnace) --- */
+#container-screen {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  z-index: 41;
+  overflow: auto;
+}
+.container-title {
+  color: #fff;
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.container-region {
+  margin-bottom: 8px;
+}
+.furnace-area {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 0;
+}
+.furnace-left {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+.furnace-flame {
+  width: 18px;
+  height: 18px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  display: flex;
+  align-items: flex-end;
+  overflow: hidden;
+}
+.furnace-flame > div {
+  width: 100%;
+  height: 0%;
+  background: linear-gradient(#ffd257, #ff7a1a);
+}
+.furnace-arrow {
+  width: 60px;
+  height: 12px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.furnace-arrow > div {
+  width: 0%;
+  height: 100%;
+  background: #cfcfcf;
+}
+
 /* Only shown on touch devices. */
 body:not(.touch) .touch-only {
   display: none !important;

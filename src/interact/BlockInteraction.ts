@@ -52,6 +52,10 @@ export class BlockInteraction {
   /** Optional hook: return true to consume a use-press on an interactive block
    * (crafting table, furnace, chest) instead of placing. */
   onInteract: ((blockId: number, x: number, y: number, z: number) => boolean) | null = null;
+  /** Called after a block is broken (for tile-entity cleanup, exertion). */
+  onBreak: ((blockId: number, x: number, y: number, z: number) => void) | null = null;
+  /** True on the tick a block was broken; the caller reads and clears it. */
+  minedThisTick = false;
 
   constructor(
     scene: THREE.Scene,
@@ -207,6 +211,8 @@ export class BlockInteraction {
     }
     this.chunks.setBlock(hit.x, hit.y, hit.z, BlockId.Air);
     this.damageHeldTool(held);
+    this.minedThisTick = true;
+    this.onBreak?.(hit.blockId, hit.x, hit.y, hit.z);
   }
 
   private damageHeldTool(held: ItemDef | undefined): void {

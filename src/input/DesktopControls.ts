@@ -81,12 +81,17 @@ export class DesktopControls {
       this.requestLock();
       return;
     }
-    if (e.button === 0) this.input.mining = true;
-    else if (e.button === 2) this.input.primaryPressed = true;
+    if (e.button === 0) {
+      this.input.mining = true;
+    } else if (e.button === 2) {
+      this.input.primaryPressed = true;
+      this.input.using = true;
+    }
   };
 
   private onMouseUp = (e: MouseEvent): void => {
     if (e.button === 0) this.input.mining = false;
+    else if (e.button === 2) this.input.using = false;
   };
 
   private onMouseMove = (e: MouseEvent): void => {

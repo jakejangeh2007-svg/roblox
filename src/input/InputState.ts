@@ -18,6 +18,8 @@ export interface InputState {
   primaryPressed: boolean;
   /** Held: currently mining (break) the targeted block. */
   mining: boolean;
+  /** Held: the use/context action is down (eating food, holding-to-use). */
+  using: boolean;
 }
 
 export function createInputState(): InputState {
@@ -31,5 +33,6 @@ export function createInputState(): InputState {
     lookPitch: 0,
     primaryPressed: false,
     mining: false,
+    using: false,
   };
 }

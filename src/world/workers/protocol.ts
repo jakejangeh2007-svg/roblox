@@ -43,7 +43,8 @@ export interface MeshBuffersMsg {
   positions: ArrayBuffer;
   normals: ArrayBuffer;
   uvs: ArrayBuffer;
-  shade: ArrayBuffer;
+  /** 3 floats/vertex: surface shade, sky light, block light. */
+  light: ArrayBuffer;
   indices: ArrayBuffer;
 }
 

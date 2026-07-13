@@ -122,8 +122,12 @@ export interface MeshBuffers {
   positions: Float32Array;
   normals: Float32Array;
   uvs: Float32Array;
-  /** Per-vertex baked light/AO as a single grayscale factor in [0,1]. */
-  shade: Float32Array;
+  /**
+   * Per-vertex light, 3 floats: (surface = faceShade×AO, sky 0..1, block 0..1).
+   * The chunk shader combines them as surface × max(sky×dayFactor, block), so
+   * time-of-day changes need only a uniform update, not a remesh.
+   */
+  light: Float32Array;
   indices: Uint32Array;
 }
 
@@ -136,7 +140,7 @@ class MeshBuilder {
   positions: number[] = [];
   normals: number[] = [];
   uvs: number[] = [];
-  shade: number[] = [];
+  light: number[] = [];
   indices: number[] = [];
   private vcount = 0;
 
@@ -147,7 +151,10 @@ class MeshBuilder {
     oz: number,
     normal: [number, number, number],
     tile: number,
-    light: [number, number, number, number],
+    /** Per-corner surface shade (faceShade × AO). */
+    surface: [number, number, number, number],
+    sky: number,
+    block: number,
     flip: boolean,
   ): void {
     const col = tile % ATLAS_COLS;
@@ -170,7 +177,7 @@ class MeshBuilder {
       this.positions.push(ox + c[0], oy + c[1], oz + c[2]);
       this.normals.push(normal[0], normal[1], normal[2]);
       this.uvs.push(cuv[i]![0], cuv[i]![1]);
-      this.shade.push(light[i]!);
+      this.light.push(surface[i]!, sky, block);
     }
     this.vcount += 4;
     // Flip the quad's triangulation toward the darker diagonal to avoid AO
@@ -188,7 +195,7 @@ class MeshBuilder {
       positions: new Float32Array(this.positions),
       normals: new Float32Array(this.normals),
       uvs: new Float32Array(this.uvs),
-      shade: new Float32Array(this.shade),
+      light: new Float32Array(this.light),
       indices: new Uint32Array(this.indices),
     };
   }
@@ -204,7 +211,30 @@ function occludes(grid: NeighborGrid, x: number, y: number, z: number): boolean 
   return BLOCKS[sample(grid, x, y, z)]?.opaque ?? false;
 }
 
-export function meshChunk(grid: NeighborGrid): MeshResult {
+const FULL_SKY = 15;
+
+/** Sky/block light at a cell within the center chunk; daylight outside it. */
+function lightAt(
+  lightVolume: Uint8Array | null,
+  x: number,
+  y: number,
+  z: number,
+): { sky: number; block: number } {
+  if (
+    !lightVolume ||
+    x < 0 || x >= CHUNK_SIZE_X ||
+    y < 0 || y >= CHUNK_SIZE_Y ||
+    z < 0 || z >= CHUNK_SIZE_Z
+  ) {
+    // Faces at the chunk border look out into a neighbor we didn't solve; treat
+    // as open daylight so borders stay lit rather than black.
+    return { sky: FULL_SKY, block: 0 };
+  }
+  const v = lightVolume[(y << 8) | (z << 4) | x]!;
+  return { sky: (v >> 4) & 0x0f, block: v & 0x0f };
+}
+
+export function meshChunk(grid: NeighborGrid, lightVolume: Uint8Array | null = null): MeshResult {
   const opaque = new MeshBuilder();
   const transparent = new MeshBuilder();
 
@@ -219,7 +249,8 @@ export function meshChunk(grid: NeighborGrid): MeshResult {
           // Cross sprites (flowers, grass, torch) have transparent texture
           // regions, so they must go in the alpha-tested transparent stream —
           // the opaque material ignores alpha and would render those as black.
-          addCross(transparent, x, y, z, def.tiles[0]);
+          const l = lightAt(lightVolume, x, y, z);
+          addCross(transparent, x, y, z, def.tiles[0], l.sky / 15, l.block / 15);
           continue;
         }
 
@@ -247,19 +278,30 @@ export function meshChunk(grid: NeighborGrid): MeshResult {
           const tile = def.tiles[face.tile]!;
           const shadeBase = FACE_SHADE[f]!;
 
-          // Compute AO for each of the 4 corners.
-          const light: [number, number, number, number] = [1, 1, 1, 1];
+          // Light comes from the cell this face is exposed to (outside cell).
+          const l = lightAt(lightVolume, nx, ny, nz);
+
+          // Compute AO-modulated surface shade for each of the 4 corners.
+          const surface: [number, number, number, number] = [1, 1, 1, 1];
           for (let ci = 0; ci < 4; ci++) {
             const c = face.corners[ci]!;
-            // Corner position relative to block, mapped to the two tangent dirs.
             const ao = cornerAO(grid, x, y, z, face, c);
             const aoFactor = 0.62 + (ao / 3) * 0.38; // 0.62..1.0
-            light[ci] = shadeBase * aoFactor;
+            surface[ci] = shadeBase * aoFactor;
           }
           // Flip triangulation to the brighter diagonal.
-          const flip = light[0] + light[2] < light[1] + light[3];
+          const flip = surface[0] + surface[2] < surface[1] + surface[3];
 
-          builder.addQuad(face.corners, x, y, z, face.normal, tile, light, flip);
+          builder.addQuad(
+            face.corners,
+            x, y, z,
+            face.normal,
+            tile,
+            surface,
+            l.sky / 15,
+            l.block / 15,
+            flip,
+          );
         }
       }
     }
@@ -314,16 +356,24 @@ function cornerAO(
 }
 
 /** Cross-plane sprite (flower, torch, tall grass): two quads in an X. */
-function addCross(builder: MeshBuilder, x: number, y: number, z: number, tile: number): void {
-  const light: [number, number, number, number] = [1, 1, 1, 1];
+function addCross(
+  builder: MeshBuilder,
+  x: number,
+  y: number,
+  z: number,
+  tile: number,
+  sky: number,
+  block: number,
+): void {
+  const full: [number, number, number, number] = [1, 1, 1, 1];
   // Plane 1: diagonal from (0,0,0)->(1,_,1)
   builder.addQuad(
     [[0.15, 0, 0.15], [0.85, 0, 0.85], [0.85, 1, 0.85], [0.15, 1, 0.15]],
-    x, y, z, [0, 1, 0], tile, light, false,
+    x, y, z, [0, 1, 0], tile, full, sky, block, false,
   );
   // Plane 2: opposite diagonal
   builder.addQuad(
     [[0.85, 0, 0.15], [0.15, 0, 0.85], [0.15, 1, 0.85], [0.85, 1, 0.15]],
-    x, y, z, [0, 1, 0], tile, light, false,
+    x, y, z, [0, 1, 0], tile, full, sky, block, false,
   );
 }

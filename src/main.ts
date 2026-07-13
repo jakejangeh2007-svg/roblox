@@ -24,8 +24,19 @@ import { TouchControls } from './input/TouchControls';
 import { DesktopControls } from './input/DesktopControls';
 import { Hotbar } from './ui/Hotbar';
 import { InventoryScreen } from './ui/InventoryScreen';
+import { ContainerScreen } from './ui/ContainerScreen';
+import { StatusBars } from './ui/StatusBars';
 import { BlockInteraction } from './interact/BlockInteraction';
 import { ItemDropManager } from './world/ItemDropManager';
+import { DayNight } from './sim/DayNight';
+import { Survival } from './sim/Survival';
+import {
+  TileEntityManager,
+  newChest,
+  newFurnace,
+  type ChestState,
+  type FurnaceState,
+} from './sim/tileEntities/TileEntities';
 
 const DEFAULT_WORLD_ID = 'default';
 const DAY_SKY = new THREE.Color(0x8fb7ff);
@@ -99,31 +110,79 @@ async function boot(): Promise<void> {
 
   // --- HUD + interaction ----------------------------------------------------
   const hotbar = new Hotbar(hud, inventory);
+  const statusBars = new StatusBars(hud);
   const drops = new ItemDropManager(engine.scene, inventory, isSolidAt);
   const interaction = new BlockInteraction(engine.scene, player, chunks, inventory);
   const inventoryScreen = new InventoryScreen(hud, inventory);
+  const containerScreen = new ContainerScreen(hud, inventory);
 
-  // Mined blocks now spawn physical, magnetizing 3D drops.
-  interaction.onDrop = (item, count, x, y, z) => drops.spawn(item, count, x, y, z);
-  // Overflow when closing the inventory / crafting spills into the world.
-  inventoryScreen.onSpill = (item, count) =>
+  // Survival + world simulation.
+  const survival = new Survival();
+  const tileEntities = new TileEntityManager(store, world.worldId);
+  const dayNight = new DayNight(engine.scene, chunks, world.timeOfDay);
+
+  const spillNearPlayer = (item: number, count: number): void =>
     drops.spawn(item, count, player.position.x, player.position.y + 1, player.position.z);
-  // Using a crafting table opens the 3×3 grid instead of placing.
-  interaction.onInteract = (blockId): boolean => {
+
+  // Mined blocks spawn physical, magnetizing 3D drops.
+  interaction.onDrop = (item, count, x, y, z) => drops.spawn(item, count, x, y, z);
+  inventoryScreen.onSpill = spillNearPlayer;
+  containerScreen.onSpill = spillNearPlayer;
+
+  // Breaking a chest/furnace returns the block and spills its stored contents.
+  interaction.onBreak = (blockId, x, y, z) => {
+    if (blockId === BlockId.Chest || blockId === BlockId.Furnace) {
+      void tileEntities.remove(x, y, z).then((state) => {
+        if (!state) return;
+        if (state.kind === 'chest') {
+          for (const s of state.slots) if (s) spillNearPlayer(s.item, s.count);
+        } else {
+          for (const s of [state.input, state.fuel, state.output]) {
+            if (s) spillNearPlayer(s.item, s.count);
+          }
+        }
+      });
+    }
+  };
+
+  // Using an interactive block opens its screen instead of placing.
+  interaction.onInteract = (blockId, x, y, z): boolean => {
     if (blockId === BlockId.CraftingTable) {
       openInventory(3);
+      return true;
+    }
+    if (blockId === BlockId.Chest) {
+      void tileEntities.getOrCreate(x, y, z, newChest).then((state) => {
+        openContainer();
+        containerScreen.showChest(state as ChestState, () => tileEntities.markDirty(x, y, z));
+      });
+      return true;
+    }
+    if (blockId === BlockId.Furnace) {
+      void tileEntities.getOrCreate(x, y, z, newFurnace).then((state) => {
+        openContainer();
+        containerScreen.showFurnace(state as FurnaceState, () => tileEntities.markDirty(x, y, z));
+      });
       return true;
     }
     return false;
   };
 
-  const openInventory = (width: 2 | 3): void => {
+  const releaseControlsForUI = (): void => {
     if (document.pointerLockElement) document.exitPointerLock();
     input.mining = false;
+    input.using = false;
     input.moveX = 0;
     input.moveZ = 0;
+  };
+  const openInventory = (width: 2 | 3): void => {
+    releaseControlsForUI();
     inventoryScreen.show(width);
   };
+  const openContainer = (): void => {
+    releaseControlsForUI();
+  };
+  const anyScreenOpen = (): boolean => inventoryScreen.isOpen || containerScreen.isOpen;
 
   // Inventory open button (touch) + E/Tab (desktop).
   const invBtn = document.createElement('div');
@@ -140,10 +199,12 @@ async function boot(): Promise<void> {
   window.addEventListener('keydown', (e) => {
     if (e.code === 'KeyE' || e.code === 'Tab') {
       e.preventDefault();
-      if (inventoryScreen.isOpen) inventoryScreen.close();
+      if (containerScreen.isOpen) containerScreen.close();
+      else if (inventoryScreen.isOpen) inventoryScreen.close();
       else openInventory(2);
-    } else if (e.code === 'Escape' && inventoryScreen.isOpen) {
-      inventoryScreen.close();
+    } else if (e.code === 'Escape') {
+      if (containerScreen.isOpen) containerScreen.close();
+      else if (inventoryScreen.isOpen) inventoryScreen.close();
     }
   });
 
@@ -153,8 +214,10 @@ async function boot(): Promise<void> {
   // --- Save on hide/kill ----------------------------------------------------
   const flush = (): void => {
     world.lastPlayed = Date.now();
+    world.timeOfDay = dayNight.time;
     void store.putWorld(world);
     void chunks.flush();
+    void tileEntities.flush();
     void store.putPlayer({
       worldId: world.worldId,
       position: { x: player.position.x, y: player.position.y, z: player.position.z },
@@ -174,6 +237,11 @@ async function boot(): Promise<void> {
   // --- Loop -----------------------------------------------------------------
   let physicsReady = false;
   let sinceSave = 0;
+  let eatTimer = 0;
+  let wasOnGround = true;
+  const EAT_TIME = 1.4;
+  const spawnPoint = { x: 0.5, y: spawnY, z: 0.5 };
+
   engine.setHooks({
     update(dt) {
       chunks.update(player.position.x, player.position.z);
@@ -183,12 +251,55 @@ async function boot(): Promise<void> {
         if (chunks.isLoaded(player.position.x, player.position.z)) physicsReady = true;
         else return;
       }
-      // Pause player physics + world interaction while the inventory is open.
-      if (!inventoryScreen.isOpen) {
+
+      const uiOpen = anyScreenOpen();
+      let blocksMined = 0;
+      let jumped = false;
+
+      if (!uiOpen) {
+        // Eating: holding use/mine while a food item is selected consumes it.
+        const heldDef = inventory.getSelectedDef();
+        if (heldDef?.food && (input.using || input.mining) && player.hunger < player.maxHunger) {
+          input.mining = false; // don't also break blocks while eating
+          eatTimer += dt;
+          if (eatTimer >= EAT_TIME) {
+            eatTimer = 0;
+            survival.eat(player, heldDef.food);
+            inventory.consumeSelected(1);
+          }
+        } else {
+          eatTimer = 0;
+        }
+
         player.update(dt, input, isSolidAt);
         interaction.update(dt, input);
+
+        if (interaction.minedThisTick) {
+          interaction.minedThisTick = false;
+          blocksMined = 1;
+        }
+        if (!player.onGround && wasOnGround) jumped = true;
+        wasOnGround = player.onGround;
+
+        survival.update(dt, player, {
+          sprinting: player.sprinting,
+          jumped,
+          blocksMined,
+        });
+
+        // Respawn on death.
+        if (player.health <= 0) {
+          player.position.set(spawnPoint.x, spawnPoint.y, spawnPoint.z);
+          player.velocity.set(0, 0, 0);
+          player.health = player.maxHealth;
+          player.hunger = Math.max(player.hunger, 10);
+        }
       }
+
       drops.update(dt, player.position.x, player.position.y, player.position.z);
+      tileEntities.update(dt);
+      dayNight.update(dt, player.position);
+      if (containerScreen.isOpen) containerScreen.update();
 
       sinceSave += dt;
       if (sinceSave > 10) {
@@ -199,6 +310,7 @@ async function boot(): Promise<void> {
     render() {
       player.applyToCamera(engine.camera);
       hotbar.render();
+      statusBars.render(player);
 
       // Break-progress bar under the crosshair.
       if (breakBar && breakFill) {
@@ -211,10 +323,12 @@ async function boot(): Promise<void> {
       }
 
       const p = player.position;
+      const clock = (dayNight.time * 24 + 6) % 24; // 0 phase = 6am
       debugEl.textContent =
-        `Voxelcraft dev — step 5/6\n` +
+        `Voxelcraft dev — step 6/6\n` +
         `fps ${engine.fps.toFixed(0)}  chunks ${chunks.loadedCount}  drops ${drops.count}\n` +
-        `xyz ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
+        `xyz ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}  ` +
+        `${String(Math.floor(clock)).padStart(2, '0')}:00 ${dayNight.isNight ? '🌙' : '☀'}\n` +
         `hp ${player.health}/20  food ${player.hunger}/20  ` +
         `${player.onGround ? 'ground' : 'air'}${player.sprinting ? ' sprint' : ''}` +
         `${player.sneaking ? ' sneak' : ''}\n` +
@@ -232,7 +346,11 @@ async function boot(): Promise<void> {
       inventory,
       interaction,
       inventoryScreen,
+      containerScreen,
       drops,
+      dayNight,
+      survival,
+      tileEntities,
       input,
       openInventory,
       teleport(x: number, y: number, z: number, yaw = 0, pitch = 0): void {

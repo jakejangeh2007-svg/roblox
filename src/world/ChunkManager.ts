@@ -19,6 +19,7 @@ import { WorldStore, CHUNK_FORMAT_VERSION, type StoredChunk } from '../storage/W
 import { Chunk, ChunkState } from './Chunk';
 import { BlockId } from './Block';
 import { buildAtlasTexture } from './atlas';
+import { createChunkMaterials, type ChunkMaterials } from './ChunkMaterial';
 import type {
   FromWorker,
   ToWorker,
@@ -40,8 +41,7 @@ export class ChunkManager {
   private readonly loading = new Set<number>();
   private readonly dirty = new Set<number>();
 
-  private readonly opaqueMaterial: THREE.Material;
-  private readonly transparentMaterial: THREE.Material;
+  private readonly materials: ChunkMaterials;
   private readonly group = new THREE.Group();
 
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -62,21 +62,9 @@ export class ChunkManager {
     this.scene.add(this.group);
 
     const atlas = buildAtlasTexture();
-    // Baked face-shading + AO live in vertex colors; MeshBasicMaterial is the
-    // cheapest path on mobile and needs no scene lights. Day/night tint (Step 6)
-    // multiplies material.color.
-    this.opaqueMaterial = new THREE.MeshBasicMaterial({
-      map: atlas,
-      vertexColors: true,
-    });
-    this.transparentMaterial = new THREE.MeshBasicMaterial({
-      map: atlas,
-      vertexColors: true,
-      transparent: true,
-      alphaTest: 0.35,
-      depthWrite: true,
-      side: THREE.DoubleSide,
-    });
+    // Custom light-aware shader: baked surface shade + sky/block light per
+    // vertex, combined with a day/night uniform so time-of-day is free.
+    this.materials = createChunkMaterials(atlas);
 
     this.worker = new GenWorker();
     this.worker.onmessage = (ev: MessageEvent<FromWorker>) => this.onWorkerMessage(ev.data);
@@ -211,9 +199,9 @@ export class ChunkManager {
     const ox = cx * CHUNK_SIZE_X;
     const oz = cz * CHUNK_SIZE_Z;
     const meshes: ChunkMeshes = {
-      opaque: opaque ? this.buildMesh(opaque, this.opaqueMaterial, ox, oz) : null,
+      opaque: opaque ? this.buildMesh(opaque, this.materials.opaque, ox, oz) : null,
       transparent: transparent
-        ? this.buildMesh(transparent, this.transparentMaterial, ox, oz)
+        ? this.buildMesh(transparent, this.materials.transparent, ox, oz)
         : null,
     };
     if (meshes.opaque) this.group.add(meshes.opaque);
@@ -233,16 +221,8 @@ export class ChunkManager {
     geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(buf.normals), 3));
     geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(buf.uvs), 2));
 
-    // Expand single-channel baked shade into an RGB vertex-color attribute.
-    const shade = new Float32Array(buf.shade);
-    const colors = new Float32Array(shade.length * 3);
-    for (let i = 0; i < shade.length; i++) {
-      const s = shade[i]!;
-      colors[i * 3] = s;
-      colors[i * 3 + 1] = s;
-      colors[i * 3 + 2] = s;
-    }
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    // Per-vertex light (surface, sky, block) → the shader's `color` attribute.
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(buf.light), 3));
     geo.setIndex(new THREE.BufferAttribute(new Uint32Array(buf.indices), 1));
     geo.computeBoundingSphere(); // enables Three's per-mesh frustum culling
 
@@ -342,6 +322,11 @@ export class ChunkManager {
     }
     this.dirty.clear();
     if (records.length) await this.store.putChunks(records);
+  }
+
+  /** Update time-of-day lighting on all chunk meshes (one uniform write). */
+  setDay(dayFactor: number, ambient: number, tint: THREE.Color): void {
+    this.materials.setDay(dayFactor, ambient, tint);
   }
 
   get loadedCount(): number {

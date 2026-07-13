@@ -70,8 +70,9 @@ export class TouchControls {
       this.input.sneak = this.sneakToggled;
       this.btnSneak.classList.toggle('toggled', this.sneakToggled);
     });
-    // Action / place: edge-triggered press (Step 4 consumes primaryPressed).
+    // Action button: press = place/use (edge), hold = using (eat food, etc.).
     this.holdButton(btnAction, (down) => {
+      this.input.using = down;
       if (down) this.input.primaryPressed = true;
     });
 

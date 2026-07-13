@@ -86,13 +86,29 @@ describe('meshChunk', () => {
     expect(transparent!.indices.length).toBe(12);
   });
 
-  it('produces per-vertex shade in [0,1]', () => {
+  it('produces per-vertex light (surface, sky, block) in [0,1]', () => {
     const grid = emptyGrid();
     setCenter(grid, 8, 8, 8, BlockId.Stone);
     const { opaque } = meshChunk(grid);
-    for (const s of opaque!.shade) {
+    // 3 floats per vertex; all channels normalized to [0,1].
+    expect(opaque!.light.length).toBe((opaque!.positions.length / 3) * 3);
+    for (const s of opaque!.light) {
       expect(s).toBeGreaterThanOrEqual(0);
       expect(s).toBeLessThanOrEqual(1);
     }
+  });
+
+  it('bakes sky light from the volume: lit faces brighter than dark ones', () => {
+    const grid = emptyGrid();
+    setCenter(grid, 8, 8, 8, BlockId.Stone);
+    // Light volume: top of the block fully sky-lit, everything else dark.
+    const vol = new Uint8Array(65536);
+    // Cell above the block (its +Y neighbor) is sky 15.
+    vol[((9) << 8) | (8 << 4) | 8] = 15 << 4;
+    const { opaque } = meshChunk(grid, vol);
+    // Find max sky channel (index %3===1) — should reach ~1 for the top face.
+    let maxSky = 0;
+    for (let i = 1; i < opaque!.light.length; i += 3) maxSky = Math.max(maxSky, opaque!.light[i]!);
+    expect(maxSky).toBeCloseTo(1, 5);
   });
 });
