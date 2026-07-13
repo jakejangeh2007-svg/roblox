@@ -151,14 +151,18 @@ Each step must pass: `npm run typecheck` && `npm run lint` && `npm test`
 
 1. ✅ **Boilerplate** — Vite+TS+Three scaffold, IndexedDB layer, renderer with
    day-sky clear color, placeholder ground grid, FPS/debug overlay.
-2. **Worker world gen** — infinite chunk streaming, simplex terrain, biomes,
+2. ✅ **Worker world gen** — infinite chunk streaming, simplex terrain, biomes,
    caves, ores, culled meshing, frustum culling.
-3. **Touch HUD + physics** — joystick, buttons, look-drag, AABB collisions,
-   gravity, sprint/sneak/jump.
-4. **Break/place** — DDA raycast, hold-to-mine with crack animation, tap-to-place,
-   block drops.
-5. **Inventory/crafting** — hotbar, full inventory screen, 2×2/3×3 crafting,
-   drag/tap item moving, tools & durability.
-6. **Survival systems** — health/hunger, day/night + dynamic lighting,
-   torch light propagation, furnace/chest/crafting-table tile entities,
-   item drop magnetism, food, fall damage wiring.
+3. ✅ **Touch HUD + physics** — joystick, buttons, look-drag, AABB collisions,
+   gravity, sprint/sneak/jump, fall damage.
+4. ✅ **Break/place** — DDA raycast, hold-to-mine with crack animation, tap-to-place,
+   tool-scaled break speed, block drops, durability.
+5. ✅ **Inventory/crafting** — hotbar, full inventory screen, 2×2/3×3 crafting,
+   tap-to-move item handling, tools & durability, physical magnetizing drops.
+6. ✅ **Survival systems** — health/hunger with regen/starvation/eating,
+   day/night cycle + sun/moon, sky+block voxel lighting via a light-aware chunk
+   shader, torch propagation, furnace/chest/crafting-table tile entities,
+   status bars, respawn.
+
+All six steps complete. 115 unit tests; typecheck, lint, and production build
+green; each step browser-verified under mobile emulation.
