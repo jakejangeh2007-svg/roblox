@@ -75,9 +75,12 @@ const T = {
 };
 
 let cached: THREE.Texture | null = null;
+let cachedCanvas: HTMLCanvasElement | null = null;
+let cachedDataUrl: string | null = null;
 
-export function buildAtlasTexture(): THREE.Texture {
-  if (cached) return cached;
+/** The raw atlas canvas (built on first texture request). */
+function buildAtlasCanvas(): HTMLCanvasElement {
+  if (cachedCanvas) return cachedCanvas;
   const canvas = document.createElement('canvas');
   canvas.width = SIZE;
   canvas.height = TILE * ROWS; // 256x256
@@ -191,6 +194,14 @@ export function buildAtlasTexture(): THREE.Texture {
   }
   speckle(ctx, T.snow, [236, 240, 244], 0.08, 42);
 
+  cachedCanvas = canvas;
+  return canvas;
+}
+
+export function buildAtlasTexture(): THREE.Texture {
+  if (cached) return cached;
+  const canvas = buildAtlasCanvas();
+
   const tex = new THREE.CanvasTexture(canvas);
   tex.magFilter = THREE.NearestFilter;
   tex.minFilter = THREE.NearestMipmapLinearFilter;
@@ -210,4 +221,31 @@ export function tileUV(tile: number): [number, number, number, number] {
   const col = tile % COLS;
   const row = Math.floor(tile / COLS);
   return [col / COLS, row / COLS, (col + 1) / COLS, (row + 1) / COLS];
+}
+
+/** Data-URL of the atlas, for CSS item icons in the DOM HUD. */
+export function getAtlasDataURL(): string {
+  if (cachedDataUrl) return cachedDataUrl;
+  cachedDataUrl = buildAtlasCanvas().toDataURL('image/png');
+  return cachedDataUrl;
+}
+
+export const ATLAS_GRID = COLS;
+
+/**
+ * CSS `background-position` / `background-size` to display a single atlas tile
+ * scaled to `boxPx`, given the tile index. Returns inline style fragments.
+ */
+export function tileIconStyle(tile: number, boxPx: number): {
+  backgroundImage: string;
+  backgroundSize: string;
+  backgroundPosition: string;
+} {
+  const col = tile % COLS;
+  const row = Math.floor(tile / COLS);
+  return {
+    backgroundImage: `url(${getAtlasDataURL()})`,
+    backgroundSize: `${boxPx * COLS}px ${boxPx * COLS}px`,
+    backgroundPosition: `-${col * boxPx}px -${row * boxPx}px`,
+  };
 }

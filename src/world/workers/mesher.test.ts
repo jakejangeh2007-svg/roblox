@@ -74,6 +74,18 @@ describe('meshChunk', () => {
     expect(opaque!.indices.length).toBe(5 * 6);
   });
 
+  it('routes cross sprites (flowers/grass) to the transparent stream', () => {
+    const grid = emptyGrid();
+    setCenter(grid, 5, 5, 5, BlockId.Flower);
+    const { opaque, transparent } = meshChunk(grid);
+    // Cross sprites have transparent pixels → must be alpha-tested (transparent
+    // stream), not opaque (which would render their backgrounds black).
+    expect(opaque).toBeNull();
+    expect(transparent).not.toBeNull();
+    // Two crossed quads → 8 verts, 12 indices.
+    expect(transparent!.indices.length).toBe(12);
+  });
+
   it('produces per-vertex shade in [0,1]', () => {
     const grid = emptyGrid();
     setCenter(grid, 8, 8, 8, BlockId.Stone);

@@ -216,7 +216,10 @@ export function meshChunk(grid: NeighborGrid): MeshResult {
         const def = BLOCKS[id]!;
 
         if (def.render === RenderKind.Cross) {
-          addCross(opaque, x, y, z, def.tiles[0]);
+          // Cross sprites (flowers, grass, torch) have transparent texture
+          // regions, so they must go in the alpha-tested transparent stream —
+          // the opaque material ignores alpha and would render those as black.
+          addCross(transparent, x, y, z, def.tiles[0]);
           continue;
         }
 
