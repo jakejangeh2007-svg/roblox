@@ -49,6 +49,9 @@ export class BlockInteraction {
   breakProgress = 0;
 
   onDrop: DropHandler;
+  /** Optional hook: return true to consume a use-press on an interactive block
+   * (crafting table, furnace, chest) instead of placing. */
+  onInteract: ((blockId: number, x: number, y: number, z: number) => boolean) | null = null;
 
   constructor(
     scene: THREE.Scene,
@@ -119,10 +122,11 @@ export class BlockInteraction {
     this.highlight.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
     this.highlight.visible = true;
 
-    // --- Placing (edge-triggered) -------------------------------------------
+    // --- Use / place (edge-triggered) ---------------------------------------
     if (input.primaryPressed) {
       input.primaryPressed = false;
-      this.tryPlace(hit);
+      const handled = this.onInteract?.(hit.blockId, hit.x, hit.y, hit.z) ?? false;
+      if (!handled) this.tryPlace(hit);
     }
 
     // --- Breaking (held) ----------------------------------------------------

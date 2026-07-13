@@ -223,6 +223,32 @@ export function tileUV(tile: number): [number, number, number, number] {
   return [col / COLS, row / COLS, (col + 1) / COLS, (row + 1) / COLS];
 }
 
+const tileTexCache = new Map<number, THREE.Texture>();
+
+/**
+ * A standalone 16×16 texture cropped from a single atlas tile — used by 3D item
+ * drops so a plain cube/quad shows the full icon without atlas-UV math.
+ */
+export function getTileTexture(tile: number): THREE.Texture {
+  const existing = tileTexCache.get(tile);
+  if (existing) return existing;
+  const src = buildAtlasCanvas();
+  const col = tile % COLS;
+  const row = Math.floor(tile / COLS);
+  const c = document.createElement('canvas');
+  c.width = TILE;
+  c.height = TILE;
+  const ctx = c.getContext('2d')!;
+  ctx.drawImage(src, col * TILE, row * TILE, TILE, TILE, 0, 0, TILE, TILE);
+  const tex = new THREE.CanvasTexture(c);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tileTexCache.set(tile, tex);
+  return tex;
+}
+
 /** Data-URL of the atlas, for CSS item icons in the DOM HUD. */
 export function getAtlasDataURL(): string {
   if (cachedDataUrl) return cachedDataUrl;

@@ -190,6 +190,142 @@
   transform-origin: left;
 }
 
+/* --- Inventory open button (hotbar-adjacent) --- */
+#btn-inventory {
+  position: absolute;
+  right: calc(env(safe-area-inset-right) + 8px);
+  bottom: calc(env(safe-area-inset-bottom) + 8px);
+  width: 48px;
+  height: 48px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  color: #fff;
+  font-size: 22px;
+  font-weight: 700;
+  pointer-events: auto;
+  z-index: 23;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* --- Inventory screen --- */
+#inventory-screen {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  z-index: 40;
+  overflow: auto;
+}
+.inv-panel {
+  background: rgba(30, 30, 34, 0.96);
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-radius: 12px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 96vw;
+}
+.inv-top {
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+.inv-craft {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.craft-grid {
+  display: grid;
+  gap: 3px;
+}
+.craft-arrow {
+  color: #fff;
+  font-size: 22px;
+}
+.inv-armor {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+.inv-grid {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 3px;
+}
+.inv-hotbar {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.15);
+}
+.inv-slot {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+}
+.inv-slot .slot-icon {
+  width: 40px;
+  height: 40px;
+}
+.inv-slot .slot-count {
+  right: 2px;
+  bottom: 0;
+}
+.inv-slot[data-craft='out'] {
+  border-color: #ffd257;
+  background: rgba(255, 210, 87, 0.12);
+}
+.inv-controls {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.inv-btn {
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.inv-btn.active {
+  background: rgba(120, 200, 120, 0.35);
+}
+.inv-cursor {
+  position: fixed;
+  width: 40px;
+  height: 40px;
+  margin: -20px 0 0 -20px;
+  image-rendering: pixelated;
+  background-repeat: no-repeat;
+  pointer-events: none;
+  z-index: 50;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  text-shadow: 1px 1px 0 #000;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+}
+@media (max-width: 480px) {
+  .inv-slot { width: 34px; height: 34px; }
+  .inv-slot .slot-icon { width: 30px; height: 30px; }
+}
+
 /* Only shown on touch devices. */
 body:not(.touch) .touch-only {
   display: none !important;

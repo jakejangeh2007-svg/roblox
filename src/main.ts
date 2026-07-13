@@ -23,7 +23,9 @@ import { createInputState } from './input/InputState';
 import { TouchControls } from './input/TouchControls';
 import { DesktopControls } from './input/DesktopControls';
 import { Hotbar } from './ui/Hotbar';
+import { InventoryScreen } from './ui/InventoryScreen';
 import { BlockInteraction } from './interact/BlockInteraction';
+import { ItemDropManager } from './world/ItemDropManager';
 
 const DEFAULT_WORLD_ID = 'default';
 const DAY_SKY = new THREE.Color(0x8fb7ff);
@@ -97,7 +99,54 @@ async function boot(): Promise<void> {
 
   // --- HUD + interaction ----------------------------------------------------
   const hotbar = new Hotbar(hud, inventory);
+  const drops = new ItemDropManager(engine.scene, inventory, isSolidAt);
   const interaction = new BlockInteraction(engine.scene, player, chunks, inventory);
+  const inventoryScreen = new InventoryScreen(hud, inventory);
+
+  // Mined blocks now spawn physical, magnetizing 3D drops.
+  interaction.onDrop = (item, count, x, y, z) => drops.spawn(item, count, x, y, z);
+  // Overflow when closing the inventory / crafting spills into the world.
+  inventoryScreen.onSpill = (item, count) =>
+    drops.spawn(item, count, player.position.x, player.position.y + 1, player.position.z);
+  // Using a crafting table opens the 3×3 grid instead of placing.
+  interaction.onInteract = (blockId): boolean => {
+    if (blockId === BlockId.CraftingTable) {
+      openInventory(3);
+      return true;
+    }
+    return false;
+  };
+
+  const openInventory = (width: 2 | 3): void => {
+    if (document.pointerLockElement) document.exitPointerLock();
+    input.mining = false;
+    input.moveX = 0;
+    input.moveZ = 0;
+    inventoryScreen.show(width);
+  };
+
+  // Inventory open button (touch) + E/Tab (desktop).
+  const invBtn = document.createElement('div');
+  invBtn.id = 'btn-inventory';
+  invBtn.className = 'touch-only';
+  invBtn.textContent = '⋯';
+  invBtn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (inventoryScreen.isOpen) inventoryScreen.close();
+    else openInventory(2);
+  });
+  hud.appendChild(invBtn);
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyE' || e.code === 'Tab') {
+      e.preventDefault();
+      if (inventoryScreen.isOpen) inventoryScreen.close();
+      else openInventory(2);
+    } else if (e.code === 'Escape' && inventoryScreen.isOpen) {
+      inventoryScreen.close();
+    }
+  });
+
   const breakBar = document.getElementById('break-progress') as HTMLDivElement | null;
   const breakFill = breakBar?.firstElementChild as HTMLDivElement | null;
 
@@ -134,8 +183,12 @@ async function boot(): Promise<void> {
         if (chunks.isLoaded(player.position.x, player.position.z)) physicsReady = true;
         else return;
       }
-      player.update(dt, input, isSolidAt);
-      interaction.update(dt, input);
+      // Pause player physics + world interaction while the inventory is open.
+      if (!inventoryScreen.isOpen) {
+        player.update(dt, input, isSolidAt);
+        interaction.update(dt, input);
+      }
+      drops.update(dt, player.position.x, player.position.y, player.position.z);
 
       sinceSave += dt;
       if (sinceSave > 10) {
@@ -159,8 +212,8 @@ async function boot(): Promise<void> {
 
       const p = player.position;
       debugEl.textContent =
-        `Voxelcraft dev — step 4/6\n` +
-        `fps ${engine.fps.toFixed(0)}  chunks ${chunks.loadedCount}\n` +
+        `Voxelcraft dev — step 5/6\n` +
+        `fps ${engine.fps.toFixed(0)}  chunks ${chunks.loadedCount}  drops ${drops.count}\n` +
         `xyz ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
         `hp ${player.health}/20  food ${player.hunger}/20  ` +
         `${player.onGround ? 'ground' : 'air'}${player.sprinting ? ' sprint' : ''}` +
@@ -178,7 +231,10 @@ async function boot(): Promise<void> {
       engine,
       inventory,
       interaction,
+      inventoryScreen,
+      drops,
       input,
+      openInventory,
       teleport(x: number, y: number, z: number, yaw = 0, pitch = 0): void {
         player.position.set(x, y, z);
         player.velocity.set(0, 0, 0);
