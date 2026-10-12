@@ -42,7 +42,7 @@ local function release(direction: FartPhysics.Direction, heldTime: number)
 end
 
 local function onAction(actionName: string, state: Enum.UserInputState, _input: InputObject): Enum.ContextActionResult
-	local direction = ACTIONS[actionName]
+	local direction: FartPhysics.Direction? = ACTIONS[actionName]
 	if not direction or not RiderState.isSeated() then
 		-- not on a boat: let the keys do their normal job (like walking)
 		return Enum.ContextActionResult.Pass

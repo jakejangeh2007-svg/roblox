@@ -28,7 +28,7 @@ local recentMegas: { [BoatService.Boat]: { Mega } } = {}
 -- Farted within FARTQUAKE_WINDOW, it's a FARTQUAKE: returns true plus the
 -- combined push and spin of those Megas, so the bonus can be added on top.
 local function registerMega(boat: BoatService.Boat, mega: Mega): (boolean, Vector3, number)
-	local list = recentMegas[boat] or {}
+	local list: { Mega } = recentMegas[boat] or {}
 	recentMegas[boat] = list
 	for i = #list, 1, -1 do
 		if mega.time - list[i].time > Config.FARTQUAKE_WINDOW then
