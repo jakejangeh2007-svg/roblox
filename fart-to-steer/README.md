@@ -22,21 +22,37 @@ What's in this first version is milestone **M0, the fun test** from the
 
 You need **Git**, **Rokit** (installs Rojo for you) and **Roblox Studio**.
 
-1. **Install Git** from <https://git-scm.com> if you don't have it.
+> **Windows:** use a normal PowerShell window, **not** "Run as administrator". An
+> administrator window starts in `C:\WINDOWS\system32`, which is the wrong place for
+> your game files. Run one command at a time so you can see if one fails.
+
+1. **Install Git.**
+   - **Windows:** in PowerShell run
+     ```powershell
+     winget install --id Git.Git -e --source winget
+     ```
+     If `winget` isn't found, download the installer from <https://git-scm.com/download/win>
+     and click Next through it with the default options.
+   - **Mac:** run `git --version` in Terminal and accept the offer to install it.
+
+   **Close the terminal and open a new one**, otherwise it won't find `git`.
 
 2. **Install Rokit.**
-   - **Windows:** open PowerShell and run
+   - **Windows:** in PowerShell run
      ```powershell
      Invoke-RestMethod https://raw.githubusercontent.com/rojo-rbx/rokit/main/scripts/install.ps1 | Invoke-Expression
      ```
-   - **Mac:** open Terminal and run
+   - **Mac:** in Terminal run
      ```bash
      curl -sSf https://raw.githubusercontent.com/rojo-rbx/rokit/main/scripts/install.sh | bash
      ```
-   Close and reopen the terminal afterwards.
+   **Close the terminal and open a new one** again. Check both worked with
+   `git --version` and `rokit --version`. Each should print a version number.
 
-3. **Download the code** (pick any folder you like):
+3. **Download the code** into your home folder. If GitHub asks you to sign in,
+   sign in with your GitHub account in the browser window that opens.
    ```bash
+   cd ~
    git clone https://github.com/jakejangeh2007-svg/roblox.git
    cd roblox
    git checkout claude/determined-gates-6stlty
@@ -59,8 +75,9 @@ You need **Git**, **Rokit** (installs Rojo for you) and **Roblox Studio**.
 
 ## Every time you work on the game
 
-1. In a terminal, in the `fart-to-steer` folder, run:
+1. Open a terminal, go to the `fart-to-steer` folder and start Rojo:
    ```bash
+   cd ~/roblox/fart-to-steer
    rojo serve
    ```
    Leave it running.
