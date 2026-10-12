@@ -723,6 +723,9 @@ gets the game out sooner.
 If spinning and pushing with friends isn't funny in grey-box, change the numbers in
 section 13 until it is, before building any islands.
 
+The M0 prototype is in [`fart-to-steer/`](../../fart-to-steer/README.md) as a Rojo
+project. Its README explains how to sync it into Roblox Studio.
+
 ---
 
 ## 15. Playtesting

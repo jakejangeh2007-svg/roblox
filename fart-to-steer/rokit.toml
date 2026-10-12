@@ -1,0 +1,6 @@
+# Tools for this project. Install them all by running `rokit install` in this folder.
+
+[tools]
+rojo = "rojo-rbx/rojo@7.7.1"
+stylua = "JohnnyMorganz/StyLua@2.6.0"
+selene = "Kampfkarren/selene@0.31.0"
