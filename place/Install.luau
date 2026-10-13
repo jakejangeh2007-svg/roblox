@@ -287,8 +287,11 @@ return TableUtil
 --   - LAUNCH_DELAY after the leader starts the run early
 -- If nobody is aboard when it's time to leave, it's removed instead.
 -- On the river it moves under physics that the server runs: its Hull (the Hull class)
--- is stepped by WaterService every frame. Riders weigh what they weigh, but while it's
--- out there they don't bump into anything, so only the hull touches the world.
+-- is stepped by WaterService every frame.
+-- Riders don't sit in the boat: they hang on to the outside of it at their seat
+-- (RiderConfig.HANG_OFFSET), with their legs in the water. They weigh what they weigh,
+-- but while they're on a boat they don't bump into anything, so only the hull touches
+-- the world. RiderService poses them on every player's screen.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
 --   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
@@ -297,10 +300,10 @@ return TableUtil
 --                 WeldConstraints (directly or through other welded parts).
 --   Physics       every part gets BoatConfig's slippery, slightly bouncy HULL_ settings,
 --                 keeping its own density.
---   Seats         one Seat per player. The number of Seats must match the size the
---                 template is listed under in BoatConfig.TEMPLATE_NAMES. Put them around
---                 the edge facing the middle. A one-seat boat can have its seat in the
---                 middle, facing forward.
+--   Seats         one Seat per player: where they hold on. The number of Seats must match
+--                 the size the template is listed under in BoatConfig.TEMPLATE_NAMES. Put
+--                 them on the rim, around the edge, facing the middle; each rider hangs
+--                 outside their seat at RiderConfig.HANG_OFFSET.
 --
 -- States: Docked -> Launched -> Destroyed. The model's State, LeaderUserId and
 -- DepartureTime attributes (see BoatServiceShared) mirror this for clients.
@@ -312,6 +315,7 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
 local Hull = require(ServerScriptService.Classes.Hull)
+local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
 local Boat = {}
@@ -325,6 +329,7 @@ type BoatMembers = {
 	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	Hull: Hull.Hull?, -- how it moves on the river; made when it launches
+	SeatRiders: { [Seat]: Player }, -- who is hanging on at each seat right now
 	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
@@ -351,6 +356,15 @@ local function EjectFromSeat(seat: Seat)
 	local seatWeld = seat:FindFirstChild("SeatWeld")
 	if seatWeld then
 		seatWeld:Destroy()
+	end
+end
+
+-- Moves whoever is in `seat` to hang on outside it, instead of sitting on it.
+local function HangFromSeat(seat: Seat)
+	local seatWeld = seat:FindFirstChild("SeatWeld")
+	if seatWeld and seatWeld:IsA("Weld") then
+		seatWeld.C0 = RiderConfig.HANG_OFFSET
+		seatWeld.C1 = CFrame.identity
 	end
 end
 
@@ -440,6 +454,7 @@ function Boat.new(
 			Frozen = false,
 			Crew = {},
 			Hull = nil,
+			SeatRiders = {},
 			RiderParts = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
@@ -475,6 +490,16 @@ function Boat.new(
 			self.Connections,
 			seat:GetPropertyChangedSignal("Occupant"):Connect(function()
 				self:OnSeatChanged(seat)
+			end)
+		)
+		-- Roblox welds a rider to their seat when they sit; once it has, move them to
+		-- hang on outside it.
+		table.insert(
+			self.Connections,
+			seat.ChildAdded:Connect(function(child)
+				if child.Name == "SeatWeld" then
+					task.defer(HangFromSeat, seat)
+				end
 			end)
 		)
 	end
@@ -544,12 +569,25 @@ function Boat.OnSeatChanged(self: Boat, seat: Seat)
 	if self.State == "Destroyed" then
 		return
 	end
+	-- Whoever was hanging on here has let go.
+	local previousRider = self.SeatRiders[seat]
+	if previousRider then
+		self.SeatRiders[seat] = nil
+		self:ReleaseRider(previousRider)
+	end
+
 	local isLaunched = self.State == "Launched"
 	local humanoid = seat.Occupant
-	if humanoid and (isLaunched or not GetPlayerInSeat(seat)) then
+	local rider = GetPlayerInSeat(seat)
+	if humanoid and (isLaunched or not rider) then
 		-- Only players ride, and nobody climbs aboard after launch.
 		EjectFromSeat(seat)
 		return
+	end
+	if rider then
+		self.SeatRiders[seat] = rider
+		self:PrepareRider(rider)
+		HangFromSeat(seat)
 	end
 
 	if isLaunched then
@@ -645,16 +683,13 @@ function Boat.Launch(self: Boat)
 	self:SetState("Launched")
 	self.Model:SetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE, nil)
 	self:MoveTo(self.LaunchCFrame)
-	for _, player in self.Crew do
-		self:PrepareRider(player)
-	end
 	local primaryPart = self.Model.PrimaryPart
 	if primaryPart then
 		self.Hull = Hull.new(primaryPart)
 	end
 end
 
--- For the ride, `player`'s body doesn't bump into anything; only the hull does.
+-- While `player` hangs on, their body doesn't bump into anything; only the hull does.
 function Boat.PrepareRider(self: Boat, player: Player)
 	local character = player.Character
 	if not character or self.RiderParts[player] then
@@ -700,7 +735,6 @@ function Boat.RemoveMissingCrew(self: Boat)
 		local player = self.Crew[index]
 		if not table.find(seatedPlayers, player) then
 			table.remove(self.Crew, index)
-			self:ReleaseRider(player)
 			self.CrewMemberLeft:Fire(player)
 		end
 	end
@@ -724,6 +758,7 @@ function Boat.Destroy(self: Boat)
 	for player in self.RiderParts do
 		self:ReleaseRider(player)
 	end
+	table.clear(self.SeatRiders)
 	if wasLaunched then
 		for _, player in self.Crew do
 			self.CrewMemberLeft:Fire(player)
@@ -2551,8 +2586,8 @@ function FartServiceServer.StopStream(self: FartServiceServer, player: Player, n
 	end
 end
 
--- The pushes from `boat`'s crew's farts right now: each rider's fart as a force at
--- their seat. Hull does the physics of what they do to the boat.
+-- The pushes from `boat`'s crew's farts right now: each rider's fart as a force where
+-- their body hangs on to the boat. Hull does the physics of what they do to the boat.
 function FartServiceServer.GetFartForces(self: FartServiceServer, boat: Boat.Boat): { Hull.AppliedForce }
 	local forces: { Hull.AppliedForce } = {}
 	if not boat:IsFloating() then
@@ -2563,8 +2598,10 @@ function FartServiceServer.GetFartForces(self: FartServiceServer, boat: Boat.Boa
 		local output = self.Outputs[player]
 		local seat = if output then boat:GetSeatOf(player) else nil
 		if output and seat then
+			local character = player.Character
+			local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
 			table.insert(forces, {
-				Position = seat.Position,
+				Position = if rootPart and rootPart:IsA("BasePart") then rootPart.Position else seat.Position,
 				Force = FartPhysics.GetForce(boatPosition, seat.CFrame, output.Forward, output.Right),
 			})
 		end
@@ -3072,7 +3109,7 @@ local FartConfig = {
 
 	-- Effects. They grow with the fart's strength, from when it starts to full acceleration.
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
-	GAS_ANGLE = math.rad(90), -- how far round from straight back the gas comes out on a Left/Right fart (90 = straight out the side)
+	AIM_ANGLE = math.rad(90), -- how far a rider twists round to aim their butt on a Left/Right fart (90 = straight out to the side)
 	MIN_PARTICLE_RATE = 20, -- particles per second when a fart starts...
 	MAX_PARTICLE_RATE = 60, -- ...and at full acceleration
 	MAX_PARTICLE_SPEED_MULTIPLIER = 2.5, -- the cloud's Speed is multiplied by up to this at full acceleration
@@ -3088,6 +3125,35 @@ local FartConfig = {
 }
 
 return FartConfig
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Game" },
+		Name = "RiderConfig",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Modules.Game.RiderConfig
+--
+-- Riders hang on to the outside of their boat instead of sitting in it.
+
+local RiderConfig = {
+	-- Where a rider's HumanoidRootPart goes, from their Seat (the Boat class puts them
+	-- there). Seats face the middle of the boat, so +Z is outward: this hangs riders just
+	-- below and outside their seat, with their arms over the side and their legs in the water.
+	HANG_OFFSET = CFrame.new(0, -0.35, 1),
+
+	-- Their pose while they hang on (RiderService, on every player's screen)
+	ARM_REACH = math.rad(60), -- arms raised forward this far from hanging down, to hold on to the boat
+	ELBOW_BEND = math.rad(15),
+	KNEE_BEND = math.rad(15),
+	KICK_ANGLE = math.rad(10), -- legs kick back and forth this far in the water...
+	KICK_SPEED = 5, -- ...this fast (radians of the kick cycle per second)
+	-- Farting Left or Right, a rider twists round to aim their butt that way: see
+	-- FartConfig.AIM_ANGLE.
+}
+
+return RiderConfig
 ]==],
 	},
 	{
@@ -3838,8 +3904,7 @@ local localPlayer = Players.LocalPlayer
 -- One player's fart that's happening right now, and its effects.
 type Stream = {
 	Direction: string,
-	Butt: Attachment, -- where the gas comes out; it turns to aim the gas
-	GasAngle: number, -- radians the gas is aimed to the side right now; it swings toward the direction's angle
+	Butt: Attachment, -- where the gas comes out; it turns with the rider's aim
 	Emitter: ParticleEmitter?,
 	Sound: Sound?,
 	BasePitch: number,
@@ -3852,6 +3917,7 @@ type FartServiceClientMembers = {
 	LocalDirection: FartPhysics.Direction?, -- the direction the local player is farting, if they are
 	Streams: { [Player]: Stream }, -- everyone farting right now, the local player included
 	RampTimes: { [Player]: number }, -- how far each player's fart has built up, the same way the server works it out
+	AimAngles: { [Player]: number }, -- how far each rider has twisted round to aim their butt (radians, missing = not at all)
 	Random: Random,
 	FartCloudTemplate: ParticleEmitter?,
 	FartSounds: { Sound },
@@ -3872,16 +3938,21 @@ local function IsRiding(): boolean
 	return boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
 end
 
--- Which way the gas comes out, turned from straight behind the rider: a Left fart goes
--- out to the rider's left (a negative turn of the butt attachment points its back toward
--- their left), a Right fart to their right.
-local function GetGasAngle(direction: string): number
+-- How far a rider twists round (about the vertical, radians) to aim their butt for a
+-- fart in `direction` (nil when not farting): a Left fart aims it out to their left (a
+-- negative turn points their back to their left), a Right fart to their right.
+local function GetAimTarget(direction: string?): number
 	if direction == "Left" then
-		return -FartConfig.GAS_ANGLE
+		return -FartConfig.AIM_ANGLE
 	elseif direction == "Right" then
-		return FartConfig.GAS_ANGLE
+		return FartConfig.AIM_ANGLE
 	end
 	return 0
+end
+
+-- Where a rider's butt is, on their HumanoidRootPart, when they've twisted round by `aimAngle`.
+local function GetButtCFrame(aimAngle: number): CFrame
+	return CFrame.Angles(0, aimAngle, 0) * FartConfig.BUTT_OFFSET
 end
 
 local function GetLocalGas(): number
@@ -3919,6 +3990,7 @@ function FartServiceClient.Init(self: FartServiceClient)
 	self.LocalDirection = nil
 	self.Streams = {}
 	self.RampTimes = {}
+	self.AimAngles = {}
 	self.Random = Random.new()
 	self.RequestStartFartRemote = nil
 	self.RequestStopFartRemote = nil
@@ -4048,9 +4120,15 @@ function FartServiceClient.SetLocalDirection(self: FartServiceClient, direction:
 	end
 end
 
+-- How far `player` has twisted round to aim their butt (radians about the vertical;
+-- negative is toward their left). RiderService turns their body by this.
+function FartServiceClient.GetAimAngle(self: FartServiceClient, player: Player): number
+	return self.AimAngles[player] or 0
+end
+
 -- Every frame: build up (or fade) everyone's fart strength, grow each fart's effects
--- with it, swing each fart's gas round to where it's aimed, and stop the local fart if
--- the player ran out of gas or isn't riding any more.
+-- with it, twist each rider round to aim their butt, and stop the local fart if the
+-- player ran out of gas or isn't riding any more.
 function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 	if self.LocalDirection and (GetLocalGas() <= 0 or not IsRiding()) then
 		table.clear(self.HeldDirections)
@@ -4067,10 +4145,7 @@ function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 			end
 		end
 	end
-	-- The gas swings round as fast as the push it makes (FartConfig.PUSH_RESPONSE_TIME).
-	local gasBlend = if FartConfig.PUSH_RESPONSE_TIME > 0
-		then 1 - math.exp(-deltaTime / FartConfig.PUSH_RESPONSE_TIME)
-		else 1
+	self:UpdateAim(deltaTime)
 	for player, stream in self.Streams do
 		if not player.Parent then
 			self:StopStream(player)
@@ -4080,15 +4155,7 @@ function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 		local rampTime = FartPhysics.UpdateRampTime(self.RampTimes[player] or 0, true, deltaTime)
 		self.RampTimes[player] = rampTime
 
-		local targetAngle = GetGasAngle(stream.Direction)
-		if stream.GasAngle ~= targetAngle then
-			stream.GasAngle += (targetAngle - stream.GasAngle) * gasBlend
-			if math.abs(targetAngle - stream.GasAngle) < 1e-3 then
-				stream.GasAngle = targetAngle
-			end
-			stream.Butt.CFrame = FartConfig.BUTT_OFFSET * CFrame.Angles(0, stream.GasAngle, 0)
-		end
-
+		stream.Butt.CFrame = GetButtCFrame(self:GetAimAngle(player))
 		local progress = FartPhysics.GetRampProgress(rampTime)
 		local emitter = stream.Emitter
 		local template = self.FartCloudTemplate
@@ -4108,6 +4175,32 @@ function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 end
 
 -- The attachment and emitter at a player's butt, made the first time they fart.
+-- Twists every rider toward where their fart is aimed, or back to facing the boat once
+-- they stop, as fast as the push itself swings round (FartConfig.PUSH_RESPONSE_TIME).
+function FartServiceClient.UpdateAim(self: FartServiceClient, deltaTime: number)
+	local blend = if FartConfig.PUSH_RESPONSE_TIME > 0
+		then 1 - math.exp(-deltaTime / FartConfig.PUSH_RESPONSE_TIME)
+		else 1
+	for player in self.Streams do
+		if not self.AimAngles[player] then
+			self.AimAngles[player] = 0
+		end
+	end
+	for player, aimAngle in self.AimAngles do
+		local stream = self.Streams[player]
+		local targetAngle = GetAimTarget(if stream then stream.Direction else nil)
+		local newAngle = aimAngle + (targetAngle - aimAngle) * blend
+		if math.abs(targetAngle - newAngle) < 1e-3 then
+			newAngle = targetAngle
+		end
+		if (newAngle == 0 and not stream) or not player.Parent then
+			self.AimAngles[player] = nil
+		else
+			self.AimAngles[player] = newAngle
+		end
+	end
+end
+
 function FartServiceClient.GetButt(self: FartServiceClient, player: Player): (Attachment?, ParticleEmitter?)
 	local character = player.Character
 	local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
@@ -4149,8 +4242,7 @@ function FartServiceClient.StartStream(self: FartServiceClient, player: Player, 
 	if not butt then
 		return
 	end
-	local gasAngle = GetGasAngle(direction)
-	butt.CFrame = FartConfig.BUTT_OFFSET * CFrame.Angles(0, gasAngle, 0)
+	butt.CFrame = GetButtCFrame(self:GetAimAngle(player))
 	if emitter then
 		emitter.Enabled = true
 	end
@@ -4170,7 +4262,6 @@ function FartServiceClient.StartStream(self: FartServiceClient, player: Player, 
 	self.Streams[player] = {
 		Direction = direction,
 		Butt = butt,
-		GasAngle = gasAngle,
 		Emitter = emitter,
 		Sound = sound,
 		BasePitch = basePitch,
@@ -4203,7 +4294,7 @@ function FartServiceClient.PlayDudEffect(self: FartServiceClient, player: Player
 	if self.Streams[player] then
 		return -- already farting; the stream's effects are showing
 	end
-	butt.CFrame = FartConfig.BUTT_OFFSET
+	butt.CFrame = GetButtCFrame(self:GetAimAngle(player))
 	local template = self.FartCloudTemplate
 	if emitter and template then
 		emitter.Speed = template.Speed
@@ -4244,6 +4335,138 @@ local FartServiceShared = {
 }
 
 return FartServiceShared
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "RiderService" },
+		Name = "RiderServiceClient",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.RiderService.RiderServiceClient
+--
+-- Poses every player riding a boat, on this player's screen. Riders hang on to the
+-- outside of their boat (the server puts them there; see the Boat class), and this gives
+-- them the pose to match: arms reaching over the side, legs kicking in the water, and
+-- their whole body twisted round to aim their butt the way they're farting
+-- (FartServiceClient:GetAimAngle). It overrides their animation every frame, so it
+-- needs no animation assets, and works for R15 and R6 characters. All the angles are in
+-- RiderConfig.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local FartServiceClient = require(ReplicatedStorage.Shared.Services.FartService.FartServiceClient)
+local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
+
+-- The joints a rider is posed by, by what they do (Root turns the whole body).
+type Rig = { [string]: Motor6D }
+
+-- Where each joint is, as { the part it's in, its name }.
+local R15_JOINTS: { [string]: { string } } = {
+	Root = { "LowerTorso", "Root" },
+	RightShoulder = { "RightUpperArm", "RightShoulder" },
+	LeftShoulder = { "LeftUpperArm", "LeftShoulder" },
+	RightElbow = { "RightLowerArm", "RightElbow" },
+	LeftElbow = { "LeftLowerArm", "LeftElbow" },
+	RightHip = { "RightUpperLeg", "RightHip" },
+	LeftHip = { "LeftUpperLeg", "LeftHip" },
+	RightKnee = { "RightLowerLeg", "RightKnee" },
+	LeftKnee = { "LeftLowerLeg", "LeftKnee" },
+}
+local R6_JOINTS: { [string]: { string } } = {
+	Root = { "HumanoidRootPart", "RootJoint" },
+	RightShoulder = { "Torso", "Right Shoulder" },
+	LeftShoulder = { "Torso", "Left Shoulder" },
+	RightHip = { "Torso", "Right Hip" },
+	LeftHip = { "Torso", "Left Hip" },
+}
+
+local RiderServiceClient = {}
+
+type RiderServiceClientMembers = {
+	Rigs: { [Model]: Rig }, -- each rider's joints, found the first time they're posed
+}
+
+export type RiderServiceClient = typeof(RiderServiceClient) & RiderServiceClientMembers
+
+-- `character`'s joints for posing.
+local function FindRig(character: Model, humanoid: Humanoid): Rig
+	local jointPlaces: { [string]: { string } } = if humanoid.RigType == Enum.HumanoidRigType.R15
+		then R15_JOINTS
+		else R6_JOINTS
+	local rig: Rig = {}
+	for role, place in jointPlaces do
+		local part = character:FindFirstChild(place[1])
+		local joint = if part then part:FindFirstChild(place[2]) else nil
+		if joint and joint:IsA("Motor6D") then
+			rig[role] = joint
+		end
+	end
+	return rig
+end
+
+-- Turns the part below `joint` by `rotation`, given in the axes of the part above it,
+-- about the joint itself. (A joint's own axes are its C0's; this converts into them.)
+local function PoseJoint(joint: Motor6D?, rotation: CFrame)
+	if joint then
+		local jointRotation = joint.C0.Rotation
+		joint.Transform = jointRotation:Inverse() * rotation * jointRotation
+	end
+end
+
+function RiderServiceClient.Init(self: RiderServiceClient)
+	self.Rigs = setmetatable({}, { __mode = "k" }) :: any
+
+	-- After animations are applied each frame, so the pose wins over the sitting animation.
+	RunService.PreSimulation:Connect(function()
+		self:Update()
+	end)
+end
+
+function RiderServiceClient.Update(self: RiderServiceClient)
+	local time = os.clock()
+	for _, player in Players:GetPlayers() do
+		local character = player.Character
+		local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+		local seat = if humanoid then humanoid.SeatPart else nil
+		if character and humanoid and seat and BoatServiceShared.GetBoatModelFromPart(seat) then
+			-- Found again if the character was rebuilt (its joints replaced)
+			local cachedRig = self.Rigs[character]
+			local cachedRoot = if cachedRig then cachedRig.Root else nil
+			local isStale = cachedRoot ~= nil and cachedRoot.Parent == nil
+			local rig: Rig = if cachedRig and not isStale then cachedRig else FindRig(character, humanoid)
+			self.Rigs[character] = rig
+			self:PoseRider(player, rig, time)
+		end
+	end
+end
+
+-- Poses one rider hanging on to their boat.
+function RiderServiceClient.PoseRider(self: RiderServiceClient, player: Player, rig: Rig, time: number)
+	-- Twisted round to aim their butt
+	PoseJoint(rig.Root, CFrame.Angles(0, FartServiceClient:GetAimAngle(player), 0))
+
+	-- Arms reaching forward over the side of the boat
+	local armReach = CFrame.Angles(RiderConfig.ARM_REACH, 0, 0)
+	PoseJoint(rig.RightShoulder, armReach)
+	PoseJoint(rig.LeftShoulder, armReach)
+	local elbowBend = CFrame.Angles(RiderConfig.ELBOW_BEND, 0, 0)
+	PoseJoint(rig.RightElbow, elbowBend)
+	PoseJoint(rig.LeftElbow, elbowBend)
+
+	-- Legs hanging in the water, kicking (each rider at their own beat)
+	local kick = math.sin(time * RiderConfig.KICK_SPEED + player.UserId % 10) * RiderConfig.KICK_ANGLE
+	PoseJoint(rig.RightHip, CFrame.Angles(kick, 0, 0))
+	PoseJoint(rig.LeftHip, CFrame.Angles(-kick, 0, 0))
+	local kneeBend = CFrame.Angles(-RiderConfig.KNEE_BEND, 0, 0)
+	PoseJoint(rig.RightKnee, kneeBend)
+	PoseJoint(rig.LeftKnee, kneeBend)
+end
+
+return RiderServiceClient :: RiderServiceClient
 ]==],
 	},
 }

@@ -166,8 +166,8 @@ function FartServiceServer.StopStream(self: FartServiceServer, player: Player, n
 	end
 end
 
--- The pushes from `boat`'s crew's farts right now: each rider's fart as a force at
--- their seat. Hull does the physics of what they do to the boat.
+-- The pushes from `boat`'s crew's farts right now: each rider's fart as a force where
+-- their body hangs on to the boat. Hull does the physics of what they do to the boat.
 function FartServiceServer.GetFartForces(self: FartServiceServer, boat: Boat.Boat): { Hull.AppliedForce }
 	local forces: { Hull.AppliedForce } = {}
 	if not boat:IsFloating() then
@@ -178,8 +178,10 @@ function FartServiceServer.GetFartForces(self: FartServiceServer, boat: Boat.Boa
 		local output = self.Outputs[player]
 		local seat = if output then boat:GetSeatOf(player) else nil
 		if output and seat then
+			local character = player.Character
+			local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
 			table.insert(forces, {
-				Position = seat.Position,
+				Position = if rootPart and rootPart:IsA("BasePart") then rootPart.Position else seat.Position,
 				Force = FartPhysics.GetForce(boatPosition, seat.CFrame, output.Forward, output.Right),
 			})
 		end

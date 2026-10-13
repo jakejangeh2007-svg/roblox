@@ -9,8 +9,11 @@
 --   - LAUNCH_DELAY after the leader starts the run early
 -- If nobody is aboard when it's time to leave, it's removed instead.
 -- On the river it moves under physics that the server runs: its Hull (the Hull class)
--- is stepped by WaterService every frame. Riders weigh what they weigh, but while it's
--- out there they don't bump into anything, so only the hull touches the world.
+-- is stepped by WaterService every frame.
+-- Riders don't sit in the boat: they hang on to the outside of it at their seat
+-- (RiderConfig.HANG_OFFSET), with their legs in the water. They weigh what they weigh,
+-- but while they're on a boat they don't bump into anything, so only the hull touches
+-- the world. RiderService poses them on every player's screen.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
 --   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
@@ -19,10 +22,10 @@
 --                 WeldConstraints (directly or through other welded parts).
 --   Physics       every part gets BoatConfig's slippery, slightly bouncy HULL_ settings,
 --                 keeping its own density.
---   Seats         one Seat per player. The number of Seats must match the size the
---                 template is listed under in BoatConfig.TEMPLATE_NAMES. Put them around
---                 the edge facing the middle. A one-seat boat can have its seat in the
---                 middle, facing forward.
+--   Seats         one Seat per player: where they hold on. The number of Seats must match
+--                 the size the template is listed under in BoatConfig.TEMPLATE_NAMES. Put
+--                 them on the rim, around the edge, facing the middle; each rider hangs
+--                 outside their seat at RiderConfig.HANG_OFFSET.
 --
 -- States: Docked -> Launched -> Destroyed. The model's State, LeaderUserId and
 -- DepartureTime attributes (see BoatServiceShared) mirror this for clients.
@@ -34,6 +37,7 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
 local Hull = require(ServerScriptService.Classes.Hull)
+local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
 local Boat = {}
@@ -47,6 +51,7 @@ type BoatMembers = {
 	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	Hull: Hull.Hull?, -- how it moves on the river; made when it launches
+	SeatRiders: { [Seat]: Player }, -- who is hanging on at each seat right now
 	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
@@ -73,6 +78,15 @@ local function EjectFromSeat(seat: Seat)
 	local seatWeld = seat:FindFirstChild("SeatWeld")
 	if seatWeld then
 		seatWeld:Destroy()
+	end
+end
+
+-- Moves whoever is in `seat` to hang on outside it, instead of sitting on it.
+local function HangFromSeat(seat: Seat)
+	local seatWeld = seat:FindFirstChild("SeatWeld")
+	if seatWeld and seatWeld:IsA("Weld") then
+		seatWeld.C0 = RiderConfig.HANG_OFFSET
+		seatWeld.C1 = CFrame.identity
 	end
 end
 
@@ -162,6 +176,7 @@ function Boat.new(
 			Frozen = false,
 			Crew = {},
 			Hull = nil,
+			SeatRiders = {},
 			RiderParts = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
@@ -197,6 +212,16 @@ function Boat.new(
 			self.Connections,
 			seat:GetPropertyChangedSignal("Occupant"):Connect(function()
 				self:OnSeatChanged(seat)
+			end)
+		)
+		-- Roblox welds a rider to their seat when they sit; once it has, move them to
+		-- hang on outside it.
+		table.insert(
+			self.Connections,
+			seat.ChildAdded:Connect(function(child)
+				if child.Name == "SeatWeld" then
+					task.defer(HangFromSeat, seat)
+				end
 			end)
 		)
 	end
@@ -266,12 +291,25 @@ function Boat.OnSeatChanged(self: Boat, seat: Seat)
 	if self.State == "Destroyed" then
 		return
 	end
+	-- Whoever was hanging on here has let go.
+	local previousRider = self.SeatRiders[seat]
+	if previousRider then
+		self.SeatRiders[seat] = nil
+		self:ReleaseRider(previousRider)
+	end
+
 	local isLaunched = self.State == "Launched"
 	local humanoid = seat.Occupant
-	if humanoid and (isLaunched or not GetPlayerInSeat(seat)) then
+	local rider = GetPlayerInSeat(seat)
+	if humanoid and (isLaunched or not rider) then
 		-- Only players ride, and nobody climbs aboard after launch.
 		EjectFromSeat(seat)
 		return
+	end
+	if rider then
+		self.SeatRiders[seat] = rider
+		self:PrepareRider(rider)
+		HangFromSeat(seat)
 	end
 
 	if isLaunched then
@@ -367,16 +405,13 @@ function Boat.Launch(self: Boat)
 	self:SetState("Launched")
 	self.Model:SetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE, nil)
 	self:MoveTo(self.LaunchCFrame)
-	for _, player in self.Crew do
-		self:PrepareRider(player)
-	end
 	local primaryPart = self.Model.PrimaryPart
 	if primaryPart then
 		self.Hull = Hull.new(primaryPart)
 	end
 end
 
--- For the ride, `player`'s body doesn't bump into anything; only the hull does.
+-- While `player` hangs on, their body doesn't bump into anything; only the hull does.
 function Boat.PrepareRider(self: Boat, player: Player)
 	local character = player.Character
 	if not character or self.RiderParts[player] then
@@ -422,7 +457,6 @@ function Boat.RemoveMissingCrew(self: Boat)
 		local player = self.Crew[index]
 		if not table.find(seatedPlayers, player) then
 			table.remove(self.Crew, index)
-			self:ReleaseRider(player)
 			self.CrewMemberLeft:Fire(player)
 		end
 	end
@@ -446,6 +480,7 @@ function Boat.Destroy(self: Boat)
 	for player in self.RiderParts do
 		self:ReleaseRider(player)
 	end
+	table.clear(self.SeatRiders)
 	if wasLaunched then
 		for _, player in self.Crew do
 			self.CrewMemberLeft:Fire(player)

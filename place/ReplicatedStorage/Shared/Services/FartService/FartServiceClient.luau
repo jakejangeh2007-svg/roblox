@@ -50,8 +50,7 @@ local localPlayer = Players.LocalPlayer
 -- One player's fart that's happening right now, and its effects.
 type Stream = {
 	Direction: string,
-	Butt: Attachment, -- where the gas comes out; it turns to aim the gas
-	GasAngle: number, -- radians the gas is aimed to the side right now; it swings toward the direction's angle
+	Butt: Attachment, -- where the gas comes out; it turns with the rider's aim
 	Emitter: ParticleEmitter?,
 	Sound: Sound?,
 	BasePitch: number,
@@ -64,6 +63,7 @@ type FartServiceClientMembers = {
 	LocalDirection: FartPhysics.Direction?, -- the direction the local player is farting, if they are
 	Streams: { [Player]: Stream }, -- everyone farting right now, the local player included
 	RampTimes: { [Player]: number }, -- how far each player's fart has built up, the same way the server works it out
+	AimAngles: { [Player]: number }, -- how far each rider has twisted round to aim their butt (radians, missing = not at all)
 	Random: Random,
 	FartCloudTemplate: ParticleEmitter?,
 	FartSounds: { Sound },
@@ -84,16 +84,21 @@ local function IsRiding(): boolean
 	return boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
 end
 
--- Which way the gas comes out, turned from straight behind the rider: a Left fart goes
--- out to the rider's left (a negative turn of the butt attachment points its back toward
--- their left), a Right fart to their right.
-local function GetGasAngle(direction: string): number
+-- How far a rider twists round (about the vertical, radians) to aim their butt for a
+-- fart in `direction` (nil when not farting): a Left fart aims it out to their left (a
+-- negative turn points their back to their left), a Right fart to their right.
+local function GetAimTarget(direction: string?): number
 	if direction == "Left" then
-		return -FartConfig.GAS_ANGLE
+		return -FartConfig.AIM_ANGLE
 	elseif direction == "Right" then
-		return FartConfig.GAS_ANGLE
+		return FartConfig.AIM_ANGLE
 	end
 	return 0
+end
+
+-- Where a rider's butt is, on their HumanoidRootPart, when they've twisted round by `aimAngle`.
+local function GetButtCFrame(aimAngle: number): CFrame
+	return CFrame.Angles(0, aimAngle, 0) * FartConfig.BUTT_OFFSET
 end
 
 local function GetLocalGas(): number
@@ -131,6 +136,7 @@ function FartServiceClient.Init(self: FartServiceClient)
 	self.LocalDirection = nil
 	self.Streams = {}
 	self.RampTimes = {}
+	self.AimAngles = {}
 	self.Random = Random.new()
 	self.RequestStartFartRemote = nil
 	self.RequestStopFartRemote = nil
@@ -260,9 +266,15 @@ function FartServiceClient.SetLocalDirection(self: FartServiceClient, direction:
 	end
 end
 
+-- How far `player` has twisted round to aim their butt (radians about the vertical;
+-- negative is toward their left). RiderService turns their body by this.
+function FartServiceClient.GetAimAngle(self: FartServiceClient, player: Player): number
+	return self.AimAngles[player] or 0
+end
+
 -- Every frame: build up (or fade) everyone's fart strength, grow each fart's effects
--- with it, swing each fart's gas round to where it's aimed, and stop the local fart if
--- the player ran out of gas or isn't riding any more.
+-- with it, twist each rider round to aim their butt, and stop the local fart if the
+-- player ran out of gas or isn't riding any more.
 function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 	if self.LocalDirection and (GetLocalGas() <= 0 or not IsRiding()) then
 		table.clear(self.HeldDirections)
@@ -279,10 +291,7 @@ function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 			end
 		end
 	end
-	-- The gas swings round as fast as the push it makes (FartConfig.PUSH_RESPONSE_TIME).
-	local gasBlend = if FartConfig.PUSH_RESPONSE_TIME > 0
-		then 1 - math.exp(-deltaTime / FartConfig.PUSH_RESPONSE_TIME)
-		else 1
+	self:UpdateAim(deltaTime)
 	for player, stream in self.Streams do
 		if not player.Parent then
 			self:StopStream(player)
@@ -292,15 +301,7 @@ function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 		local rampTime = FartPhysics.UpdateRampTime(self.RampTimes[player] or 0, true, deltaTime)
 		self.RampTimes[player] = rampTime
 
-		local targetAngle = GetGasAngle(stream.Direction)
-		if stream.GasAngle ~= targetAngle then
-			stream.GasAngle += (targetAngle - stream.GasAngle) * gasBlend
-			if math.abs(targetAngle - stream.GasAngle) < 1e-3 then
-				stream.GasAngle = targetAngle
-			end
-			stream.Butt.CFrame = FartConfig.BUTT_OFFSET * CFrame.Angles(0, stream.GasAngle, 0)
-		end
-
+		stream.Butt.CFrame = GetButtCFrame(self:GetAimAngle(player))
 		local progress = FartPhysics.GetRampProgress(rampTime)
 		local emitter = stream.Emitter
 		local template = self.FartCloudTemplate
@@ -320,6 +321,32 @@ function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 end
 
 -- The attachment and emitter at a player's butt, made the first time they fart.
+-- Twists every rider toward where their fart is aimed, or back to facing the boat once
+-- they stop, as fast as the push itself swings round (FartConfig.PUSH_RESPONSE_TIME).
+function FartServiceClient.UpdateAim(self: FartServiceClient, deltaTime: number)
+	local blend = if FartConfig.PUSH_RESPONSE_TIME > 0
+		then 1 - math.exp(-deltaTime / FartConfig.PUSH_RESPONSE_TIME)
+		else 1
+	for player in self.Streams do
+		if not self.AimAngles[player] then
+			self.AimAngles[player] = 0
+		end
+	end
+	for player, aimAngle in self.AimAngles do
+		local stream = self.Streams[player]
+		local targetAngle = GetAimTarget(if stream then stream.Direction else nil)
+		local newAngle = aimAngle + (targetAngle - aimAngle) * blend
+		if math.abs(targetAngle - newAngle) < 1e-3 then
+			newAngle = targetAngle
+		end
+		if (newAngle == 0 and not stream) or not player.Parent then
+			self.AimAngles[player] = nil
+		else
+			self.AimAngles[player] = newAngle
+		end
+	end
+end
+
 function FartServiceClient.GetButt(self: FartServiceClient, player: Player): (Attachment?, ParticleEmitter?)
 	local character = player.Character
 	local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
@@ -361,8 +388,7 @@ function FartServiceClient.StartStream(self: FartServiceClient, player: Player, 
 	if not butt then
 		return
 	end
-	local gasAngle = GetGasAngle(direction)
-	butt.CFrame = FartConfig.BUTT_OFFSET * CFrame.Angles(0, gasAngle, 0)
+	butt.CFrame = GetButtCFrame(self:GetAimAngle(player))
 	if emitter then
 		emitter.Enabled = true
 	end
@@ -382,7 +408,6 @@ function FartServiceClient.StartStream(self: FartServiceClient, player: Player, 
 	self.Streams[player] = {
 		Direction = direction,
 		Butt = butt,
-		GasAngle = gasAngle,
 		Emitter = emitter,
 		Sound = sound,
 		BasePitch = basePitch,
@@ -415,7 +440,7 @@ function FartServiceClient.PlayDudEffect(self: FartServiceClient, player: Player
 	if self.Streams[player] then
 		return -- already farting; the stream's effects are showing
 	end
-	butt.CFrame = FartConfig.BUTT_OFFSET
+	butt.CFrame = GetButtCFrame(self:GetAimAngle(player))
 	local template = self.FartCloudTemplate
 	if emitter and template then
 		emitter.Speed = template.Speed

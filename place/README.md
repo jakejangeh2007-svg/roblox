@@ -119,11 +119,12 @@ ReplicatedStorage
       CheckpointService   CheckpointServiceClient, CheckpointServiceShared
       DockService         DockServiceClient, DockServiceShared
       FartService         FartServiceClient, FartServiceShared, FartPhysics
+      RiderService        RiderServiceClient
     Classes
     Modules
       Core                Remotes
       Game                BoatConfig, CameraConfig, CheckpointConfig, DataConfig,
-                          DockConfig, FartConfig, WaterConfig
+                          DockConfig, FartConfig, RiderConfig, WaterConfig
       Math                Geometry
       Platform
   Assets                you build everything in here
@@ -198,16 +199,18 @@ Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`
 
 | Fart | Keyboard | Controller | What it does |
 | ---- | -------- | ---------- | ------------ |
-| Straight | `W`, `↑`, `Space` | `RT` | farts out behind you: pushes the boat the way you face |
-| Left | `A`, `←`, `Q` | `LB` | farts out to your left: spins the boat left |
-| Right | `D`, `→`, `E` | `RB` | farts out to your right: spins the boat right |
+| Straight | `W`, `↑`, `Space` | `RT` | butt aimed straight out behind you: pushes the boat the way you face |
+| Left | `A`, `←`, `Q` | `LB` | twist to aim your butt out to your left: spins the boat left |
+| Right | `D`, `→`, `E` | `RB` | twist to aim your butt out to your right: spins the boat right |
 
-Every fart is a **jet at your seat**: the gas goes one way and pushes the boat the other,
-and the boat moves the way real physics says (see *How boats move*). You sit at the edge
-of the boat facing its middle, so Straight pushes through the middle and just moves the
-boat. Left farts out your left side, pushing your side of the boat right, so the boat
-**spins left** (counter-clockwise) and drifts a little right; Right is the mirror image.
-To steer on your own, tap Left or Right to swing round, then push Straight.
+Riders **hang on to the outside of the raft**, arms over the side and legs kicking in the
+water, facing its middle. To fart you **aim your butt off the raft**: straight out behind
+you for Straight, or twisted round to your left or right. Every fart is a **jet from your
+butt**: the gas goes one way and pushes the boat the other, and the boat moves the way
+real physics says (see *How boats move*). Straight pushes through the middle and just
+moves the boat. Left farts out to your left, pushing your side of the boat right, so the
+boat **spins left** (counter-clockwise) and drifts a little right; Right is the mirror
+image. To steer on your own, tap Left or Right to swing round, then push Straight.
 
 **Hold a key to keep farting.** A fart starts at 12 studs/s² and builds up by 8 every
 second you keep going, up to 30 (on a boat weighing `FartConfig.REFERENCE_MASS`; heavier
@@ -331,9 +334,11 @@ Put one Model per size in **`ReplicatedStorage.Assets.Boats`**, named as in
   part at the water surface.
 - Weld every other part, Seats included, to it with **WeldConstraints** (directly or through
   other welded parts). Anchoring doesn't matter: the code sets it.
-- Put in exactly as many **Seat** objects as the size (`Boat3` has 3 Seats). Space them
-  around the edge, facing the middle. A one-seat boat can have its seat in the middle,
-  facing forward.
+- Put in exactly as many **Seat** objects as the size (`Boat3` has 3 Seats). A seat is
+  where a rider **holds on**: put them on the rim, spaced around the edge, facing the
+  middle. Riders don't sit on them; they hang outside them, at `RiderConfig.HANG_OFFSET`
+  from the seat (a little below and outward). Change that offset if riders end up too
+  high, too low, or inside the hull.
 - No scripts inside.
 - Every part's friction and bounciness is set by the code (`BoatConfig.HULL_...`); its
   density (from its Material) is kept. What the parts weigh, and how far out they sit,
@@ -353,6 +358,13 @@ Output warns at startup about any template that's missing or doesn't follow thes
   Switching direction keeps the same sound going. Sounds that loop smoothly work best.
 
 Without them farts still work, just invisible or silent, and Output warns once.
+
+The gas comes out of each rider's butt (`FartConfig.BUTT_OFFSET`, set its emitter's
+EmissionDirection to Back) and points wherever they've twisted to aim it.
+
+**Rider pose:** RiderService poses every rider in code (arms over the side, legs kicking,
+twisting to aim), so it needs no animation assets and works for R15 and R6. Its angles are
+in `RiderConfig`.
 
 ## For the UI (to be built by hand)
 

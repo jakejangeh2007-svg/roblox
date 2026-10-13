@@ -30,7 +30,7 @@ local FartConfig = {
 
 	-- Effects. They grow with the fart's strength, from when it starts to full acceleration.
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
-	GAS_ANGLE = math.rad(90), -- how far round from straight back the gas comes out on a Left/Right fart (90 = straight out the side)
+	AIM_ANGLE = math.rad(90), -- how far a rider twists round to aim their butt on a Left/Right fart (90 = straight out to the side)
 	MIN_PARTICLE_RATE = 20, -- particles per second when a fart starts...
 	MAX_PARTICLE_RATE = 60, -- ...and at full acceleration
 	MAX_PARTICLE_SPEED_MULTIPLIER = 2.5, -- the cloud's Speed is multiplied by up to this at full acceleration

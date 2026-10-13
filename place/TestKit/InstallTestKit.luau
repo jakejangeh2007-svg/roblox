@@ -340,7 +340,8 @@ local function WeldToRoot(root: BasePart, part: BasePart)
 	weld.Parent = part
 end
 
--- A round inflatable boat: a ring of tube with seats on top, facing the middle.
+-- A round inflatable boat: a ring of tube with a seat on its outer edge for each rider
+-- to hang on to, facing the middle.
 local function BuildBoatTemplate(seatCount: number): Model
 	local model = Instance.new("Model")
 	model.Name = BoatConfig.TEMPLATE_NAMES[seatCount]
@@ -381,13 +382,15 @@ local function BuildBoatTemplate(seatCount: number): Model
 	floor.Shape = Enum.PartType.Cylinder
 	WeldToRoot(root, floor)
 
-	local seatHeight = 0.5 + tubeRadius + 0.2
+	-- On the outer top of the tube, where a rider hanging outside holds on
+	local seatHeight = 0.5 + tubeRadius * 0.8
+	local seatRadius = ringRadius + tubeRadius * 0.8
 	for seatNumber = 1, seatCount do
 		local angle = (seatNumber - 1) / seatCount * 2 * math.pi
-		local position = Vector3.new(math.cos(angle) * ringRadius, seatHeight, math.sin(angle) * ringRadius)
+		local position = Vector3.new(math.cos(angle) * seatRadius, seatHeight, math.sin(angle) * seatRadius)
 		local seat = Instance.new("Seat")
 		seat.Name = `Seat{seatNumber}`
-		seat.Size = Vector3.new(2, 0.4, 2)
+		seat.Size = Vector3.new(2, 0.4, 1.2)
 		seat.CFrame = CFrame.lookAt(position, Vector3.new(0, seatHeight, 0))
 		seat.Color = color
 		seat.TopSurface = Enum.SurfaceType.Smooth
