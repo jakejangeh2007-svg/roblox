@@ -2404,11 +2404,11 @@ local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 local Boat = require(ServerScriptService.Classes.Boat)
-local Hull = require(ServerScriptService.Classes.Hull)
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
 local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
+local Hull = require(ServerScriptService.Classes.Hull)
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 
 local SERVICE_NAME = FartServiceShared.SERVICE_NAME
