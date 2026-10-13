@@ -1,8 +1,69 @@
 # Place scripts
 
-The game's code, organized by the project conventions. No external tools are needed.
+The game's code, organized by the project conventions.
 
-## Installing or updating the code
+## Auto-sync with Rojo (recommended)
+
+Claude pushes code changes to this branch on GitHub. On your PC, one terminal pulls them
+every 10 seconds and Rojo copies them into Studio, so changes show up in your place
+within about 10 seconds of being pushed.
+
+Rojo only manages the **code** folders: `ReplicatedStorage.Shared`, `ReplicatedStorage.Packages`,
+`ReplicatedStorage.UI`, `ServerScriptService.Server`, `ServerScriptService.Services`,
+`ServerScriptService.Classes`, `ServerScriptService.TestKit` and `StarterPlayerScripts.Client`.
+It makes sure `ReplicatedStorage.Assets` (with `Boats`, `VFX`, `Sounds.Farts`) and
+`Workspace.Boats` exist, but never deletes or changes anything you build inside them.
+Your map, models and UI are never touched.
+
+**Don't edit the synced scripts in Studio.** Rojo overwrites them with the repo version. Tell
+Claude what to change instead.
+
+### One-time setup (Windows)
+
+Use a normal PowerShell window, not "Run as administrator". Run one line at a time.
+
+1. Install Git, then close PowerShell and open a new one:
+   ```powershell
+   winget install --id Git.Git -e --source winget
+   ```
+   (If `winget` isn't found, install Git from <https://git-scm.com/download/win> with the default options.)
+2. Install Rokit, then close PowerShell and open a new one:
+   ```powershell
+   Invoke-RestMethod https://raw.githubusercontent.com/rojo-rbx/rokit/main/scripts/install.ps1 | Invoke-Expression
+   ```
+3. Check both worked: `git --version` and `rokit --version` should each print a version.
+4. Download the code and install Rojo (if GitHub asks you to sign in, do it in the browser
+   window that opens; when Rokit asks whether to trust Rojo, say yes):
+   ```powershell
+   cd ~
+   git clone https://github.com/jakejangeh2007-svg/roblox.git
+   cd roblox
+   git checkout claude/determined-gates-6stlty
+   cd place
+   rokit install
+   rojo plugin install
+   ```
+   If you already have the `roblox` folder from before, skip the clone: `cd ~\roblox`, then
+   `git checkout claude/determined-gates-6stlty`, `git pull`, `cd place`, and carry on from `rokit install`.
+5. Restart Roblox Studio so it loads the Rojo plugin.
+
+### Every time you work on the game
+
+1. **Terminal 1 (Rojo):**
+   ```powershell
+   cd ~\roblox\place
+   rojo serve
+   ```
+   Make sure it's the `place` folder, not the old `fart-to-steer` one.
+2. **Terminal 2 (auto-pull):**
+   ```powershell
+   cd ~\roblox
+   while ($true) { git pull --quiet; Start-Sleep -Seconds 10 }
+   ```
+3. In Studio, open your place, then **Plugins → Rojo → Connect**. Accept the changes it lists.
+4. Leave both terminals open. Close them (or press Ctrl+C) when you're done.
+
+## Without Rojo: Command Bar installer
 
 1. Open the place in Roblox Studio and close any open script tabs.
 2. **View** tab → **Command Bar**.
@@ -10,35 +71,37 @@ The game's code, organized by the project conventions. No external tools are nee
 4. The Output window lists what it created (`+`) and updated (`~`).
 
 The installer creates missing folders and scripts and replaces the code in existing
-scripts. It never deletes anything and never touches models or parts. Run it again
-whenever the code changes. Ctrl+Z undoes it.
+scripts. It never deletes anything and never touches models or parts. Ctrl+Z undoes it.
 
 `Install.luau` is generated from the other `.luau` files in this folder. Each file is
 one script; its first comment line says which instance. `X.server.luau` is a Script,
-`X.client.luau` a LocalScript, anything else a ModuleScript.
+`X.client.luau` a LocalScript, `X/init.luau` is a script named X with the folder's
+contents inside it, and anything else is a ModuleScript.
 
 ## Test kit (temporary)
 
 To playtest before the real map, boats and menus exist:
 
-1. Run `Install.luau` first (the Server script needs its test kit hook).
-2. Copy all of [`TestKit/InstallTestKit.luau`](TestKit/InstallTestKit.luau), paste it into the
-   Command Bar and press Enter. It adds one ModuleScript: `ServerScriptService.TestKit`.
-3. Press **Play**. Every playtest now builds a grey-box test world at runtime (it's gone
+1. With Rojo, the test kit (`ServerScriptService.TestKit`) is already synced. Without
+   Rojo, run `Install.luau`, then paste [`TestKit/InstallTestKit.luau`](TestKit/InstallTestKit.luau)
+   into the Command Bar.
+2. Press **Play**. Every playtest now builds a grey-box test world at runtime (it's gone
    when you stop): a lobby and every checkpoint with docks, ponds joined by rivers
    without walls, currents, rocks, the finish, boat templates `Boat1`–`Boat6`, a fart
    cloud and a placeholder sound. Your own `Workspace.Map` is set aside for the playtest,
    and your own boat templates and effects are used if you've made them.
-4. In the test world:
+3. In the test world:
    - **E** at a dock's pier spawns a boat with that dock's number of seats (dock 1 = 1 seat).
    - Walk into a seat. The boat leaves after the 30 second timer, or press **F** next to
      it to start early (party leader only, sitting in the boat).
    - Fart with **A / W / D** (or the arrow keys). Fall off a river to test wiping.
    - **E** at the yellow posts on each platform teleports there, once unlocked.
    - Anything that didn't work is explained in Output, starting with `[TestKit]`.
-5. Use **Test → Clients and Servers** with 2+ players to test together.
+4. Use **Test → Clients and Servers** with 2+ players to test together.
 
-**When you're done testing, delete `ServerScriptService.TestKit`.** Nothing else changes.
+**When you're done testing:** with Rojo, ask Claude to remove the test kit from the project,
+then delete `ServerScriptService.TestKit` in Studio. Without Rojo, just delete it.
+Nothing else changes.
 The test kit is the only code here that builds parts and prompts at runtime.
 
 ## Hierarchy

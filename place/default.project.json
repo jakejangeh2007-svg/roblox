@@ -1,0 +1,58 @@
+{
+  "name": "FartToSteer",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Shared": {
+        "$path": "ReplicatedStorage/Shared"
+      },
+      "Packages": {
+        "$path": "ReplicatedStorage/Packages"
+      },
+      "UI": {
+        "$path": "ReplicatedStorage/UI"
+      },
+      "Assets": {
+        "$className": "Folder",
+        "Boats": {
+          "$className": "Folder"
+        },
+        "VFX": {
+          "$className": "Folder"
+        },
+        "Sounds": {
+          "$className": "Folder",
+          "Farts": {
+            "$className": "Folder"
+          }
+        }
+      }
+    },
+    "ServerScriptService": {
+      "Server": {
+        "$path": "ServerScriptService/Server.server.luau"
+      },
+      "Services": {
+        "$path": "ServerScriptService/Services"
+      },
+      "Classes": {
+        "$path": "ServerScriptService/Classes"
+      },
+      "TestKit": {
+        "$path": "TestKit/TestKit.luau"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Client": {
+          "$path": "StarterPlayer/StarterPlayerScripts/Client.client.luau"
+        }
+      }
+    },
+    "Workspace": {
+      "Boats": {
+        "$className": "Folder"
+      }
+    }
+  }
+}
