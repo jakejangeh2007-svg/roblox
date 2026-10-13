@@ -5,6 +5,8 @@
 --   - While the local player sits in a boat on the river, jumping is switched off so
 --     they don't fall out by accident. (The server still handles anyone who leaves.)
 --   - BoatWiped fires when their boat falls off the river, for the UI (a RIP screen).
+--   - RequestJoinBoat, RequestStartRun, IsLeaderOf and GetSecondsUntilDeparture are for
+--     the joining UI (to be built): a Join button, the leader's Start button and the timer.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -59,6 +61,36 @@ function BoatServiceClient.UpdateJumpLock(self: BoatServiceClient)
 		humanoidToLock:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
 	end
 	self.LockedHumanoid = humanoidToLock
+end
+
+-- Asks to sit in a free seat of `boatModel`, a boat waiting at a dock.
+-- Returns whether it worked and, if not, a message to show the player.
+function BoatServiceClient.RequestJoinBoat(self: BoatServiceClient, boatModel: Model): (boolean, string?)
+	local remote = Remotes.WaitForFunction(BoatServiceShared.SERVICE_NAME, BoatServiceShared.REQUEST_JOIN_BOAT)
+	local success, message = remote:InvokeServer(boatModel)
+	return success == true, if type(message) == "string" then message else nil
+end
+
+-- Party leader only: start the run now instead of waiting for the join timer.
+-- Returns whether it worked and, if not, a message to show the player.
+function BoatServiceClient.RequestStartRun(self: BoatServiceClient): (boolean, string?)
+	local remote = Remotes.WaitForFunction(BoatServiceShared.SERVICE_NAME, BoatServiceShared.REQUEST_START_RUN)
+	local success, message = remote:InvokeServer()
+	return success == true, if type(message) == "string" then message else nil
+end
+
+-- Whether the local player leads `boatModel`.
+function BoatServiceClient.IsLeaderOf(self: BoatServiceClient, boatModel: Model): boolean
+	return boatModel:GetAttribute(BoatServiceShared.LEADER_ATTRIBUTE) == Players.LocalPlayer.UserId
+end
+
+-- Seconds until `boatModel` leaves its dock, or nil once it has left.
+function BoatServiceClient.GetSecondsUntilDeparture(self: BoatServiceClient, boatModel: Model): number?
+	local departureTime = boatModel:GetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE)
+	if typeof(departureTime) ~= "number" then
+		return nil
+	end
+	return math.max(0, departureTime - workspace:GetServerTimeNow())
 end
 
 return BoatServiceClient :: BoatServiceClient

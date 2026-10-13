@@ -7,7 +7,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 
-export type BoatState = "Docked" | "Launching" | "Launched" | "Destroyed"
+export type BoatState = "Docked" | "Launched" | "Destroyed"
 
 local BoatServiceShared = {
 	SERVICE_NAME = "BoatService",
@@ -17,10 +17,13 @@ local BoatServiceShared = {
 
 	-- Attributes on each spawned boat model, for clients and UI
 	STATE_ATTRIBUTE = "State", -- a BoatState
-	LAUNCH_TIME_ATTRIBUTE = "LaunchTime", -- server time (workspace:GetServerTimeNow()) the boat leaves the dock
+	LEADER_ATTRIBUTE = "LeaderUserId", -- UserId of the party leader
+	DEPARTURE_TIME_ATTRIBUTE = "DepartureTime", -- server time (workspace:GetServerTimeNow()) a docked boat leaves
 
 	-- Remotes
 	NOTIFY_BOAT_WIPED = "NotifyBoatWiped", -- RemoteEvent to each crew member when their boat falls off the river
+	REQUEST_JOIN_BOAT = "RequestJoinBoat", -- RemoteFunction (boat: Model) -> (success: boolean, message: string?)
+	REQUEST_START_RUN = "RequestStartRun", -- RemoteFunction () -> (success: boolean, message: string?); party leader only
 }
 
 -- The spawned boat model a part belongs to (for example a Seat), if any.

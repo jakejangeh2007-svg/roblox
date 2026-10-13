@@ -69,23 +69,36 @@ Workspace
 1. Players join in the **lobby**.
 2. At one of the lobby's **docks**, a player uses the dock's prompt and picks a boat for
    1–6 players. The server checks the request: real dock, valid size, close enough,
-   not on cooldown, dock free, checkpoint unlocked. Then it spawns the boat at the dock.
-   Each player can have one waiting boat; picking again replaces it.
-3. Players sit in the boat's seats. When **every seat is full**, a `LAUNCH_DELAY`
-   countdown starts. If anyone gets up, it stops. When it finishes, the boat moves to
-   the location's **Launch** point in the river and starts **floating**. From then on
+   not on cooldown, dock free, checkpoint unlocked. Then it spawns the boat at the dock,
+   with that player as its **party leader**.
+3. A **`JOIN_TIME` timer** (30 seconds) starts. Players get in by sitting in a free seat,
+   or by asking to join (the server checks they're close enough and a seat is free,
+   then sits them down). Anyone can get up and join a different boat instead.
+4. The boat leaves at the earliest of:
+   - the **timer running out**, with whoever is aboard (empty seats are fine);
+   - **every seat filling up**, after a `LAUNCH_DELAY` (3 second) countdown, which stops
+     if someone gets up;
+   - the **leader starting early** (they must be in the boat), after the same countdown.
+
+   If nobody is aboard when it's time to leave, the boat is removed. Otherwise it moves
+   to the location's **Launch** point in the river and starts **floating**. From then on
    nobody new can get in, and anyone who leaves goes back to their current checkpoint.
-4. On the river, players **fart to steer** (controls below). The server checks every
+   - The leader can **pick a different boat size** before it leaves: the new boat
+     replaces the old one, and everyone aboard moves into it (leader first, as far as the
+     seats go). Each player leads at most one waiting boat.
+   - If the leader **leaves the game**, someone aboard becomes leader. If nobody is
+     aboard, the boat is removed.
+5. On the river, players **fart to steer** (controls below). The server checks every
    fart, spends gas and pushes the boat. **WaterService** keeps boats on the water
    surface, slows them down and pushes them along currents. A boat that **falls off**
    the river freezes for `WIPE_DELAY`, then it's removed and its crew goes back to
    their checkpoint to spawn a new boat.
-5. When a boat on the river enters a checkpoint's **Zone**, that checkpoint and every
+6. When a boat on the river enters a checkpoint's **Zone**, that checkpoint and every
    one before it are **unlocked** and saved for everyone aboard. From then on they
    respawn there.
-6. Players can **teleport** to the lobby or any unlocked checkpoint. Each checkpoint
+7. Players can **teleport** to the lobby or any unlocked checkpoint. Each checkpoint
    has its own docks, so they can start a new boat from there.
-7. A boat entering **Map.Finish** beats the game. It's saved, and after
+8. A boat entering **Map.Finish** beats the game. It's saved, and after
    `FINISH_RETURN_DELAY` the crew is sent back to the lobby.
 
 Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`.
@@ -185,7 +198,10 @@ The client halves have everything the menus need:
 | ---- | --- |
 | Boat-size menu opens | `DockServiceClient.DockSelected` fires `(dock)` when the player uses a dock prompt |
 | Spawn the picked size | `DockServiceClient:RequestSpawnBoat(dock, seatCount)` → `(success, message)` |
-| Countdown | the boat model's `LaunchTime` attribute (server time) while its `State` attribute is `"Launching"` |
+| Join button | `BoatServiceClient:RequestJoinBoat(boatModel)` → `(success, message)` |
+| Leader's Start button | show it when `BoatServiceClient:IsLeaderOf(boatModel)`; call `BoatServiceClient:RequestStartRun()` → `(success, message)` |
+| Departure timer | `BoatServiceClient:GetSecondsUntilDeparture(boatModel)` (from the boat model's `DepartureTime` attribute) |
+| Who's leading | the boat model's `LeaderUserId` attribute |
 | Teleport menu list | `CheckpointConfig.CHECKPOINTS` plus `CheckpointServiceClient:GetUnlockedCheckpointIds()` |
 | Teleport | `CheckpointServiceClient:RequestTeleport(id)` → `(success, message)`; the lobby's id is `CheckpointConfig.LOBBY_ID` |
 | List changed | `CheckpointServiceClient.UnlockedCheckpointsChanged` |

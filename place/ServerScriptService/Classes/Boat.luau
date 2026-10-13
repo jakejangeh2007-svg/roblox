@@ -1,8 +1,13 @@
 --!strict
 -- ModuleScript: ServerScriptService.Classes.Boat
 --
--- A boat cloned from a template in ReplicatedStorage.Assets.Boats. It waits at a
--- dock until every seat is taken, counts down, then moves into the river and floats.
+-- A boat cloned from a template in ReplicatedStorage.Assets.Boats. The player who
+-- spawns it is its party leader. It waits at its dock while players get in, then moves
+-- into the river and floats. It leaves at the earliest of:
+--   - the join timer running out (JOIN_TIME after it spawned), with whoever is aboard
+--   - LAUNCH_DELAY after every seat is taken (cancelled if someone gets up)
+--   - LAUNCH_DELAY after the leader starts the run early
+-- If nobody is aboard when it's time to leave, it's removed instead.
 -- On the river the server owns its physics: WaterService keeps it afloat and
 -- FartService pushes it.
 --
@@ -16,9 +21,8 @@
 --                 the edge facing the middle. A one-seat boat can have its seat in the
 --                 middle, facing forward.
 --
--- States: Docked -> Launching -> Launched -> Destroyed. Launching goes back to Docked
--- if a seat empties during the countdown. The model's State and LaunchTime attributes
--- (see BoatServiceShared) mirror this for clients.
+-- States: Docked -> Launched -> Destroyed. The model's State, LeaderUserId and
+-- DepartureTime attributes (see BoatServiceShared) mirror this for clients.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -32,15 +36,16 @@ Boat.__index = Boat
 
 type BoatMembers = {
 	Model: Model,
-	Owner: Player, -- who spawned it
+	Leader: Player, -- the party leader: who spawned it, or who took over after they left
 	Seats: { Seat },
 	State: BoatServiceShared.BoatState,
 	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
-	EmptySince: number?, -- os.clock() when a docked boat last became empty, nil while anyone is aboard
-	LaunchCount: number, -- goes up whenever a countdown starts or stops, so an old countdown can tell it's stale
+	JoinDeadline: number, -- server time the join timer runs out
+	FullDeadline: number?, -- server time it leaves because every seat is taken (nil while any seat is free)
+	StartDeadline: number?, -- server time it leaves because the leader started the run early
 	Connections: { RBXScriptConnection },
 	CrewMemberLeft: Signal.Signal, -- fires (player: Player) when a crew member leaves after launch, for any reason
 }
@@ -134,7 +139,7 @@ end
 -- passed CheckTemplate.
 function Boat.new(
 	template: Model,
-	owner: Player,
+	leader: Player,
 	dockCFrame: CFrame,
 	launchCFrame: CFrame,
 	startIndex: number,
@@ -144,15 +149,16 @@ function Boat.new(
 	local self = setmetatable(
 		{
 			Model = model,
-			Owner = owner,
+			Leader = leader,
 			Seats = GetSeats(model),
 			State = "Docked",
 			Frozen = false,
 			Crew = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
-			EmptySince = os.clock(),
-			LaunchCount = 0,
+			JoinDeadline = workspace:GetServerTimeNow() + BoatConfig.JOIN_TIME,
+			FullDeadline = nil,
+			StartDeadline = nil,
 			Connections = {},
 			CrewMemberLeft = Signal.new(),
 		} :: BoatMembers,
@@ -180,6 +186,8 @@ function Boat.new(
 	end
 
 	model:SetAttribute(BoatServiceShared.STATE_ATTRIBUTE, self.State)
+	self:SetLeader(leader)
+	self:UpdateDepartureTime()
 	model.Parent = parent
 	return self
 end
@@ -194,9 +202,9 @@ function Boat.GetPosition(self: Boat): Vector3
 	return self.Model:GetPivot().Position
 end
 
--- True while the boat is still at its dock (waiting or counting down).
+-- True while the boat is still waiting at its dock.
 function Boat.IsAtDock(self: Boat): boolean
-	return self.State == "Docked" or self.State == "Launching"
+	return self.State == "Docked"
 end
 
 -- True while the boat is on the river and moving under physics.
@@ -255,52 +263,93 @@ function Boat.OnSeatChanged(self: Boat, seat: Seat)
 		return
 	end
 
-	local seatedCount = #self:GetSeatedPlayers()
-	if seatedCount == 0 then
-		self.EmptySince = self.EmptySince or os.clock()
-	else
-		self.EmptySince = nil
+	local isFull = #self:GetSeatedPlayers() == #self.Seats
+	if isFull and not self.FullDeadline then
+		self.FullDeadline = workspace:GetServerTimeNow() + BoatConfig.LAUNCH_DELAY
+	elseif not isFull then
+		self.FullDeadline = nil
 	end
-	if seatedCount == #self.Seats then
-		self:BeginLaunch()
-	else
-		self:CancelLaunch()
-	end
+	self:UpdateDepartureTime()
 end
 
-function Boat.BeginLaunch(self: Boat)
+function Boat.SetLeader(self: Boat, player: Player)
+	self.Leader = player
+	self.Model:SetAttribute(BoatServiceShared.LEADER_ATTRIBUTE, player.UserId)
+end
+
+-- The server time this docked boat leaves: the earliest of its deadlines.
+function Boat.GetDepartureTime(self: Boat): number
+	local departureTime = self.JoinDeadline
+	local fullDeadline = self.FullDeadline
+	if fullDeadline then
+		departureTime = math.min(departureTime, fullDeadline)
+	end
+	local startDeadline = self.StartDeadline
+	if startDeadline then
+		departureTime = math.min(departureTime, startDeadline)
+	end
+	return departureTime
+end
+
+function Boat.UpdateDepartureTime(self: Boat)
+	self.Model:SetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE, self:GetDepartureTime())
+end
+
+-- The leader started the run early: leave after LAUNCH_DELAY, whoever is aboard.
+function Boat.StartEarly(self: Boat)
+	if self.State ~= "Docked" or self.StartDeadline then
+		return
+	end
+	self.StartDeadline = workspace:GetServerTimeNow() + BoatConfig.LAUNCH_DELAY
+	self:UpdateDepartureTime()
+end
+
+function Boat.HasFreeSeat(self: Boat): boolean
+	for _, seat in self.Seats do
+		if not seat.Occupant then
+			return true
+		end
+	end
+	return false
+end
+
+-- Sits `player` in a free seat of this docked boat. They must not be sitting anywhere
+-- else. Returns false if there's no free seat or they can't sit right now.
+function Boat.SeatPlayer(self: Boat, player: Player): boolean
+	if self.State ~= "Docked" then
+		return false
+	end
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	if not humanoid or humanoid.Health <= 0 or humanoid.SeatPart then
+		return false
+	end
+	for _, seat in self.Seats do
+		if not seat.Occupant then
+			seat:Sit(humanoid)
+			return true
+		end
+	end
+	return false
+end
+
+-- Called once the departure time arrives: into the river with whoever is aboard, or
+-- removed if nobody is.
+function Boat.Depart(self: Boat)
 	if self.State ~= "Docked" then
 		return
 	end
-	self:SetState("Launching")
-	self.LaunchCount += 1
-	local launchCount = self.LaunchCount
-	self.Model:SetAttribute(
-		BoatServiceShared.LAUNCH_TIME_ATTRIBUTE,
-		workspace:GetServerTimeNow() + BoatConfig.LAUNCH_DELAY
-	)
-	task.delay(BoatConfig.LAUNCH_DELAY, function()
-		-- The state may have changed during the countdown.
-		local currentState: BoatServiceShared.BoatState = self.State
-		if self.LaunchCount == launchCount and currentState == "Launching" then
-			self:Launch()
-		end
-	end)
-end
-
-function Boat.CancelLaunch(self: Boat)
-	if self.State ~= "Launching" then
-		return
+	if #self:GetSeatedPlayers() == 0 then
+		self:Destroy()
+	else
+		self:Launch()
 	end
-	self.LaunchCount += 1
-	self:SetState("Docked")
-	self.Model:SetAttribute(BoatServiceShared.LAUNCH_TIME_ATTRIBUTE, nil)
 end
 
 function Boat.Launch(self: Boat)
 	self.Crew = self:GetSeatedPlayers()
 	self:SetState("Launched")
-	self.Model:SetAttribute(BoatServiceShared.LAUNCH_TIME_ATTRIBUTE, nil)
+	self.Model:SetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE, nil)
 	self:MoveTo(self.LaunchCFrame)
 	self:StartFloating()
 end
@@ -387,7 +436,6 @@ function Boat.Destroy(self: Boat)
 	end
 	local wasLaunched = self.State == "Launched"
 	self:SetState("Destroyed")
-	self.LaunchCount += 1
 	for _, connection in self.Connections do
 		connection:Disconnect()
 	end

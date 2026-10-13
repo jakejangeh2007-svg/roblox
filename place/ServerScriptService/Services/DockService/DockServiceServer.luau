@@ -3,11 +3,14 @@
 --
 -- Owns the docks in the lobby and at every checkpoint. A client asks to spawn a
 -- boat for a number of players at a dock; this checks the request is allowed and
--- has BoatService spawn it. Each player can have one boat waiting at a dock: asking
--- for another one replaces it.
+-- has BoatService spawn it, with the requester as party leader. Each player can lead
+-- one boat waiting at a dock: asking for another one (say, a different size) replaces
+-- it, and everyone already aboard moves into the new boat, leader first, as far as
+-- the seats go.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
@@ -92,12 +95,21 @@ function DockServiceServer.HandleSpawnRequest(
 	if not CheckpointServiceServer:IsUnlockedAsync(player, dock.Location) then
 		return false, "You haven't reached this checkpoint yet"
 	end
-	-- One waiting boat per player: a new one replaces the old one, even at the same dock.
-	local previousBoat = BoatServiceServer:GetDockedBoatOwnedBy(player)
+	-- One waiting boat per leader: a new one replaces the old one, even at the same dock.
+	local previousBoat = BoatServiceServer:GetDockedBoatLedBy(player)
 	if not dock:IsFree() and (previousBoat == nil or dock.Boat ~= previousBoat) then
 		return false, "This dock already has a boat"
 	end
+	local passengers: { Player } = {}
 	if previousBoat then
+		-- The party moves to the new boat, leader first.
+		for _, seatedPlayer in previousBoat:GetSeatedPlayers() do
+			if seatedPlayer == player then
+				table.insert(passengers, 1, seatedPlayer)
+			else
+				table.insert(passengers, seatedPlayer)
+			end
+		end
 		BoatServiceServer:DestroyBoat(previousBoat)
 	end
 
@@ -107,6 +119,16 @@ function DockServiceServer.HandleSpawnRequest(
 		return false, problem
 	end
 	dock.Boat = boat
+
+	if #passengers > 0 then
+		-- Give everyone a moment to stand up from the old seats before sitting them down.
+		RunService.Heartbeat:Wait()
+		for _, passenger in passengers do
+			if passenger.Parent then
+				boat:SeatPlayer(passenger)
+			end
+		end
+	end
 	return true, nil
 end
 

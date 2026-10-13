@@ -271,8 +271,13 @@ return TableUtil
 --!strict
 -- ModuleScript: ServerScriptService.Classes.Boat
 --
--- A boat cloned from a template in ReplicatedStorage.Assets.Boats. It waits at a
--- dock until every seat is taken, counts down, then moves into the river and floats.
+-- A boat cloned from a template in ReplicatedStorage.Assets.Boats. The player who
+-- spawns it is its party leader. It waits at its dock while players get in, then moves
+-- into the river and floats. It leaves at the earliest of:
+--   - the join timer running out (JOIN_TIME after it spawned), with whoever is aboard
+--   - LAUNCH_DELAY after every seat is taken (cancelled if someone gets up)
+--   - LAUNCH_DELAY after the leader starts the run early
+-- If nobody is aboard when it's time to leave, it's removed instead.
 -- On the river the server owns its physics: WaterService keeps it afloat and
 -- FartService pushes it.
 --
@@ -286,9 +291,8 @@ return TableUtil
 --                 the edge facing the middle. A one-seat boat can have its seat in the
 --                 middle, facing forward.
 --
--- States: Docked -> Launching -> Launched -> Destroyed. Launching goes back to Docked
--- if a seat empties during the countdown. The model's State and LaunchTime attributes
--- (see BoatServiceShared) mirror this for clients.
+-- States: Docked -> Launched -> Destroyed. The model's State, LeaderUserId and
+-- DepartureTime attributes (see BoatServiceShared) mirror this for clients.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -302,15 +306,16 @@ Boat.__index = Boat
 
 type BoatMembers = {
 	Model: Model,
-	Owner: Player, -- who spawned it
+	Leader: Player, -- the party leader: who spawned it, or who took over after they left
 	Seats: { Seat },
 	State: BoatServiceShared.BoatState,
 	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
-	EmptySince: number?, -- os.clock() when a docked boat last became empty, nil while anyone is aboard
-	LaunchCount: number, -- goes up whenever a countdown starts or stops, so an old countdown can tell it's stale
+	JoinDeadline: number, -- server time the join timer runs out
+	FullDeadline: number?, -- server time it leaves because every seat is taken (nil while any seat is free)
+	StartDeadline: number?, -- server time it leaves because the leader started the run early
 	Connections: { RBXScriptConnection },
 	CrewMemberLeft: Signal.Signal, -- fires (player: Player) when a crew member leaves after launch, for any reason
 }
@@ -404,7 +409,7 @@ end
 -- passed CheckTemplate.
 function Boat.new(
 	template: Model,
-	owner: Player,
+	leader: Player,
 	dockCFrame: CFrame,
 	launchCFrame: CFrame,
 	startIndex: number,
@@ -414,15 +419,16 @@ function Boat.new(
 	local self = setmetatable(
 		{
 			Model = model,
-			Owner = owner,
+			Leader = leader,
 			Seats = GetSeats(model),
 			State = "Docked",
 			Frozen = false,
 			Crew = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
-			EmptySince = os.clock(),
-			LaunchCount = 0,
+			JoinDeadline = workspace:GetServerTimeNow() + BoatConfig.JOIN_TIME,
+			FullDeadline = nil,
+			StartDeadline = nil,
 			Connections = {},
 			CrewMemberLeft = Signal.new(),
 		} :: BoatMembers,
@@ -450,6 +456,8 @@ function Boat.new(
 	end
 
 	model:SetAttribute(BoatServiceShared.STATE_ATTRIBUTE, self.State)
+	self:SetLeader(leader)
+	self:UpdateDepartureTime()
 	model.Parent = parent
 	return self
 end
@@ -464,9 +472,9 @@ function Boat.GetPosition(self: Boat): Vector3
 	return self.Model:GetPivot().Position
 end
 
--- True while the boat is still at its dock (waiting or counting down).
+-- True while the boat is still waiting at its dock.
 function Boat.IsAtDock(self: Boat): boolean
-	return self.State == "Docked" or self.State == "Launching"
+	return self.State == "Docked"
 end
 
 -- True while the boat is on the river and moving under physics.
@@ -525,52 +533,93 @@ function Boat.OnSeatChanged(self: Boat, seat: Seat)
 		return
 	end
 
-	local seatedCount = #self:GetSeatedPlayers()
-	if seatedCount == 0 then
-		self.EmptySince = self.EmptySince or os.clock()
-	else
-		self.EmptySince = nil
+	local isFull = #self:GetSeatedPlayers() == #self.Seats
+	if isFull and not self.FullDeadline then
+		self.FullDeadline = workspace:GetServerTimeNow() + BoatConfig.LAUNCH_DELAY
+	elseif not isFull then
+		self.FullDeadline = nil
 	end
-	if seatedCount == #self.Seats then
-		self:BeginLaunch()
-	else
-		self:CancelLaunch()
-	end
+	self:UpdateDepartureTime()
 end
 
-function Boat.BeginLaunch(self: Boat)
+function Boat.SetLeader(self: Boat, player: Player)
+	self.Leader = player
+	self.Model:SetAttribute(BoatServiceShared.LEADER_ATTRIBUTE, player.UserId)
+end
+
+-- The server time this docked boat leaves: the earliest of its deadlines.
+function Boat.GetDepartureTime(self: Boat): number
+	local departureTime = self.JoinDeadline
+	local fullDeadline = self.FullDeadline
+	if fullDeadline then
+		departureTime = math.min(departureTime, fullDeadline)
+	end
+	local startDeadline = self.StartDeadline
+	if startDeadline then
+		departureTime = math.min(departureTime, startDeadline)
+	end
+	return departureTime
+end
+
+function Boat.UpdateDepartureTime(self: Boat)
+	self.Model:SetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE, self:GetDepartureTime())
+end
+
+-- The leader started the run early: leave after LAUNCH_DELAY, whoever is aboard.
+function Boat.StartEarly(self: Boat)
+	if self.State ~= "Docked" or self.StartDeadline then
+		return
+	end
+	self.StartDeadline = workspace:GetServerTimeNow() + BoatConfig.LAUNCH_DELAY
+	self:UpdateDepartureTime()
+end
+
+function Boat.HasFreeSeat(self: Boat): boolean
+	for _, seat in self.Seats do
+		if not seat.Occupant then
+			return true
+		end
+	end
+	return false
+end
+
+-- Sits `player` in a free seat of this docked boat. They must not be sitting anywhere
+-- else. Returns false if there's no free seat or they can't sit right now.
+function Boat.SeatPlayer(self: Boat, player: Player): boolean
+	if self.State ~= "Docked" then
+		return false
+	end
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	if not humanoid or humanoid.Health <= 0 or humanoid.SeatPart then
+		return false
+	end
+	for _, seat in self.Seats do
+		if not seat.Occupant then
+			seat:Sit(humanoid)
+			return true
+		end
+	end
+	return false
+end
+
+-- Called once the departure time arrives: into the river with whoever is aboard, or
+-- removed if nobody is.
+function Boat.Depart(self: Boat)
 	if self.State ~= "Docked" then
 		return
 	end
-	self:SetState("Launching")
-	self.LaunchCount += 1
-	local launchCount = self.LaunchCount
-	self.Model:SetAttribute(
-		BoatServiceShared.LAUNCH_TIME_ATTRIBUTE,
-		workspace:GetServerTimeNow() + BoatConfig.LAUNCH_DELAY
-	)
-	task.delay(BoatConfig.LAUNCH_DELAY, function()
-		-- The state may have changed during the countdown.
-		local currentState: BoatServiceShared.BoatState = self.State
-		if self.LaunchCount == launchCount and currentState == "Launching" then
-			self:Launch()
-		end
-	end)
-end
-
-function Boat.CancelLaunch(self: Boat)
-	if self.State ~= "Launching" then
-		return
+	if #self:GetSeatedPlayers() == 0 then
+		self:Destroy()
+	else
+		self:Launch()
 	end
-	self.LaunchCount += 1
-	self:SetState("Docked")
-	self.Model:SetAttribute(BoatServiceShared.LAUNCH_TIME_ATTRIBUTE, nil)
 end
 
 function Boat.Launch(self: Boat)
 	self.Crew = self:GetSeatedPlayers()
 	self:SetState("Launched")
-	self.Model:SetAttribute(BoatServiceShared.LAUNCH_TIME_ATTRIBUTE, nil)
+	self.Model:SetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE, nil)
 	self:MoveTo(self.LaunchCFrame)
 	self:StartFloating()
 end
@@ -657,7 +706,6 @@ function Boat.Destroy(self: Boat)
 	end
 	local wasLaunched = self.State == "Launched"
 	self:SetState("Destroyed")
-	self.LaunchCount += 1
 	for _, connection in self.Connections do
 		connection:Disconnect()
 	end
@@ -933,14 +981,22 @@ UI.Init(UI)
 --!strict
 -- ModuleScript: ServerScriptService.Services.BoatService.BoatServiceServer
 --
--- Owns every boat: spawning them from templates, launching them into the river
--- and removing them. Boats are Boat objects (ServerScriptService.Classes.Boat).
--- DockService asks it for new boats, CheckpointService and WaterService ask it
--- which boats are on the river, and FartService asks which boat a player is riding.
+-- Owns every boat: spawning them from templates, filling them with players,
+-- launching them into the river and removing them. Boats are Boat objects
+-- (ServerScriptService.Classes.Boat). DockService asks it for new boats,
+-- CheckpointService and WaterService ask it which boats are on the river, and
+-- FartService asks which boat a player is riding.
+--
+-- Joining: the player who spawns a boat is its party leader. Anyone can get in by
+-- sitting in a free seat, or by asking to join (RequestJoinBoat). The boat leaves when
+-- its join timer runs out, when it's full, or when the leader starts the run early
+-- (RequestStartRun); see the Boat class. If the leader leaves the game, someone aboard
+-- takes over; if nobody is aboard, the boat is removed.
 
 local PhysicsService = game:GetService("PhysicsService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 local Boat = require(ServerScriptService.Classes.Boat)
@@ -957,6 +1013,7 @@ type BoatServiceServerMembers = {
 	TemplatesFolder: Instance?,
 	CrewMemberLeft: Signal.Signal, -- fires (player: Player, boat: Boat) when anyone leaves a launched boat, for any reason
 	NotifyBoatWipedRemote: RemoteEvent,
+	LastRequestTimes: { [Player]: number },
 }
 
 export type BoatServiceServer = typeof(BoatServiceServer) & BoatServiceServerMembers
@@ -964,8 +1021,20 @@ export type BoatServiceServer = typeof(BoatServiceServer) & BoatServiceServerMem
 function BoatServiceServer.Init(self: BoatServiceServer)
 	self.Boats = {}
 	self.CrewMemberLeft = Signal.new()
+	self.LastRequestTimes = {}
 	self.NotifyBoatWipedRemote =
 		Remotes.CreateEvent(BoatServiceShared.SERVICE_NAME, BoatServiceShared.NOTIFY_BOAT_WIPED)
+	Remotes.CreateFunction(BoatServiceShared.SERVICE_NAME, BoatServiceShared.REQUEST_JOIN_BOAT).OnServerInvoke = function(
+		player: Player,
+		boatModel: unknown
+	)
+		return self:HandleJoinRequest(player, boatModel)
+	end
+	Remotes.CreateFunction(BoatServiceShared.SERVICE_NAME, BoatServiceShared.REQUEST_START_RUN).OnServerInvoke = function(
+		player: Player
+	)
+		return self:HandleStartRequest(player)
+	end
 
 	-- Boats pass through each other.
 	local collisionGroup = BoatServiceShared.COLLISION_GROUP
@@ -988,6 +1057,9 @@ function BoatServiceServer.Init(self: BoatServiceServer)
 		self:OnPlayerRemoving(player)
 	end)
 
+	RunService.Heartbeat:Connect(function()
+		self:UpdateDepartures()
+	end)
 	task.spawn(function()
 		while true do
 			task.wait(BoatConfig.CLEANUP_INTERVAL)
@@ -1010,11 +1082,11 @@ function BoatServiceServer.CheckTemplates(self: BoatServiceServer)
 	end
 end
 
--- Spawns a boat for `seatCount` players at a dock. Returns the boat, or nil and a
--- message for the player. DockService has already checked the request is allowed.
+-- Spawns a boat for `seatCount` players at a dock, led by `leader`. Returns the boat,
+-- or nil and a message for the player. DockService has already checked the request is allowed.
 function BoatServiceServer.SpawnBoat(
 	self: BoatServiceServer,
-	owner: Player,
+	leader: Player,
 	seatCount: number,
 	dockCFrame: CFrame,
 	launchCFrame: CFrame,
@@ -1028,7 +1100,7 @@ function BoatServiceServer.SpawnBoat(
 		return nil, "That boat size isn't built yet"
 	end
 
-	local boat = Boat.new(template, owner, dockCFrame, launchCFrame, startIndex, self.BoatsFolder)
+	local boat = Boat.new(template, leader, dockCFrame, launchCFrame, startIndex, self.BoatsFolder)
 	boat.CrewMemberLeft:Connect(function(player: Player)
 		self.CrewMemberLeft:Fire(player, boat)
 	end)
@@ -1055,14 +1127,111 @@ function BoatServiceServer.GetLaunchedBoats(self: BoatServiceServer): { Boat.Boa
 	return launchedBoats
 end
 
--- The boat `player` spawned that is still waiting at a dock, if any.
-function BoatServiceServer.GetDockedBoatOwnedBy(self: BoatServiceServer, player: Player): Boat.Boat?
+-- The boat waiting at a dock that `player` leads, if any.
+function BoatServiceServer.GetDockedBoatLedBy(self: BoatServiceServer, player: Player): Boat.Boat?
 	for _, boat in self.Boats do
-		if boat.Owner == player and boat:IsAtDock() then
+		if boat.Leader == player and boat:IsAtDock() then
 			return boat
 		end
 	end
 	return nil
+end
+
+function BoatServiceServer.GetBoatByModel(self: BoatServiceServer, model: Instance): Boat.Boat?
+	for _, boat in self.Boats do
+		if boat.Model == model then
+			return boat
+		end
+	end
+	return nil
+end
+
+-- Sends every docked boat whose departure time has come.
+function BoatServiceServer.UpdateDepartures(self: BoatServiceServer)
+	local now = workspace:GetServerTimeNow()
+	for _, boat in table.clone(self.Boats) do
+		if boat:IsAtDock() and now >= boat:GetDepartureTime() then
+			boat:Depart()
+		end
+	end
+end
+
+-- Returns false if `player` made a join or start request less than REQUEST_COOLDOWN ago.
+function BoatServiceServer.PassesRequestCooldown(self: BoatServiceServer, player: Player): boolean
+	local now = os.clock()
+	local lastRequestTime = self.LastRequestTimes[player]
+	if lastRequestTime and now - lastRequestTime < BoatConfig.REQUEST_COOLDOWN then
+		return false
+	end
+	self.LastRequestTimes[player] = now
+	return true
+end
+
+-- Client request: sit in a free seat of a boat waiting at a dock.
+function BoatServiceServer.HandleJoinRequest(
+	self: BoatServiceServer,
+	player: Player,
+	boatModel: unknown
+): (boolean, string?)
+	if typeof(boatModel) ~= "Instance" then
+		return false, "Invalid request"
+	end
+	if not self:PassesRequestCooldown(player) then
+		return false, "Wait a moment"
+	end
+	local boat = self:GetBoatByModel(boatModel)
+	if not boat or not boat:IsAtDock() then
+		return false, "That boat has already left"
+	end
+	if boat:GetSeatOf(player) then
+		return true, nil
+	end
+	if self:GetLaunchedBoatOf(player) then
+		return false, "You're already on the river"
+	end
+	if not boat:HasFreeSeat() then
+		return false, "That boat is full"
+	end
+
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
+	if not humanoid or humanoid.Health <= 0 or not rootPart or not rootPart:IsA("BasePart") then
+		return false, "Wait until you've respawned"
+	end
+	if (rootPart.Position - boat:GetPosition()).Magnitude > BoatConfig.JOIN_DISTANCE then
+		return false, "Get closer to the boat"
+	end
+
+	-- Get up from any other seat first, and give the character a moment to stand.
+	local currentSeat = humanoid.SeatPart
+	if currentSeat then
+		local seatWeld = currentSeat:FindFirstChild("SeatWeld")
+		if seatWeld then
+			seatWeld:Destroy()
+		end
+		RunService.Heartbeat:Wait()
+	end
+	if not boat:SeatPlayer(player) then
+		return false, "Couldn't get you a seat, try again"
+	end
+	return true, nil
+end
+
+-- Client request from a party leader: start the run now instead of waiting for the timer.
+function BoatServiceServer.HandleStartRequest(self: BoatServiceServer, player: Player): (boolean, string?)
+	if not self:PassesRequestCooldown(player) then
+		return false, "Wait a moment"
+	end
+	local boat = self:GetDockedBoatLedBy(player)
+	if not boat then
+		return false, "You're not leading a boat"
+	end
+	if not boat:GetSeatOf(player) then
+		return false, "Get in your boat first"
+	end
+	boat:StartEarly()
+	return true, nil
 end
 
 -- Takes `player` out of whatever boat seat they're in.
@@ -1072,16 +1241,11 @@ function BoatServiceServer.EjectPlayer(self: BoatServiceServer, player: Player)
 	end
 end
 
--- Removes boats that were destroyed, and docked boats left empty for too long.
--- Also makes sure the server still simulates every boat on the river.
+-- Forgets boats that were destroyed, and makes sure the server still simulates every
+-- boat on the river.
 function BoatServiceServer.CleanUp(self: BoatServiceServer)
-	local now = os.clock()
 	for index = #self.Boats, 1, -1 do
 		local boat = self.Boats[index]
-		local emptySince = boat.EmptySince
-		if boat:IsAtDock() and emptySince and now - emptySince >= BoatConfig.EMPTY_DOCKED_TIMEOUT then
-			boat:Destroy()
-		end
 		if boat.State == "Destroyed" then
 			table.remove(self.Boats, index)
 		elseif boat:IsFloating() then
@@ -1115,12 +1279,21 @@ function BoatServiceServer.WipeBoat(self: BoatServiceServer, boat: Boat.Boat)
 	end)
 end
 
--- A player who leaves the game takes their waiting boat with them, unless friends are already in it.
+-- A leader who leaves the game hands their waiting boat to someone aboard. If nobody
+-- else is aboard, the boat goes with them.
 function BoatServiceServer.OnPlayerRemoving(self: BoatServiceServer, player: Player)
-	local boat = self:GetDockedBoatOwnedBy(player)
-	if boat and #boat:GetSeatedPlayers() == 0 then
-		self:DestroyBoat(boat)
+	self.LastRequestTimes[player] = nil
+	local boat = self:GetDockedBoatLedBy(player)
+	if not boat then
+		return
 	end
+	for _, seatedPlayer in boat:GetSeatedPlayers() do
+		if seatedPlayer ~= player and not self:GetDockedBoatLedBy(seatedPlayer) then
+			boat:SetLeader(seatedPlayer)
+			return
+		end
+	end
+	self:DestroyBoat(boat)
 end
 
 return BoatServiceServer :: BoatServiceServer
@@ -1677,11 +1850,14 @@ return DataServiceServer :: DataServiceServer
 --
 -- Owns the docks in the lobby and at every checkpoint. A client asks to spawn a
 -- boat for a number of players at a dock; this checks the request is allowed and
--- has BoatService spawn it. Each player can have one boat waiting at a dock: asking
--- for another one replaces it.
+-- has BoatService spawn it, with the requester as party leader. Each player can lead
+-- one boat waiting at a dock: asking for another one (say, a different size) replaces
+-- it, and everyone already aboard moves into the new boat, leader first, as far as
+-- the seats go.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
@@ -1766,12 +1942,21 @@ function DockServiceServer.HandleSpawnRequest(
 	if not CheckpointServiceServer:IsUnlockedAsync(player, dock.Location) then
 		return false, "You haven't reached this checkpoint yet"
 	end
-	-- One waiting boat per player: a new one replaces the old one, even at the same dock.
-	local previousBoat = BoatServiceServer:GetDockedBoatOwnedBy(player)
+	-- One waiting boat per leader: a new one replaces the old one, even at the same dock.
+	local previousBoat = BoatServiceServer:GetDockedBoatLedBy(player)
 	if not dock:IsFree() and (previousBoat == nil or dock.Boat ~= previousBoat) then
 		return false, "This dock already has a boat"
 	end
+	local passengers: { Player } = {}
 	if previousBoat then
+		-- The party moves to the new boat, leader first.
+		for _, seatedPlayer in previousBoat:GetSeatedPlayers() do
+			if seatedPlayer == player then
+				table.insert(passengers, 1, seatedPlayer)
+			else
+				table.insert(passengers, seatedPlayer)
+			end
+		end
 		BoatServiceServer:DestroyBoat(previousBoat)
 	end
 
@@ -1781,6 +1966,16 @@ function DockServiceServer.HandleSpawnRequest(
 		return false, problem
 	end
 	dock.Boat = boat
+
+	if #passengers > 0 then
+		-- Give everyone a moment to stand up from the old seats before sitting them down.
+		RunService.Heartbeat:Wait()
+		for _, passenger in passengers do
+			if passenger.Parent then
+				boat:SeatPlayer(passenger)
+			end
+		end
+	end
 	return true, nil
 end
 
@@ -2202,8 +2397,11 @@ local BoatConfig = {
 		[6] = 0.7,
 	} :: { [number]: number },
 
-	LAUNCH_DELAY = 3, -- seconds between the last seat filling up and the boat leaving the dock
-	EMPTY_DOCKED_TIMEOUT = 60, -- a boat waiting at a dock with nobody in it is removed after this many seconds
+	-- Joining
+	JOIN_TIME = 30, -- seconds players have to get in after the party leader spawns a boat
+	LAUNCH_DELAY = 3, -- countdown (seconds) once every seat is taken or the leader starts the run early
+	JOIN_DISTANCE = 40, -- how close (studs) a player must be to a boat to ask to join it
+	REQUEST_COOLDOWN = 1, -- seconds a player has to wait between join or start requests
 	CLEANUP_INTERVAL = 1, -- seconds between checks for boats to remove (also re-claims boat physics for the server)
 	WIPE_DELAY = 1.5, -- seconds a boat that fell off the river hangs frozen before its crew respawns
 
@@ -2436,6 +2634,8 @@ return Geometry
 --   - While the local player sits in a boat on the river, jumping is switched off so
 --     they don't fall out by accident. (The server still handles anyone who leaves.)
 --   - BoatWiped fires when their boat falls off the river, for the UI (a RIP screen).
+--   - RequestJoinBoat, RequestStartRun, IsLeaderOf and GetSecondsUntilDeparture are for
+--     the joining UI (to be built): a Join button, the leader's Start button and the timer.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -2492,6 +2692,36 @@ function BoatServiceClient.UpdateJumpLock(self: BoatServiceClient)
 	self.LockedHumanoid = humanoidToLock
 end
 
+-- Asks to sit in a free seat of `boatModel`, a boat waiting at a dock.
+-- Returns whether it worked and, if not, a message to show the player.
+function BoatServiceClient.RequestJoinBoat(self: BoatServiceClient, boatModel: Model): (boolean, string?)
+	local remote = Remotes.WaitForFunction(BoatServiceShared.SERVICE_NAME, BoatServiceShared.REQUEST_JOIN_BOAT)
+	local success, message = remote:InvokeServer(boatModel)
+	return success == true, if type(message) == "string" then message else nil
+end
+
+-- Party leader only: start the run now instead of waiting for the join timer.
+-- Returns whether it worked and, if not, a message to show the player.
+function BoatServiceClient.RequestStartRun(self: BoatServiceClient): (boolean, string?)
+	local remote = Remotes.WaitForFunction(BoatServiceShared.SERVICE_NAME, BoatServiceShared.REQUEST_START_RUN)
+	local success, message = remote:InvokeServer()
+	return success == true, if type(message) == "string" then message else nil
+end
+
+-- Whether the local player leads `boatModel`.
+function BoatServiceClient.IsLeaderOf(self: BoatServiceClient, boatModel: Model): boolean
+	return boatModel:GetAttribute(BoatServiceShared.LEADER_ATTRIBUTE) == Players.LocalPlayer.UserId
+end
+
+-- Seconds until `boatModel` leaves its dock, or nil once it has left.
+function BoatServiceClient.GetSecondsUntilDeparture(self: BoatServiceClient, boatModel: Model): number?
+	local departureTime = boatModel:GetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE)
+	if typeof(departureTime) ~= "number" then
+		return nil
+	end
+	return math.max(0, departureTime - workspace:GetServerTimeNow())
+end
+
 return BoatServiceClient :: BoatServiceClient
 ]==],
 	},
@@ -2509,7 +2739,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 
-export type BoatState = "Docked" | "Launching" | "Launched" | "Destroyed"
+export type BoatState = "Docked" | "Launched" | "Destroyed"
 
 local BoatServiceShared = {
 	SERVICE_NAME = "BoatService",
@@ -2519,10 +2749,13 @@ local BoatServiceShared = {
 
 	-- Attributes on each spawned boat model, for clients and UI
 	STATE_ATTRIBUTE = "State", -- a BoatState
-	LAUNCH_TIME_ATTRIBUTE = "LaunchTime", -- server time (workspace:GetServerTimeNow()) the boat leaves the dock
+	LEADER_ATTRIBUTE = "LeaderUserId", -- UserId of the party leader
+	DEPARTURE_TIME_ATTRIBUTE = "DepartureTime", -- server time (workspace:GetServerTimeNow()) a docked boat leaves
 
 	-- Remotes
 	NOTIFY_BOAT_WIPED = "NotifyBoatWiped", -- RemoteEvent to each crew member when their boat falls off the river
+	REQUEST_JOIN_BOAT = "RequestJoinBoat", -- RemoteFunction (boat: Model) -> (success: boolean, message: string?)
+	REQUEST_START_RUN = "RequestStartRun", -- RemoteFunction () -> (success: boolean, message: string?); party leader only
 }
 
 -- The spawned boat model a part belongs to (for example a Seat), if any.

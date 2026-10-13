@@ -34,8 +34,11 @@ local BoatConfig = {
 		[6] = 0.7,
 	} :: { [number]: number },
 
-	LAUNCH_DELAY = 3, -- seconds between the last seat filling up and the boat leaving the dock
-	EMPTY_DOCKED_TIMEOUT = 60, -- a boat waiting at a dock with nobody in it is removed after this many seconds
+	-- Joining
+	JOIN_TIME = 30, -- seconds players have to get in after the party leader spawns a boat
+	LAUNCH_DELAY = 3, -- countdown (seconds) once every seat is taken or the leader starts the run early
+	JOIN_DISTANCE = 40, -- how close (studs) a player must be to a boat to ask to join it
+	REQUEST_COOLDOWN = 1, -- seconds a player has to wait between join or start requests
 	CLEANUP_INTERVAL = 1, -- seconds between checks for boats to remove (also re-claims boat physics for the server)
 	WIPE_DELAY = 1.5, -- seconds a boat that fell off the river hangs frozen before its crew respawns
 
