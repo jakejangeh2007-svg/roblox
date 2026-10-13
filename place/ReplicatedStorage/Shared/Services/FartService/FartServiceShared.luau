@@ -8,9 +8,10 @@ local FartServiceShared = {
 	GAS_ATTRIBUTE = "Gas", -- on each Player: their current gas, a whole number from 0 to FartConfig.GAS_MAX
 
 	-- Remotes
-	REQUEST_FART = "RequestFart", -- RemoteEvent client -> server (direction: string, heldTime: number)
-	PLAY_FART = "PlayFart", -- RemoteEvent server -> other clients (farter: Player, direction: string, power: number, isMega: boolean)
-	PLAY_FARTQUAKE = "PlayFartquake", -- RemoteEvent server -> each crew member of a boat that just FARTQUAKEd
+	REQUEST_START_FART = "RequestStartFart", -- RemoteEvent client -> server (direction: string): start (or switch) farting
+	REQUEST_STOP_FART = "RequestStopFart", -- RemoteEvent client -> server (): stop farting
+	PLAY_FART = "PlayFart", -- RemoteEvent server -> clients (farter: Player, direction: string): farter started farting
+	STOP_FART = "StopFart", -- RemoteEvent server -> clients (farter: Player): farter stopped farting
 }
 
 return FartServiceShared

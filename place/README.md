@@ -198,9 +198,14 @@ Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`
 | Straight | `W`, `↑`, `Space` | `RT` | pushes the boat away from you |
 | Right | `D`, `→`, `E` | `RB` | turns the boat right |
 
-Tap to toot. Hold, then let go, for a Mega Fart (up to 3× the push). Each fart uses gas,
-which refills over time. When 3 or more players on one boat (or everyone, if fewer)
-Mega Fart at once, it's a **FARTQUAKE** and every push gets 1.5× stronger.
+**Hold a key to keep farting.** The push starts at 1× and grows to 2.5× over 3 seconds of
+nonstop farting. Letting go stops, and the next fart starts at 1× again. If you hold two
+keys, the one you pressed last wins.
+
+**Gas** drains at a flat 10 per second while you fart, whatever the power, so a full tank
+(100) lasts 10 seconds. It refills at 15 per second while you're not farting. When it runs
+out you stop; let go and press again once there's gas. All of these numbers are in `FartConfig`.
+
 Everyone farting Straight cancels out; everyone farting Left spins the boat on the spot.
 
 **Seat Cam:** on the river the camera sits behind your seat, so Straight always pushes
@@ -269,11 +274,12 @@ Output warns at startup about any template that's missing or doesn't follow thes
 
 ## Fart effects
 
-- **`ReplicatedStorage.Assets.VFX.FartCloud`:** a ParticleEmitter for the gas cloud.
-  Set its **Rate to 0** (farts call Emit), and its Texture, Color, Size and so on however
-  you like. Its Speed is multiplied by each fart's power.
+- **`ReplicatedStorage.Assets.VFX.FartCloud`:** a ParticleEmitter for the gas cloud. Set
+  its Texture, Color, Size and so on however you like. While someone farts, its Rate
+  (`FartConfig.STREAM_PARTICLE_RATE`) and Speed are multiplied by their power.
 - **`ReplicatedStorage.Assets.Sounds.Farts`:** a Folder of fart Sounds from the Creator
-  Store. Each fart plays a random one at a slightly random pitch.
+  Store. Each fart loops a random one, and its pitch and volume rise with power.
+  Sounds that loop smoothly work best.
 
 Without them farts still work, just invisible or silent, and Output warns once.
 
@@ -294,9 +300,8 @@ The client halves have everything the menus need:
 | List changed | `CheckpointServiceClient.UnlockedCheckpointsChanged` |
 | "Checkpoint reached" / "You win" | `CheckpointServiceClient.CheckpointReached`, `CheckpointServiceClient.GameCompleted` |
 | Gas meter | the player's `Gas` attribute, 0 to `FartConfig.GAS_MAX` |
-| Mega Fart charge bar | `FartServiceClient.ChargeStarted` and `ChargeEnded`; charge = time held / `MEGA_CHARGE_TIME` |
-| Touch fart buttons | call `FartServiceClient:StartCharge(direction)` on press and `ReleaseCharge(direction)` on release (`"Left"`, `"Straight"`, `"Right"`) |
-| "FARTQUAKE!" banner | `FartServiceClient.Fartquake` |
+| Touch fart buttons | call `FartServiceClient:PressFart(direction)` on press and `ReleaseFart(direction)` on release (`"Left"`, `"Straight"`, `"Right"`) |
+| Farting on and off (e.g. button glow) | `FartServiceClient.FartStarted` (direction) and `FartStopped` |
 | RIP screen | `BoatServiceClient.BoatWiped` |
 
 ## Saving

@@ -1,8 +1,8 @@
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Services.FartService.FartPhysics
 --
--- The rules for what one fart does. Pure math, shared by the server (which moves
--- the boat) and the client (which predicts gas use and plays effects straight away).
+-- The rules for what farting does. Pure math, shared by the server (which moves the
+-- boat) and the client (which plays effects that match).
 --
 -- Riders face the middle of the boat. "Straight" pushes the boat away from the
 -- rider. "Left" turns the boat left, the same way from every seat, plus a small
@@ -22,27 +22,17 @@ function FartPhysics.IsDirection(value: unknown): boolean
 	return value == "Left" or value == "Straight" or value == "Right"
 end
 
--- Holding a fart key at least MEGA_MIN_HOLD seconds turns a toot into a Mega Fart.
-function FartPhysics.IsMega(heldTime: number): boolean
-	return heldTime >= FartConfig.MEGA_MIN_HOLD
+-- A fart's power after `fartingTime` seconds of nonstop farting: MIN_POWER at the
+-- start, growing evenly to MAX_POWER after POWER_RAMP_TIME.
+function FartPhysics.GetPower(fartingTime: number): number
+	local progress = math.clamp(fartingTime / FartConfig.POWER_RAMP_TIME, 0, 1)
+	return FartConfig.MIN_POWER + (FartConfig.MAX_POWER - FartConfig.MIN_POWER) * progress
 end
 
-function FartPhysics.GetCost(heldTime: number): number
-	return if FartPhysics.IsMega(heldTime) then FartConfig.MEGA_COST else FartConfig.TOOT_COST
-end
-
--- 1 for a toot, up to MEGA_MULT for a fully charged Mega Fart.
-function FartPhysics.GetPower(heldTime: number): number
-	if not FartPhysics.IsMega(heldTime) then
-		return 1
-	end
-	local charge = math.clamp(heldTime / FartConfig.MEGA_CHARGE_TIME, 0, 1)
-	return 1 + (FartConfig.MEGA_MULT - 1) * charge
-end
-
--- How much one fart from `seatCFrame` changes the boat's velocity (studs/s) and its
--- turn speed (rad/s). A positive turn is a LEFT turn (counter-clockwise seen from above).
-function FartPhysics.GetKick(
+-- How fast a fart from `seatCFrame` speeds the boat up (studs/s²) and turns it
+-- (rad/s²) at `power`. A positive turn is a LEFT turn (counter-clockwise seen from above).
+-- Multiply both by the frame's time to get the change for that frame.
+function FartPhysics.GetThrust(
 	boatPosition: Vector3,
 	seatCFrame: CFrame,
 	direction: Direction,
@@ -53,12 +43,12 @@ function FartPhysics.GetKick(
 
 	if direction == "Straight" then
 		-- Gas goes out behind the rider, so the boat moves away from them.
-		return facing * FartConfig.PUSH_SPEED * power, 0
+		return facing * FartConfig.THRUST * power, 0
 	elseif direction == "Left" then
 		-- Like an outboard motor: shove our side right so the far side swings left.
-		return right * FartConfig.PUSH_SPEED * FartConfig.SIDE_PUSH * power, FartConfig.SPIN_SPEED * power
+		return right * FartConfig.THRUST * FartConfig.SIDE_THRUST * power, FartConfig.SPIN_THRUST * power
 	else
-		return -right * FartConfig.PUSH_SPEED * FartConfig.SIDE_PUSH * power, -FartConfig.SPIN_SPEED * power
+		return -right * FartConfig.THRUST * FartConfig.SIDE_THRUST * power, -FartConfig.SPIN_THRUST * power
 	end
 end
 

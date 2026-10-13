@@ -1998,16 +1998,18 @@ return DockServiceServer :: DockServiceServer
 --!strict
 -- ModuleScript: ServerScriptService.Services.FartService.FartServiceServer
 --
--- Checks every fart a client asks for, spends the player's gas and pushes their
--- boat. Clients only ask; this decides. Also handles FARTQUAKEs (several Mega Farts
--- on one boat at almost the same moment) and tells other players to play the effect.
+-- Runs every player's farting. A client asks to start farting in a direction (or to
+-- stop); this checks they're riding a boat on the river and have gas, then pushes
+-- their boat every frame until they stop, run out of gas or leave the boat. Power
+-- grows the longer they keep farting (FartPhysics.GetPower). Gas drains at a flat
+-- rate while farting and refills while not. Other players are told when someone
+-- starts or stops, so they can show it.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
-local Boat = require(ServerScriptService.Classes.Boat)
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
@@ -2017,35 +2019,37 @@ local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 
 local SERVICE_NAME = FartServiceShared.SERVICE_NAME
 
-type Mega = {
-	Player: Player,
-	Time: number,
-	Push: Vector3,
-	Spin: number,
+type Stream = {
+	Direction: FartPhysics.Direction,
+	StartedAt: number, -- os.clock() when this fart started, for its power
 }
 
 local FartServiceServer = {}
 
 type FartServiceServerMembers = {
 	Gas: { [Player]: number },
-	LastFartTimes: { [Player]: number },
-	RecentMegas: { [Boat.Boat]: { Mega } },
+	Streams: { [Player]: Stream }, -- everyone farting right now
+	LastStartTimes: { [Player]: number },
 	PlayFartRemote: RemoteEvent,
-	PlayFartquakeRemote: RemoteEvent,
+	StopFartRemote: RemoteEvent,
 }
 
 export type FartServiceServer = typeof(FartServiceServer) & FartServiceServerMembers
 
 function FartServiceServer.Init(self: FartServiceServer)
 	self.Gas = {}
-	self.LastFartTimes = {}
-	self.RecentMegas = setmetatable({}, { __mode = "k" }) :: any
+	self.Streams = {}
+	self.LastStartTimes = {}
 	self.PlayFartRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.PLAY_FART)
-	self.PlayFartquakeRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.PLAY_FARTQUAKE)
+	self.StopFartRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.STOP_FART)
 
-	Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.REQUEST_FART).OnServerEvent
-		:Connect(function(player: Player, direction: unknown, heldTime: unknown)
-			self:HandleFartRequest(player, direction, heldTime)
+	Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.REQUEST_START_FART).OnServerEvent
+		:Connect(function(player: Player, direction: unknown)
+			self:HandleStartRequest(player, direction)
+		end)
+	Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.REQUEST_STOP_FART).OnServerEvent
+		:Connect(function(player: Player)
+			self:StopStream(player, false)
 		end)
 
 	Players.PlayerAdded:Connect(function(player)
@@ -2055,12 +2059,13 @@ function FartServiceServer.Init(self: FartServiceServer)
 		self:SetGas(player, FartConfig.GAS_MAX)
 	end
 	Players.PlayerRemoving:Connect(function(player)
+		self:StopStream(player, false)
 		self.Gas[player] = nil
-		self.LastFartTimes[player] = nil
+		self.LastStartTimes[player] = nil
 	end)
 
 	RunService.Heartbeat:Connect(function(deltaTime)
-		self:Regenerate(deltaTime)
+		self:Update(deltaTime)
 	end)
 end
 
@@ -2073,103 +2078,75 @@ function FartServiceServer.SetGas(self: FartServiceServer, player: Player, gas: 
 	end
 end
 
-function FartServiceServer.Regenerate(self: FartServiceServer, deltaTime: number)
-	for player, gas in self.Gas do
-		if gas < FartConfig.GAS_MAX then
-			self:SetGas(player, math.min(FartConfig.GAS_MAX, gas + FartConfig.GAS_REGEN * deltaTime))
-		end
-	end
-end
-
--- Client request: fart in `direction` after holding the key for `heldTime` seconds.
-function FartServiceServer.HandleFartRequest(
-	self: FartServiceServer,
-	player: Player,
-	direction: unknown,
-	heldTime: unknown
-)
+-- Client request: start farting in `direction`, or switch to it if already farting.
+function FartServiceServer.HandleStartRequest(self: FartServiceServer, player: Player, direction: unknown)
 	if not FartPhysics.IsDirection(direction) then
 		return
 	end
-	if typeof(heldTime) ~= "number" or heldTime ~= heldTime then
-		return -- not a number, or NaN
-	end
-
-	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
-	if not boat or not boat:IsFloating() then
+	local current = self.Streams[player]
+	if current and current.Direction == direction then
 		return
 	end
-	local seat = boat:GetSeatOf(player)
-	if not seat then
-		return
-	end
-
 	local now = os.clock()
-	local lastFartTime = self.LastFartTimes[player]
-	if lastFartTime and now - lastFartTime < FartConfig.TOOT_COOLDOWN * FartConfig.COOLDOWN_LENIENCY then
+	local lastStartTime = self.LastStartTimes[player]
+	if lastStartTime and now - lastStartTime < FartConfig.REQUEST_COOLDOWN then
 		return
 	end
-	local held = math.clamp(heldTime, 0, FartConfig.MEGA_CHARGE_TIME)
-	local gas = self.Gas[player] or 0
-	local cost = FartPhysics.GetCost(held)
-	if gas < cost then
+	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
+	if not boat or not boat:IsFloating() or not boat:GetSeatOf(player) then
 		return
 	end
-	self:SetGas(player, gas - cost)
-	self.LastFartTimes[player] = now
-
-	local power = FartPhysics.GetPower(held)
-	local isMega = FartPhysics.IsMega(held)
-	local seatCount = #boat.Seats
-	local push, spin = FartPhysics.GetKick(boat:GetPosition(), seat.CFrame, direction :: FartPhysics.Direction, power)
-	push *= BoatConfig.PUSH_SCALES[seatCount] or 1
-	spin *= BoatConfig.SPIN_SCALES[seatCount] or 1
-	boat:AddVelocity(push, spin)
-
-	if isMega then
-		self:RegisterMega(boat, { Player = player, Time = now, Push = push, Spin = spin })
+	if (self.Gas[player] or 0) < FartConfig.MIN_GAS_TO_START then
+		return
 	end
 
-	-- Everyone else sees and hears it. The farter played it the moment they let go.
+	self.LastStartTimes[player] = now
+	self.Streams[player] = { Direction = direction :: FartPhysics.Direction, StartedAt = now }
 	for _, otherPlayer in Players:GetPlayers() do
 		if otherPlayer ~= player then
-			self.PlayFartRemote:FireClient(otherPlayer, player, direction, power, isMega)
+			self.PlayFartRemote:FireClient(otherPlayer, player, direction)
 		end
 	end
 end
 
--- Remembers a Mega Fart. If enough different crew members have Mega Farted within
--- FARTQUAKE_WINDOW, it's a FARTQUAKE: every one of those pushes gets stronger.
-function FartServiceServer.RegisterMega(self: FartServiceServer, boat: Boat.Boat, mega: Mega)
-	local megas: { Mega } = self.RecentMegas[boat] or {}
-	self.RecentMegas[boat] = megas
-	for index = #megas, 1, -1 do
-		if mega.Time - megas[index].Time > FartConfig.FARTQUAKE_WINDOW then
-			table.remove(megas, index)
-		end
-	end
-	table.insert(megas, mega)
-
-	local playersNeeded = math.max(2, math.min(FartConfig.FARTQUAKE_MIN_PLAYERS, #boat.Crew))
-	local megaPlayers: { [Player]: boolean } = {}
-	local playerCount = 0
-	for _, entry in megas do
-		if not megaPlayers[entry.Player] then
-			megaPlayers[entry.Player] = true
-			playerCount += 1
-		end
-	end
-	if playerCount < playersNeeded then
+-- Ends `player`'s fart. `notifyFarter` also tells the farter, for when the server
+-- stops it (out of gas, left the boat) rather than the farter letting go.
+function FartServiceServer.StopStream(self: FartServiceServer, player: Player, notifyFarter: boolean)
+	if not self.Streams[player] then
 		return
 	end
-
-	local extra = FartConfig.FARTQUAKE_MULT - 1
-	for _, entry in megas do
-		boat:AddVelocity(entry.Push * extra, entry.Spin * extra)
+	self.Streams[player] = nil
+	for _, otherPlayer in Players:GetPlayers() do
+		if otherPlayer ~= player or notifyFarter then
+			self.StopFartRemote:FireClient(otherPlayer, player)
+		end
 	end
-	table.clear(megas)
-	for _, crewMember in boat.Crew do
-		self.PlayFartquakeRemote:FireClient(crewMember)
+end
+
+function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
+	local now = os.clock()
+	for player, stream in self.Streams do
+		local boat = BoatServiceServer:GetLaunchedBoatOf(player)
+		local seat = if boat then boat:GetSeatOf(player) else nil
+		local gas = self.Gas[player] or 0
+		if not boat or not seat or not boat:IsFloating() or gas <= 0 then
+			self:StopStream(player, true)
+			continue
+		end
+
+		local power = FartPhysics.GetPower(now - stream.StartedAt)
+		local thrust, spin = FartPhysics.GetThrust(boat:GetPosition(), seat.CFrame, stream.Direction, power)
+		local seatCount = #boat.Seats
+		thrust *= BoatConfig.PUSH_SCALES[seatCount] or 1
+		spin *= BoatConfig.SPIN_SCALES[seatCount] or 1
+		boat:AddVelocity(thrust * deltaTime, spin * deltaTime)
+		self:SetGas(player, math.max(0, gas - FartConfig.GAS_DRAIN * deltaTime))
+	end
+
+	for player, gas in self.Gas do
+		if not self.Streams[player] and gas < FartConfig.GAS_MAX then
+			self:SetGas(player, math.min(FartConfig.GAS_MAX, gas + FartConfig.GAS_REGEN * deltaTime))
+		end
 	end
 end
 
@@ -2532,45 +2509,35 @@ return DockConfig
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.FartConfig
 
 local FartConfig = {
-	-- Push
-	PUSH_SPEED = 7, -- studs/s one Straight toot adds (the boat glides about 8 studs)
-	SIDE_PUSH = 0.45, -- sideways push of a Left/Right fart, as a fraction of PUSH_SPEED
-	SPIN_SPEED = 0.55, -- rad/s of turn one Left/Right toot adds (about 20 degrees)
-
-	-- Toots and Mega Farts
-	TOOT_COOLDOWN = 0.35, -- seconds between farts
-	COOLDOWN_LENIENCY = 0.8, -- the server accepts farts this fraction of TOOT_COOLDOWN apart, since network packets can bunch up
-	MEGA_MIN_HOLD = 0.3, -- hold a fart key at least this long (seconds) to make a Mega Fart
-	MEGA_CHARGE_TIME = 1.2, -- seconds to fully charge a Mega Fart
-	MEGA_MULT = 3, -- a fully charged Mega Fart pushes like this many toots
+	-- Push. Holding a fart key farts nonstop. Power starts at MIN_POWER and grows to
+	-- MAX_POWER over POWER_RAMP_TIME seconds of farting; letting go resets it.
+	THRUST = 8, -- studs/s² a Straight fart speeds the boat up by, at power 1
+	SIDE_THRUST = 0.45, -- sideways push of a Left/Right fart, as a fraction of THRUST
+	SPIN_THRUST = 0.7, -- rad/s² a Left/Right fart turns the boat by, at power 1
+	MIN_POWER = 1,
+	MAX_POWER = 2.5,
+	POWER_RAMP_TIME = 3, -- seconds of nonstop farting to reach MAX_POWER
 
 	-- Gas meter (each player's is in their "Gas" attribute)
 	GAS_MAX = 100,
-	TOOT_COST = 8,
-	MEGA_COST = 35,
-	GAS_REGEN = 12, -- per second, always refilling
-
-	-- FARTQUAKE: Mega Farts from several players on one boat at almost the same moment
-	FARTQUAKE_WINDOW = 0.35, -- seconds
-	FARTQUAKE_MIN_PLAYERS = 3, -- or everyone on the boat if fewer (but always at least 2)
-	FARTQUAKE_MULT = 1.5, -- every push in the FARTQUAKE gets this much stronger
+	GAS_DRAIN = 10, -- per second while farting, the same at any power: a full tank lasts 10 seconds
+	GAS_REGEN = 15, -- per second while not farting
+	MIN_GAS_TO_START = 5, -- below this, pressing a fart key just gives a sad little puff
+	REQUEST_COOLDOWN = 0.1, -- seconds the server waits between accepting start requests from one player
 
 	-- Effects
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
 	GAS_ANGLE = math.rad(45), -- how far left or right of straight back the gas comes out on a Left/Right fart
-	TOOT_PARTICLES = 10,
-	MEGA_PARTICLES = 30,
-	DUD_PARTICLES = 3, -- out of gas
-	TOOT_VOLUME = 0.6,
-	MEGA_VOLUME = 1,
-	DUD_VOLUME = 0.25,
-	MIN_PITCH = 0.85, -- every fart picks a random pitch between these
+	STREAM_PARTICLE_RATE = 25, -- particles per second while farting, multiplied by power
+	DUD_PARTICLES = 3, -- the puff when there isn't enough gas
+	STREAM_VOLUME = 0.5, -- sound volume at MIN_POWER...
+	MAX_STREAM_VOLUME = 1, -- ...rising to this at MAX_POWER
+	MIN_PITCH = 0.85, -- every fart picks a random starting pitch between these
 	MAX_PITCH = 1.15,
-	MEGA_PITCH = 0.8, -- multiplies the pitch of Mega Farts (deeper)
+	PITCH_RISE_PER_POWER = 0.15, -- the pitch rises by this much for each point of power above MIN_POWER
+	DUD_VOLUME = 0.25,
 	DUD_PITCH = 1.6, -- multiplies the pitch of duds (squeakier)
-	SOUND_LIFETIME = 5, -- seconds before a played fart sound is cleaned up
-	MEGA_SHAKE = 0.3, -- camera shake for your own Mega Fart, multiplied by its power
-	FARTQUAKE_SHAKE = 1.5, -- camera shake for a FARTQUAKE
+	DUD_SOUND_LIFETIME = 3, -- seconds before a dud sound is cleaned up
 }
 
 return FartConfig
@@ -3093,8 +3060,8 @@ return DockServiceShared
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Services.FartService.FartPhysics
 --
--- The rules for what one fart does. Pure math, shared by the server (which moves
--- the boat) and the client (which predicts gas use and plays effects straight away).
+-- The rules for what farting does. Pure math, shared by the server (which moves the
+-- boat) and the client (which plays effects that match).
 --
 -- Riders face the middle of the boat. "Straight" pushes the boat away from the
 -- rider. "Left" turns the boat left, the same way from every seat, plus a small
@@ -3114,27 +3081,17 @@ function FartPhysics.IsDirection(value: unknown): boolean
 	return value == "Left" or value == "Straight" or value == "Right"
 end
 
--- Holding a fart key at least MEGA_MIN_HOLD seconds turns a toot into a Mega Fart.
-function FartPhysics.IsMega(heldTime: number): boolean
-	return heldTime >= FartConfig.MEGA_MIN_HOLD
+-- A fart's power after `fartingTime` seconds of nonstop farting: MIN_POWER at the
+-- start, growing evenly to MAX_POWER after POWER_RAMP_TIME.
+function FartPhysics.GetPower(fartingTime: number): number
+	local progress = math.clamp(fartingTime / FartConfig.POWER_RAMP_TIME, 0, 1)
+	return FartConfig.MIN_POWER + (FartConfig.MAX_POWER - FartConfig.MIN_POWER) * progress
 end
 
-function FartPhysics.GetCost(heldTime: number): number
-	return if FartPhysics.IsMega(heldTime) then FartConfig.MEGA_COST else FartConfig.TOOT_COST
-end
-
--- 1 for a toot, up to MEGA_MULT for a fully charged Mega Fart.
-function FartPhysics.GetPower(heldTime: number): number
-	if not FartPhysics.IsMega(heldTime) then
-		return 1
-	end
-	local charge = math.clamp(heldTime / FartConfig.MEGA_CHARGE_TIME, 0, 1)
-	return 1 + (FartConfig.MEGA_MULT - 1) * charge
-end
-
--- How much one fart from `seatCFrame` changes the boat's velocity (studs/s) and its
--- turn speed (rad/s). A positive turn is a LEFT turn (counter-clockwise seen from above).
-function FartPhysics.GetKick(
+-- How fast a fart from `seatCFrame` speeds the boat up (studs/s²) and turns it
+-- (rad/s²) at `power`. A positive turn is a LEFT turn (counter-clockwise seen from above).
+-- Multiply both by the frame's time to get the change for that frame.
+function FartPhysics.GetThrust(
 	boatPosition: Vector3,
 	seatCFrame: CFrame,
 	direction: Direction,
@@ -3145,12 +3102,12 @@ function FartPhysics.GetKick(
 
 	if direction == "Straight" then
 		-- Gas goes out behind the rider, so the boat moves away from them.
-		return facing * FartConfig.PUSH_SPEED * power, 0
+		return facing * FartConfig.THRUST * power, 0
 	elseif direction == "Left" then
 		-- Like an outboard motor: shove our side right so the far side swings left.
-		return right * FartConfig.PUSH_SPEED * FartConfig.SIDE_PUSH * power, FartConfig.SPIN_SPEED * power
+		return right * FartConfig.THRUST * FartConfig.SIDE_THRUST * power, FartConfig.SPIN_THRUST * power
 	else
-		return -right * FartConfig.PUSH_SPEED * FartConfig.SIDE_PUSH * power, -FartConfig.SPIN_SPEED * power
+		return -right * FartConfig.THRUST * FartConfig.SIDE_THRUST * power, -FartConfig.SPIN_THRUST * power
 	end
 end
 
@@ -3165,31 +3122,31 @@ return FartPhysics
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Services.FartService.FartServiceClient
 --
--- The client half of FartService: turns key and controller presses into fart
--- requests, and plays fart effects. Tap = toot, hold then let go = Mega Fart.
--- Your own farts play the moment you let go, so they feel instant; the server
--- still decides whether the boat moves.
+-- The client half of FartService: turns key and controller presses into farting, and
+-- plays everyone's fart effects. Hold a key to keep farting; its power grows the
+-- longer you hold it (FartPhysics.GetPower), and letting go stops. If you hold two
+-- keys, the one you pressed last wins. Your own fart starts the moment you press, so
+-- it feels instant; the server still decides whether the boat moves.
 --
 --   Fart Left       A, Left arrow, Q, or LB
 --   Fart Straight   W, Up arrow, Space, or RT
 --   Fart Right      D, Right arrow, E, or RB
 --
--- On-screen buttons for touch devices (UI, to be built) call StartCharge and
--- ReleaseCharge. A gas meter reads the player's "Gas" attribute, and a charge bar
--- listens to ChargeStarted and ChargeEnded.
+-- On-screen buttons for touch devices (UI, to be built) call PressFart on press and
+-- ReleaseFart on release. A gas meter reads the player's "Gas" attribute.
 --
 -- Asset contract:
---   ReplicatedStorage.Assets.VFX.FartCloud      ParticleEmitter: the gas cloud. Set Rate to 0;
---                                               farts call Emit. Its Speed is multiplied by fart power.
---   ReplicatedStorage.Assets.Sounds.Farts       Folder of Sounds; each fart picks one at random
+--   ReplicatedStorage.Assets.VFX.FartCloud      ParticleEmitter: the gas cloud. While farting, its
+--                                               Rate and Speed are set from fart power.
+--   ReplicatedStorage.Assets.Sounds.Farts       Folder of Sounds; each fart loops one at random
 
 local ContextActionService = game:GetService("ContextActionService")
 local Debris = game:GetService("Debris")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
-local CameraServiceClient = require(ReplicatedStorage.Shared.Services.CameraService.CameraServiceClient)
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
 local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
@@ -3209,18 +3166,28 @@ local ACTION_DIRECTIONS: { [string]: FartPhysics.Direction } = {
 
 local localPlayer = Players.LocalPlayer
 
+-- One player's fart that's happening right now, and its effects.
+type Stream = {
+	Direction: string,
+	StartedAt: number, -- os.clock() when it started, for its power
+	Emitter: ParticleEmitter?,
+	Sound: Sound?,
+	BasePitch: number,
+}
+
 local FartServiceClient = {}
 
 type FartServiceClientMembers = {
-	PressedAt: { [string]: number }, -- direction -> os.clock() its key went down
-	LastFartTime: number,
+	HeldDirections: { FartPhysics.Direction }, -- fart keys the local player is holding, in the order pressed
+	LocalDirection: FartPhysics.Direction?, -- the direction the local player is farting, if they are
+	Streams: { [Player]: Stream }, -- everyone farting right now, the local player included
 	Random: Random,
 	FartCloudTemplate: ParticleEmitter?,
 	FartSounds: { Sound },
-	RequestFartRemote: RemoteEvent?, -- set once the server has created it
-	ChargeStarted: Signal.Signal, -- fires (direction: string) when a fart key goes down while riding
-	ChargeEnded: Signal.Signal, -- fires () when it's let go or cancelled
-	Fartquake: Signal.Signal, -- fires () when this player's boat FARTQUAKEs
+	RequestStartFartRemote: RemoteEvent?, -- set once the server has created it
+	RequestStopFartRemote: RemoteEvent?,
+	FartStarted: Signal.Signal, -- fires (direction: string) when the local player starts or switches farting
+	FartStopped: Signal.Signal, -- fires () when the local player stops farting
 }
 
 export type FartServiceClient = typeof(FartServiceClient) & FartServiceClientMembers
@@ -3232,6 +3199,11 @@ local function IsRiding(): boolean
 	local seat = if humanoid then humanoid.SeatPart else nil
 	local boatModel = if seat then BoatServiceShared.GetBoatModelFromPart(seat) else nil
 	return boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
+end
+
+local function GetLocalGas(): number
+	local gas = localPlayer:GetAttribute(FartServiceShared.GAS_ATTRIBUTE)
+	return if typeof(gas) == "number" then gas else 0
 end
 
 local function FindAssets(): (ParticleEmitter?, { Sound })
@@ -3260,28 +3232,34 @@ local function FindAssets(): (ParticleEmitter?, { Sound })
 end
 
 function FartServiceClient.Init(self: FartServiceClient)
-	self.PressedAt = {}
-	self.LastFartTime = 0
+	self.HeldDirections = {}
+	self.LocalDirection = nil
+	self.Streams = {}
 	self.Random = Random.new()
-	self.RequestFartRemote = nil
-	self.ChargeStarted = Signal.new()
-	self.ChargeEnded = Signal.new()
-	self.Fartquake = Signal.new()
+	self.RequestStartFartRemote = nil
+	self.RequestStopFartRemote = nil
+	self.FartStarted = Signal.new()
+	self.FartStopped = Signal.new()
 	self.FartCloudTemplate, self.FartSounds = FindAssets()
 
 	local function OnAction(actionName: string, inputState: Enum.UserInputState, _input: InputObject)
 		local direction: FartPhysics.Direction? = ACTION_DIRECTIONS[actionName]
-		if not direction or not IsRiding() then
-			-- Not on the river: let the keys do their normal job (like walking).
+		if not direction then
 			return Enum.ContextActionResult.Pass
 		end
 		if inputState == Enum.UserInputState.Begin then
-			self:StartCharge(direction)
-		elseif inputState == Enum.UserInputState.End then
-			self:ReleaseCharge(direction)
-		elseif inputState == Enum.UserInputState.Cancel then
-			self:CancelCharge(direction)
+			if not IsRiding() then
+				-- Not on the river: let the keys do their normal job (like walking).
+				return Enum.ContextActionResult.Pass
+			end
+			self:PressFart(direction)
+			return Enum.ContextActionResult.Sink
 		end
+		-- Letting go: only take it if the press was a fart, so walking keys still let go normally.
+		if not table.find(self.HeldDirections, direction) then
+			return Enum.ContextActionResult.Pass
+		end
+		self:ReleaseFart(direction)
 		return Enum.ContextActionResult.Sink
 	end
 	ContextActionService:BindAction(
@@ -3312,65 +3290,111 @@ function FartServiceClient.Init(self: FartServiceClient)
 		Enum.KeyCode.ButtonR1
 	)
 
+	RunService.RenderStepped:Connect(function()
+		self:Update()
+	end)
+
 	-- Remotes are waited for in a separate thread so Init never yields.
 	task.spawn(function()
-		self.RequestFartRemote = Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.REQUEST_FART)
+		self.RequestStartFartRemote = Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.REQUEST_START_FART)
+		self.RequestStopFartRemote = Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.REQUEST_STOP_FART)
 		Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.PLAY_FART).OnClientEvent
-			:Connect(function(farter: Player?, direction: string, power: number, isMega: boolean)
+			:Connect(function(farter: Player?, direction: string)
 				if farter then -- nil if they left before this arrived
-					self:PlayFartEffect(farter, direction, power, isMega)
+					self:StartStream(farter, direction)
 				end
 			end)
-		Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.PLAY_FARTQUAKE).OnClientEvent:Connect(function()
-			CameraServiceClient:Shake(FartConfig.FARTQUAKE_SHAKE)
-			self.Fartquake:Fire()
+		Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.STOP_FART).OnClientEvent:Connect(function(farter: Player?)
+			if farter == localPlayer then
+				-- The server stopped our fart (out of gas, or we left the boat).
+				table.clear(self.HeldDirections)
+				self:SetLocalDirection(nil)
+			elseif farter then
+				self:StopStream(farter)
+			end
 		end)
 	end)
 end
 
--- A fart key (or on-screen button) went down: start timing the hold.
-function FartServiceClient.StartCharge(self: FartServiceClient, direction: FartPhysics.Direction)
-	if not IsRiding() then
-		return
+-- A fart key (or on-screen button) went down.
+function FartServiceClient.PressFart(self: FartServiceClient, direction: FartPhysics.Direction)
+	local index = table.find(self.HeldDirections, direction)
+	if index then
+		table.remove(self.HeldDirections, index)
 	end
-	self.PressedAt[direction] = os.clock()
-	self.ChargeStarted:Fire(direction)
-end
-
--- The key was let go: fart, if the cooldown and gas allow it.
-function FartServiceClient.ReleaseCharge(self: FartServiceClient, direction: FartPhysics.Direction)
-	local pressedAt = self.PressedAt[direction]
-	self.PressedAt[direction] = nil
-	self.ChargeEnded:Fire()
-	if not pressedAt or not IsRiding() then
-		return
-	end
-
-	local requestFartRemote = self.RequestFartRemote
-	local now = os.clock()
-	if not requestFartRemote or now - self.LastFartTime < FartConfig.TOOT_COOLDOWN then
-		return
-	end
-	local heldTime = math.min(now - pressedAt, FartConfig.MEGA_CHARGE_TIME)
-	local gas = localPlayer:GetAttribute(FartServiceShared.GAS_ATTRIBUTE)
-	if typeof(gas) ~= "number" or gas < FartPhysics.GetCost(heldTime) then
+	table.insert(self.HeldDirections, direction)
+	if GetLocalGas() < FartConfig.MIN_GAS_TO_START then
 		self:PlayDudEffect(localPlayer)
 		return
 	end
-
-	self.LastFartTime = now
-	local power = FartPhysics.GetPower(heldTime)
-	local isMega = FartPhysics.IsMega(heldTime)
-	self:PlayFartEffect(localPlayer, direction, power, isMega)
-	if isMega then
-		CameraServiceClient:Shake(FartConfig.MEGA_SHAKE * power)
-	end
-	requestFartRemote:FireServer(direction, heldTime)
+	self:SetLocalDirection(direction)
 end
 
-function FartServiceClient.CancelCharge(self: FartServiceClient, direction: FartPhysics.Direction)
-	self.PressedAt[direction] = nil
-	self.ChargeEnded:Fire()
+-- A fart key (or on-screen button) was let go: switch to another held key, or stop.
+function FartServiceClient.ReleaseFart(self: FartServiceClient, direction: FartPhysics.Direction)
+	local index = table.find(self.HeldDirections, direction)
+	if index then
+		table.remove(self.HeldDirections, index)
+	end
+	if self.LocalDirection == direction then
+		self:SetLocalDirection(self.HeldDirections[#self.HeldDirections])
+	end
+end
+
+-- Starts, switches or (with nil) stops the local player's fart, and tells the server.
+function FartServiceClient.SetLocalDirection(self: FartServiceClient, direction: FartPhysics.Direction?)
+	if direction == self.LocalDirection then
+		return
+	end
+	local startRemote = self.RequestStartFartRemote
+	local stopRemote = self.RequestStopFartRemote
+	if not startRemote or not stopRemote then
+		return -- the server hasn't set up yet
+	end
+
+	self.LocalDirection = direction
+	if direction then
+		self:StartStream(localPlayer, direction)
+		startRemote:FireServer(direction)
+		self.FartStarted:Fire(direction)
+	else
+		self:StopStream(localPlayer)
+		stopRemote:FireServer()
+		self.FartStopped:Fire()
+	end
+end
+
+-- Every frame: grow each fart's effects with its power, and stop the local fart if
+-- the player ran out of gas or isn't riding any more.
+function FartServiceClient.Update(self: FartServiceClient)
+	if self.LocalDirection and (GetLocalGas() <= 0 or not IsRiding()) then
+		table.clear(self.HeldDirections)
+		self:SetLocalDirection(nil)
+	end
+
+	local now = os.clock()
+	local powerRange = FartConfig.MAX_POWER - FartConfig.MIN_POWER
+	for player, stream in self.Streams do
+		if not player.Parent then
+			self:StopStream(player)
+			continue
+		end
+		local power = FartPhysics.GetPower(now - stream.StartedAt)
+		local powerProgress = if powerRange > 0 then (power - FartConfig.MIN_POWER) / powerRange else 1
+		local emitter = stream.Emitter
+		local template = self.FartCloudTemplate
+		if emitter and template then
+			emitter.Rate = FartConfig.STREAM_PARTICLE_RATE * power
+			emitter.Speed = NumberRange.new(template.Speed.Min * power, template.Speed.Max * power)
+		end
+		local sound = stream.Sound
+		if sound then
+			sound.PlaybackSpeed = stream.BasePitch
+				* (1 + (power - FartConfig.MIN_POWER) * FartConfig.PITCH_RISE_PER_POWER)
+			sound.Volume = FartConfig.STREAM_VOLUME
+				+ (FartConfig.MAX_STREAM_VOLUME - FartConfig.STREAM_VOLUME) * powerProgress
+		end
+	end
 end
 
 -- The attachment and emitter at a player's butt, made the first time they fart.
@@ -3401,25 +3425,9 @@ function FartServiceClient.GetButt(self: FartServiceClient, player: Player): (At
 	return butt, emitter
 end
 
-function FartServiceClient.PlaySound(self: FartServiceClient, parent: Instance, volume: number, pitch: number)
-	if #self.FartSounds == 0 then
-		return
-	end
-	local sound = self.FartSounds[self.Random:NextInteger(1, #self.FartSounds)]:Clone()
-	sound.Volume = volume
-	sound.PlaybackSpeed = self.Random:NextNumber(FartConfig.MIN_PITCH, FartConfig.MAX_PITCH) * pitch
-	sound.Parent = parent
-	sound:Play()
-	Debris:AddItem(sound, FartConfig.SOUND_LIFETIME)
-end
-
-function FartServiceClient.PlayFartEffect(
-	self: FartServiceClient,
-	player: Player,
-	direction: string,
-	power: number,
-	isMega: boolean
-)
+-- Starts (or switches) `player`'s fart effects: a steady gas cloud and a looping sound.
+function FartServiceClient.StartStream(self: FartServiceClient, player: Player, direction: string)
+	self:StopStream(player)
 	local butt, emitter = self:GetButt(player)
 	if not butt then
 		return
@@ -3430,24 +3438,56 @@ function FartServiceClient.PlayFartEffect(
 		elseif direction == "Right" then FartConfig.GAS_ANGLE
 		else 0
 	butt.CFrame = FartConfig.BUTT_OFFSET * CFrame.Angles(0, gasAngle, 0)
-
-	local template = self.FartCloudTemplate
-	if emitter and template then
-		emitter.Speed = NumberRange.new(template.Speed.Min * power, template.Speed.Max * power)
-		emitter:Emit(if isMega then FartConfig.MEGA_PARTICLES else FartConfig.TOOT_PARTICLES)
+	if emitter then
+		emitter.Enabled = true
 	end
-	self:PlaySound(
-		butt,
-		if isMega then FartConfig.MEGA_VOLUME else FartConfig.TOOT_VOLUME,
-		if isMega then FartConfig.MEGA_PITCH else 1
-	)
+
+	local sound: Sound? = nil
+	local basePitch = self.Random:NextNumber(FartConfig.MIN_PITCH, FartConfig.MAX_PITCH)
+	if #self.FartSounds > 0 then
+		local newSound = self.FartSounds[self.Random:NextInteger(1, #self.FartSounds)]:Clone()
+		newSound.Looped = true
+		newSound.Volume = FartConfig.STREAM_VOLUME
+		newSound.PlaybackSpeed = basePitch
+		newSound.Parent = butt
+		newSound:Play()
+		sound = newSound
+	end
+
+	self.Streams[player] = {
+		Direction = direction,
+		StartedAt = os.clock(),
+		Emitter = emitter,
+		Sound = sound,
+		BasePitch = basePitch,
+	}
 end
 
--- Out of gas: a sad little puff.
+function FartServiceClient.StopStream(self: FartServiceClient, player: Player)
+	local stream = self.Streams[player]
+	if not stream then
+		return
+	end
+	self.Streams[player] = nil
+	local emitter = stream.Emitter
+	if emitter then
+		emitter.Enabled = false
+	end
+	local sound = stream.Sound
+	if sound then
+		sound:Stop()
+		sound:Destroy()
+	end
+end
+
+-- Not enough gas: a sad little puff.
 function FartServiceClient.PlayDudEffect(self: FartServiceClient, player: Player)
 	local butt, emitter = self:GetButt(player)
 	if not butt then
 		return
+	end
+	if self.Streams[player] then
+		return -- already farting; the stream's effects are showing
 	end
 	butt.CFrame = FartConfig.BUTT_OFFSET
 	local template = self.FartCloudTemplate
@@ -3455,7 +3495,14 @@ function FartServiceClient.PlayDudEffect(self: FartServiceClient, player: Player
 		emitter.Speed = template.Speed
 		emitter:Emit(FartConfig.DUD_PARTICLES)
 	end
-	self:PlaySound(butt, FartConfig.DUD_VOLUME, FartConfig.DUD_PITCH)
+	if #self.FartSounds > 0 then
+		local sound = self.FartSounds[self.Random:NextInteger(1, #self.FartSounds)]:Clone()
+		sound.Volume = FartConfig.DUD_VOLUME
+		sound.PlaybackSpeed = self.Random:NextNumber(FartConfig.MIN_PITCH, FartConfig.MAX_PITCH) * FartConfig.DUD_PITCH
+		sound.Parent = butt
+		sound:Play()
+		Debris:AddItem(sound, FartConfig.DUD_SOUND_LIFETIME)
+	end
 end
 
 return FartServiceClient :: FartServiceClient
@@ -3476,9 +3523,10 @@ local FartServiceShared = {
 	GAS_ATTRIBUTE = "Gas", -- on each Player: their current gas, a whole number from 0 to FartConfig.GAS_MAX
 
 	-- Remotes
-	REQUEST_FART = "RequestFart", -- RemoteEvent client -> server (direction: string, heldTime: number)
-	PLAY_FART = "PlayFart", -- RemoteEvent server -> other clients (farter: Player, direction: string, power: number, isMega: boolean)
-	PLAY_FARTQUAKE = "PlayFartquake", -- RemoteEvent server -> each crew member of a boat that just FARTQUAKEd
+	REQUEST_START_FART = "RequestStartFart", -- RemoteEvent client -> server (direction: string): start (or switch) farting
+	REQUEST_STOP_FART = "RequestStopFart", -- RemoteEvent client -> server (): stop farting
+	PLAY_FART = "PlayFart", -- RemoteEvent server -> clients (farter: Player, direction: string): farter started farting
+	STOP_FART = "StopFart", -- RemoteEvent server -> clients (farter: Player): farter stopped farting
 }
 
 return FartServiceShared

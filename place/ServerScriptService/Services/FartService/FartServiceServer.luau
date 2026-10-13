@@ -1,16 +1,18 @@
 --!strict
 -- ModuleScript: ServerScriptService.Services.FartService.FartServiceServer
 --
--- Checks every fart a client asks for, spends the player's gas and pushes their
--- boat. Clients only ask; this decides. Also handles FARTQUAKEs (several Mega Farts
--- on one boat at almost the same moment) and tells other players to play the effect.
+-- Runs every player's farting. A client asks to start farting in a direction (or to
+-- stop); this checks they're riding a boat on the river and have gas, then pushes
+-- their boat every frame until they stop, run out of gas or leave the boat. Power
+-- grows the longer they keep farting (FartPhysics.GetPower). Gas drains at a flat
+-- rate while farting and refills while not. Other players are told when someone
+-- starts or stops, so they can show it.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
-local Boat = require(ServerScriptService.Classes.Boat)
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
@@ -20,35 +22,37 @@ local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 
 local SERVICE_NAME = FartServiceShared.SERVICE_NAME
 
-type Mega = {
-	Player: Player,
-	Time: number,
-	Push: Vector3,
-	Spin: number,
+type Stream = {
+	Direction: FartPhysics.Direction,
+	StartedAt: number, -- os.clock() when this fart started, for its power
 }
 
 local FartServiceServer = {}
 
 type FartServiceServerMembers = {
 	Gas: { [Player]: number },
-	LastFartTimes: { [Player]: number },
-	RecentMegas: { [Boat.Boat]: { Mega } },
+	Streams: { [Player]: Stream }, -- everyone farting right now
+	LastStartTimes: { [Player]: number },
 	PlayFartRemote: RemoteEvent,
-	PlayFartquakeRemote: RemoteEvent,
+	StopFartRemote: RemoteEvent,
 }
 
 export type FartServiceServer = typeof(FartServiceServer) & FartServiceServerMembers
 
 function FartServiceServer.Init(self: FartServiceServer)
 	self.Gas = {}
-	self.LastFartTimes = {}
-	self.RecentMegas = setmetatable({}, { __mode = "k" }) :: any
+	self.Streams = {}
+	self.LastStartTimes = {}
 	self.PlayFartRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.PLAY_FART)
-	self.PlayFartquakeRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.PLAY_FARTQUAKE)
+	self.StopFartRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.STOP_FART)
 
-	Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.REQUEST_FART).OnServerEvent
-		:Connect(function(player: Player, direction: unknown, heldTime: unknown)
-			self:HandleFartRequest(player, direction, heldTime)
+	Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.REQUEST_START_FART).OnServerEvent
+		:Connect(function(player: Player, direction: unknown)
+			self:HandleStartRequest(player, direction)
+		end)
+	Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.REQUEST_STOP_FART).OnServerEvent
+		:Connect(function(player: Player)
+			self:StopStream(player, false)
 		end)
 
 	Players.PlayerAdded:Connect(function(player)
@@ -58,12 +62,13 @@ function FartServiceServer.Init(self: FartServiceServer)
 		self:SetGas(player, FartConfig.GAS_MAX)
 	end
 	Players.PlayerRemoving:Connect(function(player)
+		self:StopStream(player, false)
 		self.Gas[player] = nil
-		self.LastFartTimes[player] = nil
+		self.LastStartTimes[player] = nil
 	end)
 
 	RunService.Heartbeat:Connect(function(deltaTime)
-		self:Regenerate(deltaTime)
+		self:Update(deltaTime)
 	end)
 end
 
@@ -76,103 +81,75 @@ function FartServiceServer.SetGas(self: FartServiceServer, player: Player, gas: 
 	end
 end
 
-function FartServiceServer.Regenerate(self: FartServiceServer, deltaTime: number)
-	for player, gas in self.Gas do
-		if gas < FartConfig.GAS_MAX then
-			self:SetGas(player, math.min(FartConfig.GAS_MAX, gas + FartConfig.GAS_REGEN * deltaTime))
-		end
-	end
-end
-
--- Client request: fart in `direction` after holding the key for `heldTime` seconds.
-function FartServiceServer.HandleFartRequest(
-	self: FartServiceServer,
-	player: Player,
-	direction: unknown,
-	heldTime: unknown
-)
+-- Client request: start farting in `direction`, or switch to it if already farting.
+function FartServiceServer.HandleStartRequest(self: FartServiceServer, player: Player, direction: unknown)
 	if not FartPhysics.IsDirection(direction) then
 		return
 	end
-	if typeof(heldTime) ~= "number" or heldTime ~= heldTime then
-		return -- not a number, or NaN
-	end
-
-	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
-	if not boat or not boat:IsFloating() then
+	local current = self.Streams[player]
+	if current and current.Direction == direction then
 		return
 	end
-	local seat = boat:GetSeatOf(player)
-	if not seat then
-		return
-	end
-
 	local now = os.clock()
-	local lastFartTime = self.LastFartTimes[player]
-	if lastFartTime and now - lastFartTime < FartConfig.TOOT_COOLDOWN * FartConfig.COOLDOWN_LENIENCY then
+	local lastStartTime = self.LastStartTimes[player]
+	if lastStartTime and now - lastStartTime < FartConfig.REQUEST_COOLDOWN then
 		return
 	end
-	local held = math.clamp(heldTime, 0, FartConfig.MEGA_CHARGE_TIME)
-	local gas = self.Gas[player] or 0
-	local cost = FartPhysics.GetCost(held)
-	if gas < cost then
+	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
+	if not boat or not boat:IsFloating() or not boat:GetSeatOf(player) then
 		return
 	end
-	self:SetGas(player, gas - cost)
-	self.LastFartTimes[player] = now
-
-	local power = FartPhysics.GetPower(held)
-	local isMega = FartPhysics.IsMega(held)
-	local seatCount = #boat.Seats
-	local push, spin = FartPhysics.GetKick(boat:GetPosition(), seat.CFrame, direction :: FartPhysics.Direction, power)
-	push *= BoatConfig.PUSH_SCALES[seatCount] or 1
-	spin *= BoatConfig.SPIN_SCALES[seatCount] or 1
-	boat:AddVelocity(push, spin)
-
-	if isMega then
-		self:RegisterMega(boat, { Player = player, Time = now, Push = push, Spin = spin })
+	if (self.Gas[player] or 0) < FartConfig.MIN_GAS_TO_START then
+		return
 	end
 
-	-- Everyone else sees and hears it. The farter played it the moment they let go.
+	self.LastStartTimes[player] = now
+	self.Streams[player] = { Direction = direction :: FartPhysics.Direction, StartedAt = now }
 	for _, otherPlayer in Players:GetPlayers() do
 		if otherPlayer ~= player then
-			self.PlayFartRemote:FireClient(otherPlayer, player, direction, power, isMega)
+			self.PlayFartRemote:FireClient(otherPlayer, player, direction)
 		end
 	end
 end
 
--- Remembers a Mega Fart. If enough different crew members have Mega Farted within
--- FARTQUAKE_WINDOW, it's a FARTQUAKE: every one of those pushes gets stronger.
-function FartServiceServer.RegisterMega(self: FartServiceServer, boat: Boat.Boat, mega: Mega)
-	local megas: { Mega } = self.RecentMegas[boat] or {}
-	self.RecentMegas[boat] = megas
-	for index = #megas, 1, -1 do
-		if mega.Time - megas[index].Time > FartConfig.FARTQUAKE_WINDOW then
-			table.remove(megas, index)
-		end
-	end
-	table.insert(megas, mega)
-
-	local playersNeeded = math.max(2, math.min(FartConfig.FARTQUAKE_MIN_PLAYERS, #boat.Crew))
-	local megaPlayers: { [Player]: boolean } = {}
-	local playerCount = 0
-	for _, entry in megas do
-		if not megaPlayers[entry.Player] then
-			megaPlayers[entry.Player] = true
-			playerCount += 1
-		end
-	end
-	if playerCount < playersNeeded then
+-- Ends `player`'s fart. `notifyFarter` also tells the farter, for when the server
+-- stops it (out of gas, left the boat) rather than the farter letting go.
+function FartServiceServer.StopStream(self: FartServiceServer, player: Player, notifyFarter: boolean)
+	if not self.Streams[player] then
 		return
 	end
-
-	local extra = FartConfig.FARTQUAKE_MULT - 1
-	for _, entry in megas do
-		boat:AddVelocity(entry.Push * extra, entry.Spin * extra)
+	self.Streams[player] = nil
+	for _, otherPlayer in Players:GetPlayers() do
+		if otherPlayer ~= player or notifyFarter then
+			self.StopFartRemote:FireClient(otherPlayer, player)
+		end
 	end
-	table.clear(megas)
-	for _, crewMember in boat.Crew do
-		self.PlayFartquakeRemote:FireClient(crewMember)
+end
+
+function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
+	local now = os.clock()
+	for player, stream in self.Streams do
+		local boat = BoatServiceServer:GetLaunchedBoatOf(player)
+		local seat = if boat then boat:GetSeatOf(player) else nil
+		local gas = self.Gas[player] or 0
+		if not boat or not seat or not boat:IsFloating() or gas <= 0 then
+			self:StopStream(player, true)
+			continue
+		end
+
+		local power = FartPhysics.GetPower(now - stream.StartedAt)
+		local thrust, spin = FartPhysics.GetThrust(boat:GetPosition(), seat.CFrame, stream.Direction, power)
+		local seatCount = #boat.Seats
+		thrust *= BoatConfig.PUSH_SCALES[seatCount] or 1
+		spin *= BoatConfig.SPIN_SCALES[seatCount] or 1
+		boat:AddVelocity(thrust * deltaTime, spin * deltaTime)
+		self:SetGas(player, math.max(0, gas - FartConfig.GAS_DRAIN * deltaTime))
+	end
+
+	for player, gas in self.Gas do
+		if not self.Streams[player] and gas < FartConfig.GAS_MAX then
+			self:SetGas(player, math.min(FartConfig.GAS_MAX, gas + FartConfig.GAS_REGEN * deltaTime))
+		end
 	end
 end
 

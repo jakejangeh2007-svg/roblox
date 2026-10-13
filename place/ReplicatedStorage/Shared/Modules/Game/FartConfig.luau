@@ -2,45 +2,35 @@
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.FartConfig
 
 local FartConfig = {
-	-- Push
-	PUSH_SPEED = 7, -- studs/s one Straight toot adds (the boat glides about 8 studs)
-	SIDE_PUSH = 0.45, -- sideways push of a Left/Right fart, as a fraction of PUSH_SPEED
-	SPIN_SPEED = 0.55, -- rad/s of turn one Left/Right toot adds (about 20 degrees)
-
-	-- Toots and Mega Farts
-	TOOT_COOLDOWN = 0.35, -- seconds between farts
-	COOLDOWN_LENIENCY = 0.8, -- the server accepts farts this fraction of TOOT_COOLDOWN apart, since network packets can bunch up
-	MEGA_MIN_HOLD = 0.3, -- hold a fart key at least this long (seconds) to make a Mega Fart
-	MEGA_CHARGE_TIME = 1.2, -- seconds to fully charge a Mega Fart
-	MEGA_MULT = 3, -- a fully charged Mega Fart pushes like this many toots
+	-- Push. Holding a fart key farts nonstop. Power starts at MIN_POWER and grows to
+	-- MAX_POWER over POWER_RAMP_TIME seconds of farting; letting go resets it.
+	THRUST = 8, -- studs/s² a Straight fart speeds the boat up by, at power 1
+	SIDE_THRUST = 0.45, -- sideways push of a Left/Right fart, as a fraction of THRUST
+	SPIN_THRUST = 0.7, -- rad/s² a Left/Right fart turns the boat by, at power 1
+	MIN_POWER = 1,
+	MAX_POWER = 2.5,
+	POWER_RAMP_TIME = 3, -- seconds of nonstop farting to reach MAX_POWER
 
 	-- Gas meter (each player's is in their "Gas" attribute)
 	GAS_MAX = 100,
-	TOOT_COST = 8,
-	MEGA_COST = 35,
-	GAS_REGEN = 12, -- per second, always refilling
-
-	-- FARTQUAKE: Mega Farts from several players on one boat at almost the same moment
-	FARTQUAKE_WINDOW = 0.35, -- seconds
-	FARTQUAKE_MIN_PLAYERS = 3, -- or everyone on the boat if fewer (but always at least 2)
-	FARTQUAKE_MULT = 1.5, -- every push in the FARTQUAKE gets this much stronger
+	GAS_DRAIN = 10, -- per second while farting, the same at any power: a full tank lasts 10 seconds
+	GAS_REGEN = 15, -- per second while not farting
+	MIN_GAS_TO_START = 5, -- below this, pressing a fart key just gives a sad little puff
+	REQUEST_COOLDOWN = 0.1, -- seconds the server waits between accepting start requests from one player
 
 	-- Effects
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
 	GAS_ANGLE = math.rad(45), -- how far left or right of straight back the gas comes out on a Left/Right fart
-	TOOT_PARTICLES = 10,
-	MEGA_PARTICLES = 30,
-	DUD_PARTICLES = 3, -- out of gas
-	TOOT_VOLUME = 0.6,
-	MEGA_VOLUME = 1,
-	DUD_VOLUME = 0.25,
-	MIN_PITCH = 0.85, -- every fart picks a random pitch between these
+	STREAM_PARTICLE_RATE = 25, -- particles per second while farting, multiplied by power
+	DUD_PARTICLES = 3, -- the puff when there isn't enough gas
+	STREAM_VOLUME = 0.5, -- sound volume at MIN_POWER...
+	MAX_STREAM_VOLUME = 1, -- ...rising to this at MAX_POWER
+	MIN_PITCH = 0.85, -- every fart picks a random starting pitch between these
 	MAX_PITCH = 1.15,
-	MEGA_PITCH = 0.8, -- multiplies the pitch of Mega Farts (deeper)
+	PITCH_RISE_PER_POWER = 0.15, -- the pitch rises by this much for each point of power above MIN_POWER
+	DUD_VOLUME = 0.25,
 	DUD_PITCH = 1.6, -- multiplies the pitch of duds (squeakier)
-	SOUND_LIFETIME = 5, -- seconds before a played fart sound is cleaned up
-	MEGA_SHAKE = 0.3, -- camera shake for your own Mega Fart, multiplied by its power
-	FARTQUAKE_SHAKE = 1.5, -- camera shake for a FARTQUAKE
+	DUD_SOUND_LIFETIME = 3, -- seconds before a dud sound is cleaned up
 }
 
 return FartConfig
