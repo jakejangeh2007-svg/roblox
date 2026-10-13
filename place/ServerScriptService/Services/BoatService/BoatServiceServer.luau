@@ -3,9 +3,10 @@
 --
 -- Owns every boat: spawning them from templates, launching them into the river
 -- and removing them. Boats are Boat objects (ServerScriptService.Classes.Boat).
--- DockService asks it for new boats, and CheckpointService asks it which boats
--- are on the river.
+-- DockService asks it for new boats, CheckpointService and WaterService ask it
+-- which boats are on the river, and FartService asks which boat a player is riding.
 
+local PhysicsService = game:GetService("PhysicsService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
@@ -13,6 +14,7 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local Boat = require(ServerScriptService.Classes.Boat)
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
 local BoatServiceServer = {}
@@ -22,6 +24,7 @@ type BoatServiceServerMembers = {
 	BoatsFolder: Instance,
 	TemplatesFolder: Instance?,
 	CrewMemberLeft: Signal.Signal, -- fires (player: Player, boat: Boat) when anyone leaves a launched boat, for any reason
+	NotifyBoatWipedRemote: RemoteEvent,
 }
 
 export type BoatServiceServer = typeof(BoatServiceServer) & BoatServiceServerMembers
@@ -29,6 +32,15 @@ export type BoatServiceServer = typeof(BoatServiceServer) & BoatServiceServerMem
 function BoatServiceServer.Init(self: BoatServiceServer)
 	self.Boats = {}
 	self.CrewMemberLeft = Signal.new()
+	self.NotifyBoatWipedRemote =
+		Remotes.CreateEvent(BoatServiceShared.SERVICE_NAME, BoatServiceShared.NOTIFY_BOAT_WIPED)
+
+	-- Boats pass through each other.
+	local collisionGroup = BoatServiceShared.COLLISION_GROUP
+	if not PhysicsService:IsCollisionGroupRegistered(collisionGroup) then
+		PhysicsService:RegisterCollisionGroup(collisionGroup)
+	end
+	PhysicsService:CollisionGroupSetCollidable(collisionGroup, collisionGroup, false)
 
 	local boatsFolder = workspace:FindFirstChild(BoatServiceShared.BOATS_FOLDER_NAME)
 	if not boatsFolder then
@@ -129,6 +141,7 @@ function BoatServiceServer.EjectPlayer(self: BoatServiceServer, player: Player)
 end
 
 -- Removes boats that were destroyed, and docked boats left empty for too long.
+-- Also makes sure the server still simulates every boat on the river.
 function BoatServiceServer.CleanUp(self: BoatServiceServer)
 	local now = os.clock()
 	for index = #self.Boats, 1, -1 do
@@ -139,8 +152,35 @@ function BoatServiceServer.CleanUp(self: BoatServiceServer)
 		end
 		if boat.State == "Destroyed" then
 			table.remove(self.Boats, index)
+		elseif boat:IsFloating() then
+			boat:ClaimNetworkOwnership()
 		end
 	end
+end
+
+-- The boat on the river that `player` is part of the crew of, if any.
+function BoatServiceServer.GetLaunchedBoatOf(self: BoatServiceServer, player: Player): Boat.Boat?
+	for _, boat in self.Boats do
+		if boat.State == "Launched" and table.find(boat.Crew, player) then
+			return boat
+		end
+	end
+	return nil
+end
+
+-- A boat fell off the river: freeze it, tell its crew, then remove it. Removing it
+-- sends the crew back to their checkpoint (CheckpointService listens to CrewMemberLeft).
+function BoatServiceServer.WipeBoat(self: BoatServiceServer, boat: Boat.Boat)
+	if not boat:IsFloating() then
+		return
+	end
+	boat:Freeze()
+	for _, player in boat.Crew do
+		self.NotifyBoatWipedRemote:FireClient(player)
+	end
+	task.delay(BoatConfig.WIPE_DELAY, function()
+		self:DestroyBoat(boat)
+	end)
 end
 
 -- A player who leaves the game takes their waiting boat with them, unless friends are already in it.

@@ -2,12 +2,19 @@
 -- ModuleScript: ServerScriptService.Classes.Boat
 --
 -- A boat cloned from a template in ReplicatedStorage.Assets.Boats. It waits at a
--- dock until every seat is taken, counts down, then moves into the river.
+-- dock until every seat is taken, counts down, then moves into the river and floats.
+-- On the river the server owns its physics: WaterService keeps it afloat and
+-- FartService pushes it.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
---   PrimaryPart   must be set. Weld every other part to it with WeldConstraints.
---   Seats         one Seat per player, anywhere in the model. The number of Seats must
---                 match the size the template is listed under in BoatConfig.TEMPLATE_NAMES.
+--   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
+--                 water should come up to, with its top face pointing up. It can be invisible.
+--   Welds         every other part, Seats included, welded to the PrimaryPart with
+--                 WeldConstraints (directly or through other welded parts).
+--   Seats         one Seat per player. The number of Seats must match the size the
+--                 template is listed under in BoatConfig.TEMPLATE_NAMES. Put them around
+--                 the edge facing the middle. A one-seat boat can have its seat in the
+--                 middle, facing forward.
 --
 -- States: Docked -> Launching -> Launched -> Destroyed. Launching goes back to Docked
 -- if a seat empties during the countdown. The model's State and LaunchTime attributes
@@ -28,6 +35,7 @@ type BoatMembers = {
 	Owner: Player, -- who spawned it
 	Seats: { Seat },
 	State: BoatServiceShared.BoatState,
+	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
@@ -61,17 +69,63 @@ local function GetPlayerInSeat(seat: Seat): Player?
 	return if humanoid then Players:GetPlayerFromCharacter(humanoid.Parent) else nil
 end
 
+-- The first part in `template` that isn't welded to its PrimaryPart, directly or
+-- through other welded parts. Nil if every part is.
+local function FindUnweldedPart(template: Model, primaryPart: BasePart): BasePart?
+	local neighbors: { [BasePart]: { BasePart } } = {}
+	local function Link(first: BasePart, second: BasePart)
+		local list = neighbors[first] or {}
+		neighbors[first] = list
+		table.insert(list, second)
+	end
+	for _, descendant in template:GetDescendants() do
+		local part0: BasePart?, part1: BasePart? = nil, nil
+		if descendant:IsA("WeldConstraint") or descendant:IsA("JointInstance") then
+			part0, part1 = descendant.Part0, descendant.Part1
+		end
+		if part0 and part1 then
+			Link(part0, part1)
+			Link(part1, part0)
+		end
+	end
+
+	local reached: { [BasePart]: boolean } = { [primaryPart] = true }
+	local toVisit = { primaryPart }
+	while #toVisit > 0 do
+		local part = table.remove(toVisit) :: BasePart
+		local partNeighbors: { BasePart } = neighbors[part] or {}
+		for _, neighbor in partNeighbors do
+			if not reached[neighbor] then
+				reached[neighbor] = true
+				table.insert(toVisit, neighbor)
+			end
+		end
+	end
+
+	for _, descendant in template:GetDescendants() do
+		if descendant:IsA("BasePart") and not reached[descendant] then
+			return descendant
+		end
+	end
+	return nil
+end
+
 -- Checks a template follows the contract above. Returns a problem description if not.
 function Boat.CheckTemplate(template: Instance?, seatCount: number): string?
 	if not template or not template:IsA("Model") then
 		return "is missing (it should be a Model)"
 	end
-	if not template.PrimaryPart then
+	local primaryPart = template.PrimaryPart
+	if not primaryPart then
 		return "has no PrimaryPart set"
 	end
 	local foundSeats = #GetSeats(template)
 	if foundSeats ~= seatCount then
 		return `has {foundSeats} Seats but should have {seatCount}`
+	end
+	local unweldedPart = FindUnweldedPart(template, primaryPart)
+	if unweldedPart then
+		return `has a part named {unweldedPart.Name} that isn't welded to the PrimaryPart`
 	end
 	return nil
 end
@@ -93,6 +147,7 @@ function Boat.new(
 			Owner = owner,
 			Seats = GetSeats(model),
 			State = "Docked",
+			Frozen = false,
 			Crew = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
@@ -104,10 +159,14 @@ function Boat.new(
 		Boat
 	)
 
+	-- Only the PrimaryPart is anchored, so the whole boat is held in place by it now and
+	-- floats freely once it's unanchored at launch.
 	local primaryPart = model.PrimaryPart
-	if primaryPart then
-		-- Held in place for now. Water movement will unanchor it when it's added.
-		primaryPart.Anchored = true
+	for _, descendant in model:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.Anchored = descendant == primaryPart
+			descendant.CollisionGroup = BoatServiceShared.COLLISION_GROUP
+		end
 	end
 	self:MoveTo(dockCFrame)
 
@@ -140,6 +199,11 @@ function Boat.IsAtDock(self: Boat): boolean
 	return self.State == "Docked" or self.State == "Launching"
 end
 
+-- True while the boat is on the river and moving under physics.
+function Boat.IsFloating(self: Boat): boolean
+	return self.State == "Launched" and not self.Frozen
+end
+
 function Boat.GetSeatedPlayers(self: Boat): { Player }
 	local seatedPlayers = {}
 	for _, seat in self.Seats do
@@ -151,12 +215,21 @@ function Boat.GetSeatedPlayers(self: Boat): { Player }
 	return seatedPlayers
 end
 
--- Takes `player` out of their seat in this boat, if they're in one.
-function Boat.Eject(self: Boat, player: Player)
+-- The seat `player` is sitting in on this boat, if any.
+function Boat.GetSeatOf(self: Boat, player: Player): Seat?
 	for _, seat in self.Seats do
 		if GetPlayerInSeat(seat) == player then
-			EjectFromSeat(seat)
+			return seat
 		end
+	end
+	return nil
+end
+
+-- Takes `player` out of their seat in this boat, if they're in one.
+function Boat.Eject(self: Boat, player: Player)
+	local seat = self:GetSeatOf(player)
+	if seat then
+		EjectFromSeat(seat)
 	end
 end
 
@@ -229,6 +302,68 @@ function Boat.Launch(self: Boat)
 	self:SetState("Launched")
 	self.Model:SetAttribute(BoatServiceShared.LAUNCH_TIME_ATTRIBUTE, nil)
 	self:MoveTo(self.LaunchCFrame)
+	self:StartFloating()
+end
+
+-- Hands the boat over to physics: unanchors it, keeps it upright (it can still spin
+-- freely) and makes the server simulate it.
+function Boat.StartFloating(self: Boat)
+	local primaryPart = self.Model.PrimaryPart
+	if not primaryPart then
+		return
+	end
+
+	local uprightAttachment = Instance.new("Attachment")
+	uprightAttachment.Name = "UprightAttachment"
+	-- The attachment's primary axis (its X axis) points along the boat's up direction.
+	uprightAttachment.CFrame = CFrame.fromMatrix(Vector3.zero, Vector3.yAxis, Vector3.xAxis)
+	uprightAttachment.Parent = primaryPart
+
+	local upright = Instance.new("AlignOrientation")
+	upright.Name = "Upright"
+	upright.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	upright.AlignType = Enum.AlignType.PrimaryAxisParallel
+	upright.PrimaryAxis = Vector3.yAxis
+	upright.Attachment0 = uprightAttachment
+	upright.MaxTorque = math.huge
+	upright.Responsiveness = BoatConfig.UPRIGHT_RESPONSIVENESS
+	upright.Parent = primaryPart
+
+	primaryPart.Anchored = false
+	self:ClaimNetworkOwnership()
+	primaryPart.AssemblyLinearVelocity = Vector3.zero
+	primaryPart.AssemblyAngularVelocity = Vector3.zero
+end
+
+-- Makes sure the server simulates the boat. Seated players can otherwise end up owning
+-- it, so BoatService calls this again every CLEANUP_INTERVAL.
+function Boat.ClaimNetworkOwnership(self: Boat)
+	local primaryPart = self.Model.PrimaryPart
+	if not primaryPart or not primaryPart:CanSetNetworkOwnership() then
+		return
+	end
+	if primaryPart:GetNetworkOwnershipAuto() or primaryPart:GetNetworkOwner() ~= nil then
+		primaryPart:SetNetworkOwner(nil)
+	end
+end
+
+-- Adds to the boat's speed (studs/s) and turn speed (rad/s, positive turns left).
+function Boat.AddVelocity(self: Boat, push: Vector3, spin: number)
+	local primaryPart = self.Model.PrimaryPart
+	if not primaryPart or not self:IsFloating() then
+		return
+	end
+	primaryPart.AssemblyLinearVelocity += push
+	primaryPart.AssemblyAngularVelocity += Vector3.yAxis * spin
+end
+
+-- Holds the boat still in mid-air (after falling off the river) until it's removed.
+function Boat.Freeze(self: Boat)
+	self.Frozen = true
+	local primaryPart = self.Model.PrimaryPart
+	if primaryPart then
+		primaryPart.Anchored = true
+	end
 end
 
 -- After launch: anyone in the crew who is no longer seated has left the boat.

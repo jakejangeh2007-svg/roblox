@@ -24,16 +24,22 @@ ReplicatedStorage
   Shared
     Services
       BoatService         BoatServiceClient, BoatServiceShared
+      CameraService       CameraServiceClient
       CheckpointService   CheckpointServiceClient, CheckpointServiceShared
       DockService         DockServiceClient, DockServiceShared
+      FartService         FartServiceClient, FartServiceShared, FartPhysics
     Classes
     Modules
       Core                Remotes
-      Game                BoatConfig, CheckpointConfig, DataConfig, DockConfig
+      Game                BoatConfig, CameraConfig, CheckpointConfig, DataConfig,
+                          DockConfig, FartConfig, WaterConfig
       Math                Geometry
       Platform
-  Assets
-    Boats                 boat templates (you build these)
+  Assets                you build everything in here
+    Boats                 boat templates
+    VFX                   FartCloud (a ParticleEmitter)
+    Sounds
+      Farts               fart Sounds
   UI                      top-level UI initializer
     HUD
     Menus
@@ -46,6 +52,8 @@ ServerScriptService
     CheckpointService     CheckpointServiceServer
     DataService           DataServiceServer
     DockService           DockServiceServer
+    FartService           FartServiceServer
+    WaterService          WaterServiceServer
   Classes                 Boat, Dock, Location
 
 StarterPlayer.StarterPlayerScripts
@@ -65,17 +73,39 @@ Workspace
    Each player can have one waiting boat; picking again replaces it.
 3. Players sit in the boat's seats. When **every seat is full**, a `LAUNCH_DELAY`
    countdown starts. If anyone gets up, it stops. When it finishes, the boat moves to
-   the location's **Launch** point in the river. From then on nobody new can get in.
-   Anyone who leaves goes back to their current checkpoint.
-4. When a boat on the river enters a checkpoint's **Zone**, that checkpoint and every
+   the location's **Launch** point in the river and starts **floating**. From then on
+   nobody new can get in, and anyone who leaves goes back to their current checkpoint.
+4. On the river, players **fart to steer** (controls below). The server checks every
+   fart, spends gas and pushes the boat. **WaterService** keeps boats on the water
+   surface, slows them down and pushes them along currents. A boat that **falls off**
+   the river freezes for `WIPE_DELAY`, then it's removed and its crew goes back to
+   their checkpoint to spawn a new boat.
+5. When a boat on the river enters a checkpoint's **Zone**, that checkpoint and every
    one before it are **unlocked** and saved for everyone aboard. From then on they
    respawn there.
-5. Players can **teleport** to the lobby or any unlocked checkpoint. Each checkpoint
+6. Players can **teleport** to the lobby or any unlocked checkpoint. Each checkpoint
    has its own docks, so they can start a new boat from there.
-6. A boat entering **Map.Finish** beats the game. It's saved, and after
+7. A boat entering **Map.Finish** beats the game. It's saved, and after
    `FINISH_RETURN_DELAY` the crew is sent back to the lobby.
 
 Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`.
+
+## Fart controls
+
+| Fart | Keyboard | Controller | What it does |
+| ---- | -------- | ---------- | ------------ |
+| Left | `A`, `←`, `Q` | `LB` | turns the boat left (the same way from every seat) |
+| Straight | `W`, `↑`, `Space` | `RT` | pushes the boat away from you |
+| Right | `D`, `→`, `E` | `RB` | turns the boat right |
+
+Tap to toot. Hold, then let go, for a Mega Fart (up to 3× the push). Each fart uses gas,
+which refills over time. When 3 or more players on one boat (or everyone, if fewer)
+Mega Fart at once, it's a **FARTQUAKE** and every push gets 1.5× stronger.
+Everyone farting Straight cancels out; everyone farting Left spins the boat on the spot.
+
+**Seat Cam:** on the river the camera sits behind your seat, so Straight always pushes
+up your screen. `V` (or `Y` on a controller) switches to the normal camera.
+Touch devices need on-screen buttons, which are UI, so they come with the menus.
 
 ## Building the map
 
@@ -103,11 +133,20 @@ Workspace
         Docks (Folder)           same as the lobby's
       Checkpoint2 ...
     Finish             Part      a boat whose middle is inside this has beaten the game
+    Water (Folder)               every water surface part on the river, any names
+      ...              Parts     the TOP face is the water surface
+      Rapids           Part      named after an entry in WaterConfig.CURRENT_SPEEDS: flows toward its front face
 ```
 
 - Make `Spawn`, `Launch`, `Zone`, `BoatSpawn` and `Finish` **Anchored**, **CanCollide off**
   and **Transparency 1** (they're markers, not things to stand on).
 - Make `Zone` and `Finish` big enough to cover the whole river, so a boat can't miss them.
+- Make water parts **Anchored** and **CanCollide off**. Boats float wherever there's a water
+  part underneath and fall where there isn't, so rivers without walls can be fallen off.
+- To make water flow, name the part after an entry in `WaterConfig.CURRENT_SPEEDS`
+  (`Current` or `Rapids` to start with) and turn it so its front face points downstream.
+  Add more names and speeds there.
+- Put each `Launch` part at water level, over a water part.
 - The checkpoints and their order live in `CheckpointConfig.CHECKPOINTS`. The three
   there now are placeholders: edit the list to match the map.
 
@@ -116,12 +155,27 @@ Workspace
 Put one Model per size in **`ReplicatedStorage.Assets.Boats`**, named as in
 `BoatConfig.TEMPLATE_NAMES` (`Boat1` … `Boat6` by default):
 
-- Set the Model's **PrimaryPart**.
-- Weld every other part to it with **WeldConstraints**.
-- Put in exactly as many **Seat** objects as the size (`Boat3` has 3 Seats).
+- Set the Model's **PrimaryPart** to a flat part in the middle of the boat, at the height
+  the water should come up to, top face up. It can be invisible. Boats float with this
+  part at the water surface.
+- Weld every other part, Seats included, to it with **WeldConstraints** (directly or through
+  other welded parts). Anchoring doesn't matter: the code sets it.
+- Put in exactly as many **Seat** objects as the size (`Boat3` has 3 Seats). Space them
+  around the edge, facing the middle. A one-seat boat can have its seat in the middle,
+  facing forward.
 - No scripts inside.
 
 Output warns at startup about any template that's missing or doesn't follow these rules.
+
+## Fart effects
+
+- **`ReplicatedStorage.Assets.VFX.FartCloud`:** a ParticleEmitter for the gas cloud.
+  Set its **Rate to 0** (farts call Emit), and its Texture, Color, Size and so on however
+  you like. Its Speed is multiplied by each fart's power.
+- **`ReplicatedStorage.Assets.Sounds.Farts`:** a Folder of fart Sounds from the Creator
+  Store. Each fart plays a random one at a slightly random pitch.
+
+Without them farts still work, just invisible or silent, and Output warns once.
 
 ## For the UI (to be built by hand)
 
@@ -136,6 +190,11 @@ The client halves have everything the menus need:
 | Teleport | `CheckpointServiceClient:RequestTeleport(id)` → `(success, message)`; the lobby's id is `CheckpointConfig.LOBBY_ID` |
 | List changed | `CheckpointServiceClient.UnlockedCheckpointsChanged` |
 | "Checkpoint reached" / "You win" | `CheckpointServiceClient.CheckpointReached`, `CheckpointServiceClient.GameCompleted` |
+| Gas meter | the player's `Gas` attribute, 0 to `FartConfig.GAS_MAX` |
+| Mega Fart charge bar | `FartServiceClient.ChargeStarted` and `ChargeEnded`; charge = time held / `MEGA_CHARGE_TIME` |
+| Touch fart buttons | call `FartServiceClient:StartCharge(direction)` on press and `ReleaseCharge(direction)` on release (`"Left"`, `"Straight"`, `"Right"`) |
+| "FARTQUAKE!" banner | `FartServiceClient.Fartquake` |
+| RIP screen | `BoatServiceClient.BoatWiped` |
 
 ## Saving
 

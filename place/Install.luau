@@ -19,12 +19,15 @@ local FOLDERS: { { string } } = {
 	{ "ReplicatedStorage", "Shared", "Classes" },
 	{ "ReplicatedStorage", "Shared", "Modules", "Platform" },
 	{ "ReplicatedStorage", "Assets", "Boats" },
+	{ "ReplicatedStorage", "Assets", "VFX" },
+	{ "ReplicatedStorage", "Assets", "Sounds", "Farts" },
 	{ "ReplicatedStorage", "UI", "HUD" },
 	{ "ReplicatedStorage", "UI", "Menus" },
 	{ "ServerScriptService", "Services" },
 	{ "ServerScriptService", "Classes" },
 	{ "Workspace", "Map", "Lobby", "Docks" },
 	{ "Workspace", "Map", "Checkpoints" },
+	{ "Workspace", "Map", "Water" },
 	{ "Workspace", "Boats" },
 }
 
@@ -269,12 +272,19 @@ return TableUtil
 -- ModuleScript: ServerScriptService.Classes.Boat
 --
 -- A boat cloned from a template in ReplicatedStorage.Assets.Boats. It waits at a
--- dock until every seat is taken, counts down, then moves into the river.
+-- dock until every seat is taken, counts down, then moves into the river and floats.
+-- On the river the server owns its physics: WaterService keeps it afloat and
+-- FartService pushes it.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
---   PrimaryPart   must be set. Weld every other part to it with WeldConstraints.
---   Seats         one Seat per player, anywhere in the model. The number of Seats must
---                 match the size the template is listed under in BoatConfig.TEMPLATE_NAMES.
+--   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
+--                 water should come up to, with its top face pointing up. It can be invisible.
+--   Welds         every other part, Seats included, welded to the PrimaryPart with
+--                 WeldConstraints (directly or through other welded parts).
+--   Seats         one Seat per player. The number of Seats must match the size the
+--                 template is listed under in BoatConfig.TEMPLATE_NAMES. Put them around
+--                 the edge facing the middle. A one-seat boat can have its seat in the
+--                 middle, facing forward.
 --
 -- States: Docked -> Launching -> Launched -> Destroyed. Launching goes back to Docked
 -- if a seat empties during the countdown. The model's State and LaunchTime attributes
@@ -295,6 +305,7 @@ type BoatMembers = {
 	Owner: Player, -- who spawned it
 	Seats: { Seat },
 	State: BoatServiceShared.BoatState,
+	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
@@ -328,17 +339,63 @@ local function GetPlayerInSeat(seat: Seat): Player?
 	return if humanoid then Players:GetPlayerFromCharacter(humanoid.Parent) else nil
 end
 
+-- The first part in `template` that isn't welded to its PrimaryPart, directly or
+-- through other welded parts. Nil if every part is.
+local function FindUnweldedPart(template: Model, primaryPart: BasePart): BasePart?
+	local neighbors: { [BasePart]: { BasePart } } = {}
+	local function Link(first: BasePart, second: BasePart)
+		local list = neighbors[first] or {}
+		neighbors[first] = list
+		table.insert(list, second)
+	end
+	for _, descendant in template:GetDescendants() do
+		local part0: BasePart?, part1: BasePart? = nil, nil
+		if descendant:IsA("WeldConstraint") or descendant:IsA("JointInstance") then
+			part0, part1 = descendant.Part0, descendant.Part1
+		end
+		if part0 and part1 then
+			Link(part0, part1)
+			Link(part1, part0)
+		end
+	end
+
+	local reached: { [BasePart]: boolean } = { [primaryPart] = true }
+	local toVisit = { primaryPart }
+	while #toVisit > 0 do
+		local part = table.remove(toVisit) :: BasePart
+		local partNeighbors: { BasePart } = neighbors[part] or {}
+		for _, neighbor in partNeighbors do
+			if not reached[neighbor] then
+				reached[neighbor] = true
+				table.insert(toVisit, neighbor)
+			end
+		end
+	end
+
+	for _, descendant in template:GetDescendants() do
+		if descendant:IsA("BasePart") and not reached[descendant] then
+			return descendant
+		end
+	end
+	return nil
+end
+
 -- Checks a template follows the contract above. Returns a problem description if not.
 function Boat.CheckTemplate(template: Instance?, seatCount: number): string?
 	if not template or not template:IsA("Model") then
 		return "is missing (it should be a Model)"
 	end
-	if not template.PrimaryPart then
+	local primaryPart = template.PrimaryPart
+	if not primaryPart then
 		return "has no PrimaryPart set"
 	end
 	local foundSeats = #GetSeats(template)
 	if foundSeats ~= seatCount then
 		return `has {foundSeats} Seats but should have {seatCount}`
+	end
+	local unweldedPart = FindUnweldedPart(template, primaryPart)
+	if unweldedPart then
+		return `has a part named {unweldedPart.Name} that isn't welded to the PrimaryPart`
 	end
 	return nil
 end
@@ -360,6 +417,7 @@ function Boat.new(
 			Owner = owner,
 			Seats = GetSeats(model),
 			State = "Docked",
+			Frozen = false,
 			Crew = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
@@ -371,10 +429,14 @@ function Boat.new(
 		Boat
 	)
 
+	-- Only the PrimaryPart is anchored, so the whole boat is held in place by it now and
+	-- floats freely once it's unanchored at launch.
 	local primaryPart = model.PrimaryPart
-	if primaryPart then
-		-- Held in place for now. Water movement will unanchor it when it's added.
-		primaryPart.Anchored = true
+	for _, descendant in model:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			descendant.Anchored = descendant == primaryPart
+			descendant.CollisionGroup = BoatServiceShared.COLLISION_GROUP
+		end
 	end
 	self:MoveTo(dockCFrame)
 
@@ -407,6 +469,11 @@ function Boat.IsAtDock(self: Boat): boolean
 	return self.State == "Docked" or self.State == "Launching"
 end
 
+-- True while the boat is on the river and moving under physics.
+function Boat.IsFloating(self: Boat): boolean
+	return self.State == "Launched" and not self.Frozen
+end
+
 function Boat.GetSeatedPlayers(self: Boat): { Player }
 	local seatedPlayers = {}
 	for _, seat in self.Seats do
@@ -418,12 +485,21 @@ function Boat.GetSeatedPlayers(self: Boat): { Player }
 	return seatedPlayers
 end
 
--- Takes `player` out of their seat in this boat, if they're in one.
-function Boat.Eject(self: Boat, player: Player)
+-- The seat `player` is sitting in on this boat, if any.
+function Boat.GetSeatOf(self: Boat, player: Player): Seat?
 	for _, seat in self.Seats do
 		if GetPlayerInSeat(seat) == player then
-			EjectFromSeat(seat)
+			return seat
 		end
+	end
+	return nil
+end
+
+-- Takes `player` out of their seat in this boat, if they're in one.
+function Boat.Eject(self: Boat, player: Player)
+	local seat = self:GetSeatOf(player)
+	if seat then
+		EjectFromSeat(seat)
 	end
 end
 
@@ -496,6 +572,68 @@ function Boat.Launch(self: Boat)
 	self:SetState("Launched")
 	self.Model:SetAttribute(BoatServiceShared.LAUNCH_TIME_ATTRIBUTE, nil)
 	self:MoveTo(self.LaunchCFrame)
+	self:StartFloating()
+end
+
+-- Hands the boat over to physics: unanchors it, keeps it upright (it can still spin
+-- freely) and makes the server simulate it.
+function Boat.StartFloating(self: Boat)
+	local primaryPart = self.Model.PrimaryPart
+	if not primaryPart then
+		return
+	end
+
+	local uprightAttachment = Instance.new("Attachment")
+	uprightAttachment.Name = "UprightAttachment"
+	-- The attachment's primary axis (its X axis) points along the boat's up direction.
+	uprightAttachment.CFrame = CFrame.fromMatrix(Vector3.zero, Vector3.yAxis, Vector3.xAxis)
+	uprightAttachment.Parent = primaryPart
+
+	local upright = Instance.new("AlignOrientation")
+	upright.Name = "Upright"
+	upright.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	upright.AlignType = Enum.AlignType.PrimaryAxisParallel
+	upright.PrimaryAxis = Vector3.yAxis
+	upright.Attachment0 = uprightAttachment
+	upright.MaxTorque = math.huge
+	upright.Responsiveness = BoatConfig.UPRIGHT_RESPONSIVENESS
+	upright.Parent = primaryPart
+
+	primaryPart.Anchored = false
+	self:ClaimNetworkOwnership()
+	primaryPart.AssemblyLinearVelocity = Vector3.zero
+	primaryPart.AssemblyAngularVelocity = Vector3.zero
+end
+
+-- Makes sure the server simulates the boat. Seated players can otherwise end up owning
+-- it, so BoatService calls this again every CLEANUP_INTERVAL.
+function Boat.ClaimNetworkOwnership(self: Boat)
+	local primaryPart = self.Model.PrimaryPart
+	if not primaryPart or not primaryPart:CanSetNetworkOwnership() then
+		return
+	end
+	if primaryPart:GetNetworkOwnershipAuto() or primaryPart:GetNetworkOwner() ~= nil then
+		primaryPart:SetNetworkOwner(nil)
+	end
+end
+
+-- Adds to the boat's speed (studs/s) and turn speed (rad/s, positive turns left).
+function Boat.AddVelocity(self: Boat, push: Vector3, spin: number)
+	local primaryPart = self.Model.PrimaryPart
+	if not primaryPart or not self:IsFloating() then
+		return
+	end
+	primaryPart.AssemblyLinearVelocity += push
+	primaryPart.AssemblyAngularVelocity += Vector3.yAxis * spin
+end
+
+-- Holds the boat still in mid-air (after falling off the river) until it's removed.
+function Boat.Freeze(self: Boat)
+	self.Frozen = true
+	local primaryPart = self.Model.PrimaryPart
+	if primaryPart then
+		primaryPart.Anchored = true
+	end
 end
 
 -- After launch: anyone in the crew who is no longer seated has left the boat.
@@ -797,9 +935,10 @@ UI.Init(UI)
 --
 -- Owns every boat: spawning them from templates, launching them into the river
 -- and removing them. Boats are Boat objects (ServerScriptService.Classes.Boat).
--- DockService asks it for new boats, and CheckpointService asks it which boats
--- are on the river.
+-- DockService asks it for new boats, CheckpointService and WaterService ask it
+-- which boats are on the river, and FartService asks which boat a player is riding.
 
+local PhysicsService = game:GetService("PhysicsService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
@@ -807,6 +946,7 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local Boat = require(ServerScriptService.Classes.Boat)
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
 local BoatServiceServer = {}
@@ -816,6 +956,7 @@ type BoatServiceServerMembers = {
 	BoatsFolder: Instance,
 	TemplatesFolder: Instance?,
 	CrewMemberLeft: Signal.Signal, -- fires (player: Player, boat: Boat) when anyone leaves a launched boat, for any reason
+	NotifyBoatWipedRemote: RemoteEvent,
 }
 
 export type BoatServiceServer = typeof(BoatServiceServer) & BoatServiceServerMembers
@@ -823,6 +964,15 @@ export type BoatServiceServer = typeof(BoatServiceServer) & BoatServiceServerMem
 function BoatServiceServer.Init(self: BoatServiceServer)
 	self.Boats = {}
 	self.CrewMemberLeft = Signal.new()
+	self.NotifyBoatWipedRemote =
+		Remotes.CreateEvent(BoatServiceShared.SERVICE_NAME, BoatServiceShared.NOTIFY_BOAT_WIPED)
+
+	-- Boats pass through each other.
+	local collisionGroup = BoatServiceShared.COLLISION_GROUP
+	if not PhysicsService:IsCollisionGroupRegistered(collisionGroup) then
+		PhysicsService:RegisterCollisionGroup(collisionGroup)
+	end
+	PhysicsService:CollisionGroupSetCollidable(collisionGroup, collisionGroup, false)
 
 	local boatsFolder = workspace:FindFirstChild(BoatServiceShared.BOATS_FOLDER_NAME)
 	if not boatsFolder then
@@ -923,6 +1073,7 @@ function BoatServiceServer.EjectPlayer(self: BoatServiceServer, player: Player)
 end
 
 -- Removes boats that were destroyed, and docked boats left empty for too long.
+-- Also makes sure the server still simulates every boat on the river.
 function BoatServiceServer.CleanUp(self: BoatServiceServer)
 	local now = os.clock()
 	for index = #self.Boats, 1, -1 do
@@ -933,8 +1084,35 @@ function BoatServiceServer.CleanUp(self: BoatServiceServer)
 		end
 		if boat.State == "Destroyed" then
 			table.remove(self.Boats, index)
+		elseif boat:IsFloating() then
+			boat:ClaimNetworkOwnership()
 		end
 	end
+end
+
+-- The boat on the river that `player` is part of the crew of, if any.
+function BoatServiceServer.GetLaunchedBoatOf(self: BoatServiceServer, player: Player): Boat.Boat?
+	for _, boat in self.Boats do
+		if boat.State == "Launched" and table.find(boat.Crew, player) then
+			return boat
+		end
+	end
+	return nil
+end
+
+-- A boat fell off the river: freeze it, tell its crew, then remove it. Removing it
+-- sends the crew back to their checkpoint (CheckpointService listens to CrewMemberLeft).
+function BoatServiceServer.WipeBoat(self: BoatServiceServer, boat: Boat.Boat)
+	if not boat:IsFloating() then
+		return
+	end
+	boat:Freeze()
+	for _, player in boat.Crew do
+		self.NotifyBoatWipedRemote:FireClient(player)
+	end
+	task.delay(BoatConfig.WIPE_DELAY, function()
+		self:DestroyBoat(boat)
+	end)
 end
 
 -- A player who leaves the game takes their waiting boat with them, unless friends are already in it.
@@ -1610,6 +1788,309 @@ return DockServiceServer :: DockServiceServer
 ]==],
 	},
 	{
+		ParentPath = { "ServerScriptService", "Services", "FartService" },
+		Name = "FartServiceServer",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Services.FartService.FartServiceServer
+--
+-- Checks every fart a client asks for, spends the player's gas and pushes their
+-- boat. Clients only ask; this decides. Also handles FARTQUAKEs (several Mega Farts
+-- on one boat at almost the same moment) and tells other players to play the effect.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Boat = require(ServerScriptService.Classes.Boat)
+local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
+local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
+local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
+local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
+local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
+local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
+
+local SERVICE_NAME = FartServiceShared.SERVICE_NAME
+
+type Mega = {
+	Player: Player,
+	Time: number,
+	Push: Vector3,
+	Spin: number,
+}
+
+local FartServiceServer = {}
+
+type FartServiceServerMembers = {
+	Gas: { [Player]: number },
+	LastFartTimes: { [Player]: number },
+	RecentMegas: { [Boat.Boat]: { Mega } },
+	PlayFartRemote: RemoteEvent,
+	PlayFartquakeRemote: RemoteEvent,
+}
+
+export type FartServiceServer = typeof(FartServiceServer) & FartServiceServerMembers
+
+function FartServiceServer.Init(self: FartServiceServer)
+	self.Gas = {}
+	self.LastFartTimes = {}
+	self.RecentMegas = setmetatable({}, { __mode = "k" }) :: any
+	self.PlayFartRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.PLAY_FART)
+	self.PlayFartquakeRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.PLAY_FARTQUAKE)
+
+	Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.REQUEST_FART).OnServerEvent
+		:Connect(function(player: Player, direction: unknown, heldTime: unknown)
+			self:HandleFartRequest(player, direction, heldTime)
+		end)
+
+	Players.PlayerAdded:Connect(function(player)
+		self:SetGas(player, FartConfig.GAS_MAX)
+	end)
+	for _, player in Players:GetPlayers() do
+		self:SetGas(player, FartConfig.GAS_MAX)
+	end
+	Players.PlayerRemoving:Connect(function(player)
+		self.Gas[player] = nil
+		self.LastFartTimes[player] = nil
+	end)
+
+	RunService.Heartbeat:Connect(function(deltaTime)
+		self:Regenerate(deltaTime)
+	end)
+end
+
+function FartServiceServer.SetGas(self: FartServiceServer, player: Player, gas: number)
+	self.Gas[player] = gas
+	-- Players see whole numbers, which keeps attribute updates down.
+	local shownGas = math.floor(gas)
+	if player:GetAttribute(FartServiceShared.GAS_ATTRIBUTE) ~= shownGas then
+		player:SetAttribute(FartServiceShared.GAS_ATTRIBUTE, shownGas)
+	end
+end
+
+function FartServiceServer.Regenerate(self: FartServiceServer, deltaTime: number)
+	for player, gas in self.Gas do
+		if gas < FartConfig.GAS_MAX then
+			self:SetGas(player, math.min(FartConfig.GAS_MAX, gas + FartConfig.GAS_REGEN * deltaTime))
+		end
+	end
+end
+
+-- Client request: fart in `direction` after holding the key for `heldTime` seconds.
+function FartServiceServer.HandleFartRequest(
+	self: FartServiceServer,
+	player: Player,
+	direction: unknown,
+	heldTime: unknown
+)
+	if not FartPhysics.IsDirection(direction) then
+		return
+	end
+	if typeof(heldTime) ~= "number" or heldTime ~= heldTime then
+		return -- not a number, or NaN
+	end
+
+	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
+	if not boat or not boat:IsFloating() then
+		return
+	end
+	local seat = boat:GetSeatOf(player)
+	if not seat then
+		return
+	end
+
+	local now = os.clock()
+	local lastFartTime = self.LastFartTimes[player]
+	if lastFartTime and now - lastFartTime < FartConfig.TOOT_COOLDOWN * FartConfig.COOLDOWN_LENIENCY then
+		return
+	end
+	local held = math.clamp(heldTime, 0, FartConfig.MEGA_CHARGE_TIME)
+	local gas = self.Gas[player] or 0
+	local cost = FartPhysics.GetCost(held)
+	if gas < cost then
+		return
+	end
+	self:SetGas(player, gas - cost)
+	self.LastFartTimes[player] = now
+
+	local power = FartPhysics.GetPower(held)
+	local isMega = FartPhysics.IsMega(held)
+	local seatCount = #boat.Seats
+	local push, spin = FartPhysics.GetKick(boat:GetPosition(), seat.CFrame, direction :: FartPhysics.Direction, power)
+	push *= BoatConfig.PUSH_SCALES[seatCount] or 1
+	spin *= BoatConfig.SPIN_SCALES[seatCount] or 1
+	boat:AddVelocity(push, spin)
+
+	if isMega then
+		self:RegisterMega(boat, { Player = player, Time = now, Push = push, Spin = spin })
+	end
+
+	-- Everyone else sees and hears it. The farter played it the moment they let go.
+	for _, otherPlayer in Players:GetPlayers() do
+		if otherPlayer ~= player then
+			self.PlayFartRemote:FireClient(otherPlayer, player, direction, power, isMega)
+		end
+	end
+end
+
+-- Remembers a Mega Fart. If enough different crew members have Mega Farted within
+-- FARTQUAKE_WINDOW, it's a FARTQUAKE: every one of those pushes gets stronger.
+function FartServiceServer.RegisterMega(self: FartServiceServer, boat: Boat.Boat, mega: Mega)
+	local megas: { Mega } = self.RecentMegas[boat] or {}
+	self.RecentMegas[boat] = megas
+	for index = #megas, 1, -1 do
+		if mega.Time - megas[index].Time > FartConfig.FARTQUAKE_WINDOW then
+			table.remove(megas, index)
+		end
+	end
+	table.insert(megas, mega)
+
+	local playersNeeded = math.max(2, math.min(FartConfig.FARTQUAKE_MIN_PLAYERS, #boat.Crew))
+	local megaPlayers: { [Player]: boolean } = {}
+	local playerCount = 0
+	for _, entry in megas do
+		if not megaPlayers[entry.Player] then
+			megaPlayers[entry.Player] = true
+			playerCount += 1
+		end
+	end
+	if playerCount < playersNeeded then
+		return
+	end
+
+	local extra = FartConfig.FARTQUAKE_MULT - 1
+	for _, entry in megas do
+		boat:AddVelocity(entry.Push * extra, entry.Spin * extra)
+	end
+	table.clear(megas)
+	for _, crewMember in boat.Crew do
+		self.PlayFartquakeRemote:FireClient(crewMember)
+	end
+end
+
+return FartServiceServer :: FartServiceServer
+]==],
+	},
+	{
+		ParentPath = { "ServerScriptService", "Services", "WaterService" },
+		Name = "WaterServiceServer",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Services.WaterService.WaterServiceServer
+--
+-- Keeps boats on the river afloat: holds them at the water surface, slows them down
+-- and pushes them along currents. Where there's no water under a boat, nothing holds
+-- it up and it falls. A boat that falls FALL_DISTANCE below the last water it was on
+-- has fallen off the river, and BoatService wipes it.
+--
+-- Map contract:
+--   Workspace.Map.Water   Folder of parts whose TOP face is the water surface. Make them
+--                         Anchored and CanCollide off. Parts named after an entry in
+--                         WaterConfig.CURRENT_SPEEDS flow toward their front face.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Boat = require(ServerScriptService.Classes.Boat)
+local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
+local WaterConfig = require(ReplicatedStorage.Shared.Modules.Game.WaterConfig)
+
+local WaterServiceServer = {}
+
+type WaterServiceServerMembers = {
+	RaycastParameters: RaycastParams,
+	LastWaterHeights: { [Boat.Boat]: number }, -- the surface height each boat last floated on
+}
+
+export type WaterServiceServer = typeof(WaterServiceServer) & WaterServiceServerMembers
+
+-- The velocity the water's current gives things floating on `waterPart`.
+local function GetCurrent(waterPart: Instance): Vector3
+	local speed = WaterConfig.CURRENT_SPEEDS[waterPart.Name]
+	if not speed or not waterPart:IsA("BasePart") then
+		return Vector3.zero
+	end
+	local flatDirection = waterPart.CFrame.LookVector * Vector3.new(1, 0, 1)
+	if flatDirection.Magnitude == 0 then
+		return Vector3.zero
+	end
+	return flatDirection.Unit * speed
+end
+
+function WaterServiceServer.Init(self: WaterServiceServer)
+	self.RaycastParameters = RaycastParams.new()
+	self.RaycastParameters.FilterType = Enum.RaycastFilterType.Include
+	self.LastWaterHeights = setmetatable({}, { __mode = "k" }) :: any
+
+	local map = workspace:FindFirstChild("Map")
+	local waterFolder = if map then map:FindFirstChild("Water") else nil
+	if waterFolder then
+		self.RaycastParameters.FilterDescendantsInstances = { waterFolder }
+	else
+		warn("Map piece missing: Workspace.Map.Water (a Folder of water surface parts). Boats will sink.")
+	end
+
+	RunService.Heartbeat:Connect(function(deltaTime)
+		self:Update(deltaTime)
+	end)
+end
+
+function WaterServiceServer.Update(self: WaterServiceServer, deltaTime: number)
+	for _, boat in BoatServiceServer:GetLaunchedBoats() do
+		local primaryPart = boat.Model.PrimaryPart
+		if not primaryPart or not boat:IsFloating() then
+			continue
+		end
+
+		local origin = primaryPart.Position + Vector3.new(0, WaterConfig.WATER_CHECK_ABOVE, 0)
+		local reach = Vector3.new(0, -(WaterConfig.WATER_CHECK_ABOVE + WaterConfig.WATER_CHECK_BELOW), 0)
+		local hit = workspace:Raycast(origin, reach, self.RaycastParameters)
+		if hit then
+			self.LastWaterHeights[boat] = hit.Position.Y
+			self:Float(primaryPart, hit, deltaTime)
+		else
+			-- Nothing holds it up. Before it has floated anywhere, measure from where it launched.
+			local lastWaterHeight = self.LastWaterHeights[boat] or boat.LaunchCFrame.Position.Y
+			if primaryPart.Position.Y < lastWaterHeight - WaterConfig.FALL_DISTANCE then
+				BoatServiceServer:WipeBoat(boat)
+			end
+		end
+	end
+end
+
+function WaterServiceServer.Float(
+	self: WaterServiceServer,
+	primaryPart: BasePart,
+	hit: RaycastResult,
+	deltaTime: number
+)
+	local velocity = primaryPart.AssemblyLinearVelocity
+	local depth = (hit.Position.Y + WaterConfig.FLOAT_HEIGHT) - primaryPart.Position.Y
+
+	-- Spring the boat onto the surface, and cancel gravity while it floats.
+	local verticalSpeed = velocity.Y
+		+ (workspace.Gravity + depth * WaterConfig.FLOAT_STIFFNESS - velocity.Y * WaterConfig.FLOAT_DAMPING)
+			* deltaTime
+
+	-- Slow down toward the speed of the water's current.
+	local drag = math.exp(-WaterConfig.WATER_DRAG * deltaTime)
+	local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z) * drag + GetCurrent(hit.Instance) * (1 - drag)
+	primaryPart.AssemblyLinearVelocity = Vector3.new(flatVelocity.X, verticalSpeed, flatVelocity.Z)
+
+	local spin = primaryPart.AssemblyAngularVelocity
+	local tiltDrag = math.exp(-WaterConfig.TILT_DRAG * deltaTime)
+	local spinDrag = math.exp(-WaterConfig.SPIN_DRAG * deltaTime)
+	primaryPart.AssemblyAngularVelocity = Vector3.new(spin.X * tiltDrag, spin.Y * spinDrag, spin.Z * tiltDrag)
+end
+
+return WaterServiceServer :: WaterServiceServer
+]==],
+	},
+	{
 		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Core" },
 		Name = "Remotes",
 		ClassName = "ModuleScript",
@@ -1703,12 +2184,53 @@ local BoatConfig = {
 		[6] = "Boat6",
 	} :: { [number]: string },
 
+	-- Multiplies every fart push and turn, by boat size. Bigger boats are heavier to steer.
+	PUSH_SCALES = {
+		[1] = 1.2,
+		[2] = 1.1,
+		[3] = 1.05,
+		[4] = 1,
+		[5] = 0.9,
+		[6] = 0.8,
+	} :: { [number]: number },
+	SPIN_SCALES = {
+		[1] = 1.5,
+		[2] = 1.2,
+		[3] = 1.1,
+		[4] = 1,
+		[5] = 0.85,
+		[6] = 0.7,
+	} :: { [number]: number },
+
 	LAUNCH_DELAY = 3, -- seconds between the last seat filling up and the boat leaving the dock
 	EMPTY_DOCKED_TIMEOUT = 60, -- a boat waiting at a dock with nobody in it is removed after this many seconds
-	CLEANUP_INTERVAL = 1, -- seconds between checks for boats to remove
+	CLEANUP_INTERVAL = 1, -- seconds between checks for boats to remove (also re-claims boat physics for the server)
+	WIPE_DELAY = 1.5, -- seconds a boat that fell off the river hangs frozen before its crew respawns
+
+	UPRIGHT_RESPONSIVENESS = 25, -- how quickly a tipped boat rights itself
+	CENTER_SEAT_RADIUS = 1, -- a seat closer than this (studs) to the middle of the boat counts as a middle seat
 }
 
 return BoatConfig
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Game" },
+		Name = "CameraConfig",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Modules.Game.CameraConfig
+
+local CameraConfig = {
+	SEAT_CAM_BACK = 14, -- studs behind your seat
+	SEAT_CAM_UP = 9, -- studs above your seat
+	SEAT_CAM_LOOK_AHEAD = 10, -- how far past the middle of the boat the camera looks
+	SEAT_CAM_SMOOTHING = 8, -- higher = the camera follows more tightly
+	SHAKE_DECAY = 8, -- how fast camera shake dies down
+}
+
+return CameraConfig
 ]==],
 	},
 	{
@@ -1796,6 +2318,91 @@ return DockConfig
 ]==],
 	},
 	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Game" },
+		Name = "FartConfig",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Modules.Game.FartConfig
+
+local FartConfig = {
+	-- Push
+	PUSH_SPEED = 7, -- studs/s one Straight toot adds (the boat glides about 8 studs)
+	SIDE_PUSH = 0.45, -- sideways push of a Left/Right fart, as a fraction of PUSH_SPEED
+	SPIN_SPEED = 0.55, -- rad/s of turn one Left/Right toot adds (about 20 degrees)
+
+	-- Toots and Mega Farts
+	TOOT_COOLDOWN = 0.35, -- seconds between farts
+	COOLDOWN_LENIENCY = 0.8, -- the server accepts farts this fraction of TOOT_COOLDOWN apart, since network packets can bunch up
+	MEGA_MIN_HOLD = 0.3, -- hold a fart key at least this long (seconds) to make a Mega Fart
+	MEGA_CHARGE_TIME = 1.2, -- seconds to fully charge a Mega Fart
+	MEGA_MULT = 3, -- a fully charged Mega Fart pushes like this many toots
+
+	-- Gas meter (each player's is in their "Gas" attribute)
+	GAS_MAX = 100,
+	TOOT_COST = 8,
+	MEGA_COST = 35,
+	GAS_REGEN = 12, -- per second, always refilling
+
+	-- FARTQUAKE: Mega Farts from several players on one boat at almost the same moment
+	FARTQUAKE_WINDOW = 0.35, -- seconds
+	FARTQUAKE_MIN_PLAYERS = 3, -- or everyone on the boat if fewer (but always at least 2)
+	FARTQUAKE_MULT = 1.5, -- every push in the FARTQUAKE gets this much stronger
+
+	-- Effects
+	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
+	GAS_ANGLE = math.rad(45), -- how far left or right of straight back the gas comes out on a Left/Right fart
+	TOOT_PARTICLES = 10,
+	MEGA_PARTICLES = 30,
+	DUD_PARTICLES = 3, -- out of gas
+	TOOT_VOLUME = 0.6,
+	MEGA_VOLUME = 1,
+	DUD_VOLUME = 0.25,
+	MIN_PITCH = 0.85, -- every fart picks a random pitch between these
+	MAX_PITCH = 1.15,
+	MEGA_PITCH = 0.8, -- multiplies the pitch of Mega Farts (deeper)
+	DUD_PITCH = 1.6, -- multiplies the pitch of duds (squeakier)
+	SOUND_LIFETIME = 5, -- seconds before a played fart sound is cleaned up
+	MEGA_SHAKE = 0.3, -- camera shake for your own Mega Fart, multiplied by its power
+	FARTQUAKE_SHAKE = 1.5, -- camera shake for a FARTQUAKE
+}
+
+return FartConfig
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Game" },
+		Name = "WaterConfig",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Modules.Game.WaterConfig
+
+local WaterConfig = {
+	WATER_DRAG = 0.9, -- how fast boats slow down
+	SPIN_DRAG = 1.6, -- how fast spinning stops
+	TILT_DRAG = 4, -- how fast wobbling stops
+
+	FLOAT_HEIGHT = 0, -- how far above the water surface a boat's PrimaryPart sits
+	FLOAT_STIFFNESS = 60, -- how strongly boats snap onto the surface
+	FLOAT_DAMPING = 8, -- how quickly bobbing stops
+	WATER_CHECK_ABOVE = 4, -- boats look for water from this far above their PrimaryPart...
+	WATER_CHECK_BELOW = 8, -- ...down to this far below it
+
+	FALL_DISTANCE = 30, -- a boat this far below the last water it floated on has fallen off the river
+
+	-- Water parts named one of these flow toward their front face at this many studs/s.
+	-- Any other water part is still water.
+	CURRENT_SPEEDS = {
+		Current = 4,
+		Rapids = 8,
+	} :: { [string]: number },
+}
+
+return WaterConfig
+]==],
+	},
+	{
 		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Math" },
 		Name = "Geometry",
 		ClassName = "ModuleScript",
@@ -1825,38 +2432,42 @@ return Geometry
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Services.BoatService.BoatServiceClient
 --
--- The client half of BoatService. While the local player sits in a boat that has
--- left the dock, jumping is switched off so they don't fall out by accident.
--- (The server still handles anyone who does leave.)
+-- The client half of BoatService.
+--   - While the local player sits in a boat on the river, jumping is switched off so
+--     they don't fall out by accident. (The server still handles anyone who leaves.)
+--   - BoatWiped fires when their boat falls off the river, for the UI (a RIP screen).
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
+local Signal = require(ReplicatedStorage.Packages.Signal)
 
 local BoatServiceClient = {}
 
 type BoatServiceClientMembers = {
 	LockedHumanoid: Humanoid?, -- the humanoid whose jumping is currently switched off
+	BoatWiped: Signal.Signal, -- fires () when the local player's boat falls off the river
 }
 
 export type BoatServiceClient = typeof(BoatServiceClient) & BoatServiceClientMembers
 
--- The spawned boat model a seat belongs to, if any.
-local function FindBoatModel(seat: BasePart): Model?
-	local boatsFolder = workspace:FindFirstChild(BoatServiceShared.BOATS_FOLDER_NAME) or workspace
-	local ancestor: Instance? = seat
-	while ancestor and ancestor.Parent ~= boatsFolder do
-		ancestor = ancestor.Parent
-	end
-	return if ancestor and ancestor:IsA("Model") then ancestor else nil
-end
-
 function BoatServiceClient.Init(self: BoatServiceClient)
 	self.LockedHumanoid = nil
+	self.BoatWiped = Signal.new()
+
 	RunService.Heartbeat:Connect(function()
 		self:UpdateJumpLock()
+	end)
+
+	-- Remotes are waited for in a separate thread so Init never yields.
+	task.spawn(function()
+		Remotes.WaitForEvent(BoatServiceShared.SERVICE_NAME, BoatServiceShared.NOTIFY_BOAT_WIPED).OnClientEvent
+			:Connect(function()
+				self.BoatWiped:Fire()
+			end)
 	end)
 end
 
@@ -1864,7 +2475,7 @@ function BoatServiceClient.UpdateJumpLock(self: BoatServiceClient)
 	local character = Players.LocalPlayer.Character
 	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
 	local seat = if humanoid then humanoid.SeatPart else nil
-	local boatModel = if seat then FindBoatModel(seat) else nil
+	local boatModel = if seat then BoatServiceShared.GetBoatModelFromPart(seat) else nil
 	local isOnRiver = boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
 	local humanoidToLock = if isOnRiver then humanoid else nil
 
@@ -1892,20 +2503,152 @@ return BoatServiceClient :: BoatServiceClient
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared
 --
--- Names both halves of BoatService agree on.
+-- Names and helpers both halves of BoatService (and other services) agree on.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 
 export type BoatState = "Docked" | "Launching" | "Launched" | "Destroyed"
 
 local BoatServiceShared = {
+	SERVICE_NAME = "BoatService",
 	BOATS_FOLDER_NAME = "Boats", -- Workspace.Boats holds every spawned boat
 	TEMPLATES_FOLDER_NAME = "Boats", -- ReplicatedStorage.Assets.Boats holds the boat templates
+	COLLISION_GROUP = "Boats", -- boats pass through each other
 
 	-- Attributes on each spawned boat model, for clients and UI
 	STATE_ATTRIBUTE = "State", -- a BoatState
 	LAUNCH_TIME_ATTRIBUTE = "LaunchTime", -- server time (workspace:GetServerTimeNow()) the boat leaves the dock
+
+	-- Remotes
+	NOTIFY_BOAT_WIPED = "NotifyBoatWiped", -- RemoteEvent to each crew member when their boat falls off the river
 }
 
+-- The spawned boat model a part belongs to (for example a Seat), if any.
+function BoatServiceShared.GetBoatModelFromPart(part: Instance): Model?
+	local boatsFolder = workspace:FindFirstChild(BoatServiceShared.BOATS_FOLDER_NAME) or workspace
+	local ancestor: Instance? = part
+	while ancestor and ancestor.Parent ~= boatsFolder do
+		ancestor = ancestor.Parent
+	end
+	return if ancestor and ancestor:IsA("Model") then ancestor else nil
+end
+
+-- Which way a rider faces, flat on the water: toward the middle of the boat. A rider
+-- in a middle seat (like a one-seat boat) faces the way their seat faces.
+function BoatServiceShared.GetRiderFacing(boatPosition: Vector3, seatCFrame: CFrame): Vector3
+	local towardMiddle = (boatPosition - seatCFrame.Position) * Vector3.new(1, 0, 1)
+	if towardMiddle.Magnitude >= BoatConfig.CENTER_SEAT_RADIUS then
+		return towardMiddle.Unit
+	end
+	local seatFacing = seatCFrame.LookVector * Vector3.new(1, 0, 1)
+	return if seatFacing.Magnitude > 0 then seatFacing.Unit else -Vector3.zAxis
+end
+
 return BoatServiceShared
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "CameraService" },
+		Name = "CameraServiceClient",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.CameraService.CameraServiceClient
+--
+-- Seat Cam: while the local player rides a boat on the river, the camera sits behind
+-- their own seat and looks across the boat. That way Straight always pushes the boat
+-- up the screen and Left always turns the view left. Press V (or Y on a controller)
+-- to switch to the normal Roblox camera and back.
+
+local ContextActionService = game:GetService("ContextActionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local CameraConfig = require(ReplicatedStorage.Shared.Modules.Game.CameraConfig)
+
+local localPlayer = Players.LocalPlayer
+
+local CameraServiceClient = {}
+
+type CameraServiceClientMembers = {
+	SeatCamEnabled: boolean,
+	ShakeAmount: number,
+	SmoothedCFrame: CFrame?,
+	Random: Random,
+}
+
+export type CameraServiceClient = typeof(CameraServiceClient) & CameraServiceClientMembers
+
+-- The boat model and seat the local player is riding on the river, if any.
+local function GetRiddenSeat(): (Model?, BasePart?)
+	local character = localPlayer.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	local seat = if humanoid then humanoid.SeatPart else nil
+	local boatModel = if seat then BoatServiceShared.GetBoatModelFromPart(seat) else nil
+	if not seat or not boatModel or boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) ~= "Launched" then
+		return nil, nil
+	end
+	return boatModel, seat
+end
+
+function CameraServiceClient.Init(self: CameraServiceClient)
+	self.SeatCamEnabled = true
+	self.ShakeAmount = 0
+	self.SmoothedCFrame = nil
+	self.Random = Random.new()
+
+	RunService:BindToRenderStep("SeatCam", Enum.RenderPriority.Camera.Value + 1, function(deltaTime)
+		self:Update(deltaTime)
+	end)
+	ContextActionService:BindAction("ToggleSeatCam", function(_actionName, inputState, _input)
+		if inputState == Enum.UserInputState.Begin then
+			self.SeatCamEnabled = not self.SeatCamEnabled
+		end
+		return Enum.ContextActionResult.Sink
+	end, false, Enum.KeyCode.V, Enum.KeyCode.ButtonY)
+end
+
+-- Shakes the camera. Bigger numbers shake harder; it dies down by itself.
+function CameraServiceClient.Shake(self: CameraServiceClient, amount: number)
+	self.ShakeAmount = math.max(self.ShakeAmount, amount)
+end
+
+function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number)
+	local camera = workspace.CurrentCamera
+	local boatModel, seat = GetRiddenSeat()
+	if not self.SeatCamEnabled or not boatModel or not seat then
+		if camera.CameraType == Enum.CameraType.Scriptable then
+			camera.CameraType = Enum.CameraType.Custom
+		end
+		self.SmoothedCFrame = nil
+		return
+	end
+
+	local boatPosition = boatModel:GetPivot().Position
+	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seat.CFrame)
+	local eye = seat.Position - facing * CameraConfig.SEAT_CAM_BACK + Vector3.yAxis * CameraConfig.SEAT_CAM_UP
+	local goal = CFrame.lookAt(eye, boatPosition + facing * CameraConfig.SEAT_CAM_LOOK_AHEAD)
+
+	local smoothing = 1 - math.exp(-CameraConfig.SEAT_CAM_SMOOTHING * deltaTime)
+	local current = (self.SmoothedCFrame or goal):Lerp(goal, smoothing)
+	self.SmoothedCFrame = current
+
+	if self.ShakeAmount > 0 then
+		local offsetX = self.Random:NextNumber(-1, 1) * self.ShakeAmount
+		local offsetY = self.Random:NextNumber(-1, 1) * self.ShakeAmount
+		current *= CFrame.new(offsetX, offsetY, 0)
+		self.ShakeAmount *= math.exp(-CameraConfig.SHAKE_DECAY * deltaTime)
+	end
+
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.CFrame = current
+end
+
+return CameraServiceClient :: CameraServiceClient
 ]==],
 	},
 	{
@@ -2099,6 +2842,405 @@ local DockServiceShared = {
 }
 
 return DockServiceShared
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "FartService" },
+		Name = "FartPhysics",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.FartService.FartPhysics
+--
+-- The rules for what one fart does. Pure math, shared by the server (which moves
+-- the boat) and the client (which predicts gas use and plays effects straight away).
+--
+-- Riders face the middle of the boat. "Straight" pushes the boat away from the
+-- rider. "Left" turns the boat left, the same way from every seat, plus a small
+-- sideways push. So with seats spread around the ring, everyone farting Straight
+-- cancels out, and everyone farting Left spins the boat on the spot.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
+
+export type Direction = "Left" | "Straight" | "Right"
+
+local FartPhysics = {}
+
+function FartPhysics.IsDirection(value: unknown): boolean
+	return value == "Left" or value == "Straight" or value == "Right"
+end
+
+-- Holding a fart key at least MEGA_MIN_HOLD seconds turns a toot into a Mega Fart.
+function FartPhysics.IsMega(heldTime: number): boolean
+	return heldTime >= FartConfig.MEGA_MIN_HOLD
+end
+
+function FartPhysics.GetCost(heldTime: number): number
+	return if FartPhysics.IsMega(heldTime) then FartConfig.MEGA_COST else FartConfig.TOOT_COST
+end
+
+-- 1 for a toot, up to MEGA_MULT for a fully charged Mega Fart.
+function FartPhysics.GetPower(heldTime: number): number
+	if not FartPhysics.IsMega(heldTime) then
+		return 1
+	end
+	local charge = math.clamp(heldTime / FartConfig.MEGA_CHARGE_TIME, 0, 1)
+	return 1 + (FartConfig.MEGA_MULT - 1) * charge
+end
+
+-- How much one fart from `seatCFrame` changes the boat's velocity (studs/s) and its
+-- turn speed (rad/s). A positive turn is a LEFT turn (counter-clockwise seen from above).
+function FartPhysics.GetKick(
+	boatPosition: Vector3,
+	seatCFrame: CFrame,
+	direction: Direction,
+	power: number
+): (Vector3, number)
+	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame)
+	local right = facing:Cross(Vector3.yAxis) -- the rider's right hand
+
+	if direction == "Straight" then
+		-- Gas goes out behind the rider, so the boat moves away from them.
+		return facing * FartConfig.PUSH_SPEED * power, 0
+	elseif direction == "Left" then
+		-- Like an outboard motor: shove our side right so the far side swings left.
+		return right * FartConfig.PUSH_SPEED * FartConfig.SIDE_PUSH * power, FartConfig.SPIN_SPEED * power
+	else
+		return -right * FartConfig.PUSH_SPEED * FartConfig.SIDE_PUSH * power, -FartConfig.SPIN_SPEED * power
+	end
+end
+
+return FartPhysics
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "FartService" },
+		Name = "FartServiceClient",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.FartService.FartServiceClient
+--
+-- The client half of FartService: turns key and controller presses into fart
+-- requests, and plays fart effects. Tap = toot, hold then let go = Mega Fart.
+-- Your own farts play the moment you let go, so they feel instant; the server
+-- still decides whether the boat moves.
+--
+--   Fart Left       A, Left arrow, Q, or LB
+--   Fart Straight   W, Up arrow, Space, or RT
+--   Fart Right      D, Right arrow, E, or RB
+--
+-- On-screen buttons for touch devices (UI, to be built) call StartCharge and
+-- ReleaseCharge. A gas meter reads the player's "Gas" attribute, and a charge bar
+-- listens to ChargeStarted and ChargeEnded.
+--
+-- Asset contract:
+--   ReplicatedStorage.Assets.VFX.FartCloud      ParticleEmitter: the gas cloud. Set Rate to 0;
+--                                               farts call Emit. Its Speed is multiplied by fart power.
+--   ReplicatedStorage.Assets.Sounds.Farts       Folder of Sounds; each fart picks one at random
+
+local ContextActionService = game:GetService("ContextActionService")
+local Debris = game:GetService("Debris")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local CameraServiceClient = require(ReplicatedStorage.Shared.Services.CameraService.CameraServiceClient)
+local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
+local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
+local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
+local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
+local Signal = require(ReplicatedStorage.Packages.Signal)
+
+local SERVICE_NAME = FartServiceShared.SERVICE_NAME
+local BUTT_ATTACHMENT_NAME = "FartButt"
+local FART_CLOUD_NAME = "FartCloud"
+local FART_SOUNDS_NAME = "Farts"
+
+local ACTION_DIRECTIONS: { [string]: FartPhysics.Direction } = {
+	FartLeft = "Left",
+	FartStraight = "Straight",
+	FartRight = "Right",
+}
+
+local localPlayer = Players.LocalPlayer
+
+local FartServiceClient = {}
+
+type FartServiceClientMembers = {
+	PressedAt: { [string]: number }, -- direction -> os.clock() its key went down
+	LastFartTime: number,
+	Random: Random,
+	FartCloudTemplate: ParticleEmitter?,
+	FartSounds: { Sound },
+	RequestFartRemote: RemoteEvent?, -- set once the server has created it
+	ChargeStarted: Signal.Signal, -- fires (direction: string) when a fart key goes down while riding
+	ChargeEnded: Signal.Signal, -- fires () when it's let go or cancelled
+	Fartquake: Signal.Signal, -- fires () when this player's boat FARTQUAKEs
+}
+
+export type FartServiceClient = typeof(FartServiceClient) & FartServiceClientMembers
+
+-- True while the local player sits in a boat that's on the river.
+local function IsRiding(): boolean
+	local character = localPlayer.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	local seat = if humanoid then humanoid.SeatPart else nil
+	local boatModel = if seat then BoatServiceShared.GetBoatModelFromPart(seat) else nil
+	return boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
+end
+
+local function FindAssets(): (ParticleEmitter?, { Sound })
+	local assets = ReplicatedStorage.Assets
+	local vfxFolder = assets:FindFirstChild("VFX")
+	local fartCloud = if vfxFolder then vfxFolder:FindFirstChild(FART_CLOUD_NAME) else nil
+	if not fartCloud or not fartCloud:IsA("ParticleEmitter") then
+		warn(`Asset missing: ReplicatedStorage.Assets.VFX.{FART_CLOUD_NAME} (a ParticleEmitter). Farts won't show.`)
+		fartCloud = nil
+	end
+
+	local fartSounds = {}
+	local soundsFolder = assets:FindFirstChild("Sounds")
+	local fartSoundsFolder = if soundsFolder then soundsFolder:FindFirstChild(FART_SOUNDS_NAME) else nil
+	if fartSoundsFolder then
+		for _, child in fartSoundsFolder:GetChildren() do
+			if child:IsA("Sound") then
+				table.insert(fartSounds, child)
+			end
+		end
+	end
+	if #fartSounds == 0 then
+		warn(`Asset missing: Sounds in ReplicatedStorage.Assets.Sounds.{FART_SOUNDS_NAME}. Farts will be silent.`)
+	end
+	return fartCloud :: ParticleEmitter?, fartSounds
+end
+
+function FartServiceClient.Init(self: FartServiceClient)
+	self.PressedAt = {}
+	self.LastFartTime = 0
+	self.Random = Random.new()
+	self.RequestFartRemote = nil
+	self.ChargeStarted = Signal.new()
+	self.ChargeEnded = Signal.new()
+	self.Fartquake = Signal.new()
+	self.FartCloudTemplate, self.FartSounds = FindAssets()
+
+	local function OnAction(actionName: string, inputState: Enum.UserInputState, _input: InputObject)
+		local direction: FartPhysics.Direction? = ACTION_DIRECTIONS[actionName]
+		if not direction or not IsRiding() then
+			-- Not on the river: let the keys do their normal job (like walking).
+			return Enum.ContextActionResult.Pass
+		end
+		if inputState == Enum.UserInputState.Begin then
+			self:StartCharge(direction)
+		elseif inputState == Enum.UserInputState.End then
+			self:ReleaseCharge(direction)
+		elseif inputState == Enum.UserInputState.Cancel then
+			self:CancelCharge(direction)
+		end
+		return Enum.ContextActionResult.Sink
+	end
+	ContextActionService:BindAction(
+		"FartLeft",
+		OnAction,
+		false,
+		Enum.KeyCode.A,
+		Enum.KeyCode.Left,
+		Enum.KeyCode.Q,
+		Enum.KeyCode.ButtonL1
+	)
+	ContextActionService:BindAction(
+		"FartStraight",
+		OnAction,
+		false,
+		Enum.KeyCode.W,
+		Enum.KeyCode.Up,
+		Enum.KeyCode.Space,
+		Enum.KeyCode.ButtonR2
+	)
+	ContextActionService:BindAction(
+		"FartRight",
+		OnAction,
+		false,
+		Enum.KeyCode.D,
+		Enum.KeyCode.Right,
+		Enum.KeyCode.E,
+		Enum.KeyCode.ButtonR1
+	)
+
+	-- Remotes are waited for in a separate thread so Init never yields.
+	task.spawn(function()
+		self.RequestFartRemote = Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.REQUEST_FART)
+		Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.PLAY_FART).OnClientEvent
+			:Connect(function(farter: Player?, direction: string, power: number, isMega: boolean)
+				if farter then -- nil if they left before this arrived
+					self:PlayFartEffect(farter, direction, power, isMega)
+				end
+			end)
+		Remotes.WaitForEvent(SERVICE_NAME, FartServiceShared.PLAY_FARTQUAKE).OnClientEvent:Connect(function()
+			CameraServiceClient:Shake(FartConfig.FARTQUAKE_SHAKE)
+			self.Fartquake:Fire()
+		end)
+	end)
+end
+
+-- A fart key (or on-screen button) went down: start timing the hold.
+function FartServiceClient.StartCharge(self: FartServiceClient, direction: FartPhysics.Direction)
+	if not IsRiding() then
+		return
+	end
+	self.PressedAt[direction] = os.clock()
+	self.ChargeStarted:Fire(direction)
+end
+
+-- The key was let go: fart, if the cooldown and gas allow it.
+function FartServiceClient.ReleaseCharge(self: FartServiceClient, direction: FartPhysics.Direction)
+	local pressedAt = self.PressedAt[direction]
+	self.PressedAt[direction] = nil
+	self.ChargeEnded:Fire()
+	if not pressedAt or not IsRiding() then
+		return
+	end
+
+	local requestFartRemote = self.RequestFartRemote
+	local now = os.clock()
+	if not requestFartRemote or now - self.LastFartTime < FartConfig.TOOT_COOLDOWN then
+		return
+	end
+	local heldTime = math.min(now - pressedAt, FartConfig.MEGA_CHARGE_TIME)
+	local gas = localPlayer:GetAttribute(FartServiceShared.GAS_ATTRIBUTE)
+	if typeof(gas) ~= "number" or gas < FartPhysics.GetCost(heldTime) then
+		self:PlayDudEffect(localPlayer)
+		return
+	end
+
+	self.LastFartTime = now
+	local power = FartPhysics.GetPower(heldTime)
+	local isMega = FartPhysics.IsMega(heldTime)
+	self:PlayFartEffect(localPlayer, direction, power, isMega)
+	if isMega then
+		CameraServiceClient:Shake(FartConfig.MEGA_SHAKE * power)
+	end
+	requestFartRemote:FireServer(direction, heldTime)
+end
+
+function FartServiceClient.CancelCharge(self: FartServiceClient, direction: FartPhysics.Direction)
+	self.PressedAt[direction] = nil
+	self.ChargeEnded:Fire()
+end
+
+-- The attachment and emitter at a player's butt, made the first time they fart.
+function FartServiceClient.GetButt(self: FartServiceClient, player: Player): (Attachment?, ParticleEmitter?)
+	local character = player.Character
+	local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
+	if not rootPart or not rootPart:IsA("BasePart") then
+		return nil, nil
+	end
+
+	local existing = rootPart:FindFirstChild(BUTT_ATTACHMENT_NAME)
+	if existing and existing:IsA("Attachment") then
+		return existing, existing:FindFirstChildOfClass("ParticleEmitter")
+	end
+
+	local butt = Instance.new("Attachment")
+	butt.Name = BUTT_ATTACHMENT_NAME
+	butt.CFrame = FartConfig.BUTT_OFFSET
+	butt.Parent = rootPart
+	local emitter: ParticleEmitter? = nil
+	local template = self.FartCloudTemplate
+	if template then
+		local newEmitter = template:Clone()
+		newEmitter.Enabled = false
+		newEmitter.Parent = butt
+		emitter = newEmitter
+	end
+	return butt, emitter
+end
+
+function FartServiceClient.PlaySound(self: FartServiceClient, parent: Instance, volume: number, pitch: number)
+	if #self.FartSounds == 0 then
+		return
+	end
+	local sound = self.FartSounds[self.Random:NextInteger(1, #self.FartSounds)]:Clone()
+	sound.Volume = volume
+	sound.PlaybackSpeed = self.Random:NextNumber(FartConfig.MIN_PITCH, FartConfig.MAX_PITCH) * pitch
+	sound.Parent = parent
+	sound:Play()
+	Debris:AddItem(sound, FartConfig.SOUND_LIFETIME)
+end
+
+function FartServiceClient.PlayFartEffect(
+	self: FartServiceClient,
+	player: Player,
+	direction: string,
+	power: number,
+	isMega: boolean
+)
+	local butt, emitter = self:GetButt(player)
+	if not butt then
+		return
+	end
+	-- Gas comes out behind the rider, angled to the side on a Left or Right fart.
+	local gasAngle = if direction == "Left"
+		then -FartConfig.GAS_ANGLE
+		elseif direction == "Right" then FartConfig.GAS_ANGLE
+		else 0
+	butt.CFrame = FartConfig.BUTT_OFFSET * CFrame.Angles(0, gasAngle, 0)
+
+	local template = self.FartCloudTemplate
+	if emitter and template then
+		emitter.Speed = NumberRange.new(template.Speed.Min * power, template.Speed.Max * power)
+		emitter:Emit(if isMega then FartConfig.MEGA_PARTICLES else FartConfig.TOOT_PARTICLES)
+	end
+	self:PlaySound(
+		butt,
+		if isMega then FartConfig.MEGA_VOLUME else FartConfig.TOOT_VOLUME,
+		if isMega then FartConfig.MEGA_PITCH else 1
+	)
+end
+
+-- Out of gas: a sad little puff.
+function FartServiceClient.PlayDudEffect(self: FartServiceClient, player: Player)
+	local butt, emitter = self:GetButt(player)
+	if not butt then
+		return
+	end
+	butt.CFrame = FartConfig.BUTT_OFFSET
+	local template = self.FartCloudTemplate
+	if emitter and template then
+		emitter.Speed = template.Speed
+		emitter:Emit(FartConfig.DUD_PARTICLES)
+	end
+	self:PlaySound(butt, FartConfig.DUD_VOLUME, FartConfig.DUD_PITCH)
+end
+
+return FartServiceClient :: FartServiceClient
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "FartService" },
+		Name = "FartServiceShared",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.FartService.FartServiceShared
+--
+-- Names both halves of FartService agree on.
+
+local FartServiceShared = {
+	SERVICE_NAME = "FartService",
+	GAS_ATTRIBUTE = "Gas", -- on each Player: their current gas, a whole number from 0 to FartConfig.GAS_MAX
+
+	-- Remotes
+	REQUEST_FART = "RequestFart", -- RemoteEvent client -> server (direction: string, heldTime: number)
+	PLAY_FART = "PlayFart", -- RemoteEvent server -> other clients (farter: Player, direction: string, power: number, isMega: boolean)
+	PLAY_FARTQUAKE = "PlayFartquake", -- RemoteEvent server -> each crew member of a boat that just FARTQUAKEd
+}
+
+return FartServiceShared
 ]==],
 	},
 }

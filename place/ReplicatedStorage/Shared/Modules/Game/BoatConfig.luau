@@ -16,9 +16,31 @@ local BoatConfig = {
 		[6] = "Boat6",
 	} :: { [number]: string },
 
+	-- Multiplies every fart push and turn, by boat size. Bigger boats are heavier to steer.
+	PUSH_SCALES = {
+		[1] = 1.2,
+		[2] = 1.1,
+		[3] = 1.05,
+		[4] = 1,
+		[5] = 0.9,
+		[6] = 0.8,
+	} :: { [number]: number },
+	SPIN_SCALES = {
+		[1] = 1.5,
+		[2] = 1.2,
+		[3] = 1.1,
+		[4] = 1,
+		[5] = 0.85,
+		[6] = 0.7,
+	} :: { [number]: number },
+
 	LAUNCH_DELAY = 3, -- seconds between the last seat filling up and the boat leaving the dock
 	EMPTY_DOCKED_TIMEOUT = 60, -- a boat waiting at a dock with nobody in it is removed after this many seconds
-	CLEANUP_INTERVAL = 1, -- seconds between checks for boats to remove
+	CLEANUP_INTERVAL = 1, -- seconds between checks for boats to remove (also re-claims boat physics for the server)
+	WIPE_DELAY = 1.5, -- seconds a boat that fell off the river hangs frozen before its crew respawns
+
+	UPRIGHT_RESPONSIVENESS = 25, -- how quickly a tipped boat rights itself
+	CENTER_SEAT_RADIUS = 1, -- a seat closer than this (studs) to the middle of the boat counts as a middle seat
 }
 
 return BoatConfig
