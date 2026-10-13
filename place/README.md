@@ -54,12 +54,15 @@ Use a normal PowerShell window, not "Run as administrator". Run one line at a ti
    cd ~\roblox\place
    rojo serve
    ```
-   Make sure it's the `place` folder, not the old `fart-to-steer` one.
+   Make sure it's the `place` folder, not the old `fart-to-steer` one: Rojo should say it's
+   serving **FartToSteerPlace**.
 2. **Terminal 2 (auto-pull):**
    ```powershell
    cd ~\roblox
-   while ($true) { git pull --quiet; Start-Sleep -Seconds 10 }
+   while ($true) { git pull; Start-Sleep -Seconds 10 }
    ```
+   It prints `Already up to date.` every 10 seconds, and a list of changed files when
+   something new arrives. Any error shows up here too.
 3. In Studio, open your place, then **Plugins → Rojo → Connect**. Accept the changes it lists.
 4. Leave both terminals open. Close them (or press Ctrl+C) when you're done.
 
