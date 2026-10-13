@@ -287,9 +287,8 @@ return TableUtil
 --   - LAUNCH_DELAY after the leader starts the run early
 -- If nobody is aboard when it's time to leave, it's removed instead.
 -- On the river it moves under physics that the server runs: its Hull (the Hull class)
--- is stepped by WaterService every frame. While it's out there its riders don't bump
--- into anything and weigh nothing, so only the hull touches the world and every boat of
--- a size handles the same however its crew is spread around it.
+-- is stepped by WaterService every frame. Riders weigh what they weigh, but while it's
+-- out there they don't bump into anything, so only the hull touches the world.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
 --   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
@@ -318,12 +317,6 @@ local Signal = require(ReplicatedStorage.Packages.Signal)
 local Boat = {}
 Boat.__index = Boat
 
--- What a rider's body part was like before they launched, to put back when they leave.
-type RiderPartSettings = {
-	CollisionGroup: string,
-	Massless: boolean,
-}
-
 type BoatMembers = {
 	Model: Model,
 	Leader: Player, -- the party leader: who spawned it, or who took over after they left
@@ -332,7 +325,7 @@ type BoatMembers = {
 	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	Hull: Hull.Hull?, -- how it moves on the river; made when it launches
-	RiderParts: { [Player]: { [BasePart]: RiderPartSettings } }, -- each rider's body parts, changed for the ride
+	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
 	JoinDeadline: number, -- server time the join timer runs out
@@ -657,23 +650,21 @@ function Boat.Launch(self: Boat)
 	end
 	local primaryPart = self.Model.PrimaryPart
 	if primaryPart then
-		self.Hull = Hull.new(primaryPart, #self.Seats)
+		self.Hull = Hull.new(primaryPart)
 	end
 end
 
--- For the ride, `player`'s body doesn't bump into anything (only the hull does) and
--- weighs nothing, so the boat turns around its own middle wherever they sit.
+-- For the ride, `player`'s body doesn't bump into anything; only the hull does.
 function Boat.PrepareRider(self: Boat, player: Player)
 	local character = player.Character
 	if not character or self.RiderParts[player] then
 		return
 	end
-	local riderParts: { [BasePart]: RiderPartSettings } = {}
+	local riderParts: { [BasePart]: string } = {}
 	for _, descendant in character:GetDescendants() do
 		if descendant:IsA("BasePart") then
-			riderParts[descendant] = { CollisionGroup = descendant.CollisionGroup, Massless = descendant.Massless }
+			riderParts[descendant] = descendant.CollisionGroup
 			descendant.CollisionGroup = BoatServiceShared.RIDER_COLLISION_GROUP
-			descendant.Massless = true
 		end
 	end
 	self.RiderParts[player] = riderParts
@@ -686,10 +677,9 @@ function Boat.ReleaseRider(self: Boat, player: Player)
 		return
 	end
 	self.RiderParts[player] = nil
-	for part, settings in riderParts do
+	for part, collisionGroup in riderParts do
 		if part.Parent then
-			part.CollisionGroup = settings.CollisionGroup
-			part.Massless = settings.Massless
+			part.CollisionGroup = collisionGroup
 		end
 	end
 end
@@ -821,17 +811,18 @@ return Dock
 --!strict
 -- ModuleScript: ServerScriptService.Classes.Hull
 --
--- How a boat on the river moves. This is the one place a floating boat's velocity is
--- worked out, all in one go every frame, so nothing fights over it. A Boat makes its
--- Hull when it launches, and WaterService steps it every frame with what the water
--- under it is doing and how hard its crew is farting (FartService):
---   - Farts push and turn it, scaled by its size's handling (BoatConfig.HANDLING).
---   - It turns around whoever is turning it, and its motion swings round with it as it
---     turns (BoatConfig.KEEL_GRIP), so it carves through a turn like a steered boat
---     instead of flinging its riders round its middle or sliding on the old way.
+-- How a boat on the river moves: as a real rigid body. This is the one place a floating
+-- boat's velocity is worked out, all in one go every frame, so nothing fights over it.
+-- A Boat makes its Hull when it launches, and WaterService steps it every frame with
+-- what the water under it is doing and the pushes from its crew's farts (FartService).
+--   - Each fart is a force applied where its rider sits. The forces speed the boat up by
+--     force / mass, and spin it by torque / moment of inertia, both worked out from the
+--     boat's real parts and riders. A push through the middle only moves the boat; a push
+--     off to one side also spins it. Big, heavy boats are slower to move and to spin.
 --   - Water drags it toward the water's own speed: gently when it's slow, so it glides
 --     on when the crew stops, and harder when it's fast, so it levels off smoothly at
---     its top speed. Currents carry it along, and rough water shoves and twists it.
+--     its top speed. The same water drag, acting round the rim, slows its spinning.
+--     Currents carry it along, and rough water shoves and twists it.
 --   - The water holds it up like a soft spring, so it bobs on the waves and settles
 --     after a drop instead of bouncing back out. Above the surface that hold fades out;
 --     in the air only gravity, a little air drag and the farts act on it.
@@ -853,11 +844,17 @@ export type Water = {
 	TurnTurbulence: number, -- twist from rough water, in rad/s² (positive turns left)
 }
 
--- The part of water drag that grows with speed, sized so one rider farting Straight at
--- full strength (on a boat with PushScale 1) levels off at TOP_SPEED.
+-- A force on the boat (in Roblox force units) and the point in the world it acts at.
+export type AppliedForce = {
+	Position: Vector3,
+	Force: Vector3,
+}
+
+-- The part of water drag that grows with speed, sized so one rider pushing at full
+-- strength levels a boat of FartConfig.REFERENCE_MASS off at TOP_SPEED.
 local SPEED_DRAG = math.max(
 	0,
-	(FartConfig.MAX_STRAIGHT_ACCELERATION - WaterConfig.GLIDE_DRAG * WaterConfig.TOP_SPEED) / WaterConfig.TOP_SPEED ^ 2
+	(FartConfig.MAX_PUSH_ACCELERATION - WaterConfig.GLIDE_DRAG * WaterConfig.TOP_SPEED) / WaterConfig.TOP_SPEED ^ 2
 )
 -- Changes to the tilt the boat aims for smaller than this aren't worth sending to the
 -- Upright constraint (every change is sent to every player).
@@ -868,39 +865,60 @@ Hull.__index = Hull
 
 type HullMembers = {
 	PrimaryPart: BasePart,
-	Handling: BoatConfig.Handling,
-	TurnSpeedDrag: number, -- like SPEED_DRAG but for turning, sized from Handling.TopTurnSpeed
 	Upright: AlignOrientation, -- tilts the boat toward the up direction it should have
 	Buoyancy: VectorForce, -- holds up the boat's weight while it's in the water
+	Mass: number, -- what the boat and its riders weigh, when SpinInertia was worked out
+	SpinInertia: number, -- moment of inertia for spinning flat on the water, about its center of mass
 	LastWaterHeight: number, -- the surface height it was last over (its launch height at first)
 	LastFlatVelocity: Vector3, -- its velocity across the water after the last step
-	PivotOffset: Vector3, -- where it turns around, from its center of mass, in its own space
 	LeanAcceleration: Vector3, -- its recent acceleration across the water, smoothed, for leaning
 }
 
 export type Hull = typeof(setmetatable({} :: HullMembers, Hull))
 
--- The turning drag that grows with turn speed, sized so one rider turning at full
--- strength levels off at the boat's TopTurnSpeed.
-local function GetTurnSpeedDrag(handling: BoatConfig.Handling): number
-	local topTurnSpeed = handling.TopTurnSpeed
-	if topTurnSpeed <= 0 then
-		return 0
+-- `part`'s moment of inertia for spinning about a vertical line through its own middle.
+-- Balls and cylinders use their own shapes; anything else counts as a box.
+local function GetPartSpinInertia(part: BasePart): number
+	local mass = part:GetMass()
+	local size = part.Size
+	if part:IsA("Part") and part.Shape == Enum.PartType.Ball then
+		return 0.4 * mass * (math.min(size.X, size.Y, size.Z) / 2) ^ 2
 	end
-	local maxTurnAcceleration = FartConfig.MAX_TURN_ACCELERATION * handling.TurnScale
-	return math.max(0, (maxTurnAcceleration - WaterConfig.TURN_GLIDE_DRAG * topTurnSpeed) / topTurnSpeed ^ 2)
+
+	-- About the part's own X, Y and Z axes
+	local inertiaX, inertiaY, inertiaZ
+	if part:IsA("Part") and part.Shape == Enum.PartType.Cylinder then
+		-- A cylinder's length runs along its X axis.
+		local radius = math.min(size.Y, size.Z) / 2
+		inertiaX = 0.5 * mass * radius ^ 2
+		inertiaY = mass * (3 * radius ^ 2 + size.X ^ 2) / 12
+		inertiaZ = inertiaY
+	else
+		inertiaX = mass * (size.Y ^ 2 + size.Z ^ 2) / 12
+		inertiaY = mass * (size.X ^ 2 + size.Z ^ 2) / 12
+		inertiaZ = mass * (size.X ^ 2 + size.Y ^ 2) / 12
+	end
+	-- Straight up, in the part's own axes
+	local up = part.CFrame:VectorToObjectSpace(Vector3.yAxis)
+	return inertiaX * up.X ^ 2 + inertiaY * up.Y ^ 2 + inertiaZ * up.Z ^ 2
 end
 
--- How far something easing with `responseTime` moves toward its target in `deltaTime`
--- seconds, from 0 (not at all) to 1 (all the way).
-local function GetBlend(responseTime: number, deltaTime: number): number
-	return if responseTime > 0 then 1 - math.exp(-deltaTime / responseTime) else 1
-end
-
--- `localOffset` (in the space of `primaryCFrame`) as a flat offset in world space.
-local function GetFlatWorldOffset(primaryCFrame: CFrame, localOffset: Vector3): Vector3
-	local offset = primaryCFrame:VectorToWorldSpace(localOffset)
-	return Vector3.new(offset.X, 0, offset.Z)
+-- The moment of inertia for spinning flat on the water of everything joined to
+-- `primaryPart` (the boat and its seated riders), about their shared center of mass.
+local function GetSpinInertia(primaryPart: BasePart): number
+	local centerOfMass = primaryPart.AssemblyCenterOfMass
+	local parts: { [BasePart]: boolean } = { [primaryPart] = true }
+	for _, part in primaryPart:GetConnectedParts(true) do
+		parts[part] = true
+	end
+	local inertia = 0
+	for part in parts do
+		if not part.Massless then
+			local offset = part.Position - centerOfMass
+			inertia += GetPartSpinInertia(part) + part:GetMass() * (offset.X ^ 2 + offset.Z ^ 2)
+		end
+	end
+	return math.max(inertia, 1e-3)
 end
 
 -- `up` (made unit length), tilted back toward straight up if it's more than `maxTilt`
@@ -918,10 +936,8 @@ local function LimitTilt(up: Vector3, maxTilt: number): Vector3
 end
 
 -- Hands the boat whose PrimaryPart is `primaryPart` over to physics: unanchors it,
--- makes the server run it and starts keeping it upright. `seatCount` picks its handling.
-function Hull.new(primaryPart: BasePart, seatCount: number): Hull
-	local handling = BoatConfig.HANDLING[seatCount] or BoatConfig.HANDLING[BoatConfig.MAX_SEATS]
-
+-- makes the server run it and starts keeping it upright. Its riders must be seated.
+function Hull.new(primaryPart: BasePart): Hull
 	local attachment = Instance.new("Attachment")
 	attachment.Name = "HullAttachment"
 	-- The attachment's primary axis (its X axis) points along the boat's up direction.
@@ -949,13 +965,12 @@ function Hull.new(primaryPart: BasePart, seatCount: number): Hull
 	local self = setmetatable(
 		{
 			PrimaryPart = primaryPart,
-			Handling = handling,
-			TurnSpeedDrag = GetTurnSpeedDrag(handling),
 			Upright = upright,
 			Buoyancy = buoyancy,
+			Mass = primaryPart.AssemblyMass,
+			SpinInertia = GetSpinInertia(primaryPart),
 			LastWaterHeight = primaryPart.Position.Y,
 			LastFlatVelocity = Vector3.zero,
-			PivotOffset = Vector3.zero,
 			LeanAcceleration = Vector3.zero,
 		} :: HullMembers,
 		Hull
@@ -981,18 +996,22 @@ function Hull.ClaimNetworkOwnership(self: Hull)
 end
 
 -- Moves the boat on by `deltaTime` seconds. `water` is what the water under it is doing,
--- or nil if there's no water under it. `thrust` (studs/s²) and `turn` (rad/s², positive
--- turns left) are its crew's farts, before its handling scales them, and `turnPivot` is
--- the point the farts are turning it around (nil when nobody is turning it).
-function Hull.Step(self: Hull, water: Water?, thrust: Vector3, turn: number, turnPivot: Vector3?, deltaTime: number)
+-- or nil if there's no water under it. `forces` are the pushes from its crew's farts.
+function Hull.Step(self: Hull, water: Water?, forces: { AppliedForce }, deltaTime: number)
 	if deltaTime <= 0 then
 		return
 	end
 	self:ClaimNetworkOwnership()
 	local primaryPart = self.PrimaryPart
-	local handling = self.Handling
 	local velocity = primaryPart.AssemblyLinearVelocity
 	local spin = primaryPart.AssemblyAngularVelocity
+
+	-- What it weighs changes when a rider leaves; its moment of inertia changes with it.
+	local mass = primaryPart.AssemblyMass
+	if mass ~= self.Mass then
+		self.Mass = mass
+		self.SpinInertia = GetSpinInertia(primaryPart)
+	end
 
 	-- How much the boat is in the water: 1 at or below the surface, fading to 0 at
 	-- AIRBORNE_HEIGHT above it. Everything the water does is scaled by this.
@@ -1013,37 +1032,35 @@ function Hull.Step(self: Hull, water: Water?, thrust: Vector3, turn: number, tur
 	end
 	local dragScale = WaterConfig.AIR_DRAG + (1 - WaterConfig.AIR_DRAG) * wetness
 
-	-- The boat's motion is worked out for the point it turns around (its pivot), and its
-	-- middle swings round that point as it turns.
-	local primaryCFrame = primaryPart.CFrame
-	local pivotOffset = GetFlatWorldOffset(primaryCFrame, self.PivotOffset)
-	local pivotVelocity = Vector3.new(velocity.X, 0, velocity.Z) + Vector3.new(0, spin.Y, 0):Cross(pivotOffset)
-
-	-- Across the water: the motion swings round as the boat turns (keel grip), farts and
-	-- rough water push it, and drag pulls its speed toward the water's. Drag is applied
-	-- implicitly (dividing instead of subtracting), so it can never overshoot and send
-	-- the boat backwards, however long the frame.
-	local push = Vector3.new(thrust.X, 0, thrust.Z) + shove
-	local carve = CFrame.fromAxisAngle(Vector3.yAxis, spin.Y * deltaTime * BoatConfig.KEEL_GRIP * wetness)
-	local relativeVelocity = carve:VectorToWorldSpace(pivotVelocity - flow)
-	local drag = dragScale * (WaterConfig.GLIDE_DRAG + SPEED_DRAG * relativeVelocity.Magnitude)
-	relativeVelocity = (relativeVelocity + push * handling.PushScale * deltaTime) / (1 + drag * deltaTime)
-
-	-- Turning, the same way.
-	local turnSpeed = spin.Y
-	local turnDrag = dragScale * (WaterConfig.TURN_GLIDE_DRAG + self.TurnSpeedDrag * math.abs(turnSpeed))
-	turnSpeed = (turnSpeed + (turn + twist) * handling.TurnScale * deltaTime) / (1 + turnDrag * deltaTime)
-
-	-- The pivot eases toward the riders turning the boat, or back to its middle once
-	-- nobody is, so the way it swings round never jumps.
-	local targetOffset = Vector3.zero
-	if turnPivot then
-		local offset = turnPivot - primaryPart.AssemblyCenterOfMass
-		targetOffset = primaryCFrame:VectorToObjectSpace(Vector3.new(offset.X, 0, offset.Z))
+	-- The farts, added up: their total force and their total torque about the center of
+	-- mass (only the flat parts matter; the boat is kept upright).
+	local centerOfMass = primaryPart.AssemblyCenterOfMass
+	local totalForce = Vector3.zero
+	local totalTorque = 0 -- about the vertical axis; positive spins it left (counter-clockwise from above)
+	for _, appliedForce in forces do
+		local force = Vector3.new(appliedForce.Force.X, 0, appliedForce.Force.Z)
+		local offset = appliedForce.Position - centerOfMass
+		totalForce += force
+		totalTorque += offset.Z * force.X - offset.X * force.Z
 	end
-	self.PivotOffset = self.PivotOffset:Lerp(targetOffset, GetBlend(BoatConfig.TURN_PIVOT_RESPONSE_TIME, deltaTime))
-	pivotOffset = GetFlatWorldOffset(primaryCFrame, self.PivotOffset)
-	local flatVelocity = relativeVelocity + flow - Vector3.new(0, turnSpeed, 0):Cross(pivotOffset)
+
+	-- Across the water: the farts and rough water speed it up, and drag pulls its speed
+	-- toward the water's. Drag is applied implicitly (dividing instead of subtracting), so
+	-- it can never overshoot and send the boat backwards, however long the frame.
+	local acceleration = totalForce / mass + shove
+	local relativeVelocity = Vector3.new(velocity.X, 0, velocity.Z) - flow
+	local drag = dragScale * (WaterConfig.GLIDE_DRAG + SPEED_DRAG * relativeVelocity.Magnitude)
+	relativeVelocity = (relativeVelocity + acceleration * deltaTime) / (1 + drag * deltaTime)
+	local flatVelocity = relativeVelocity + flow
+
+	-- Spinning: the torque turns it by torque / moment of inertia, and the water drags on
+	-- its rim, which moves at the spin speed times its radius of gyration.
+	local spinSpeed = spin.Y
+	local gyrationRadius = math.sqrt(self.SpinInertia / mass)
+	local rimSpeed = math.abs(spinSpeed) * gyrationRadius
+	local spinDrag = dragScale * WaterConfig.SPIN_DRAG_SCALE * (WaterConfig.GLIDE_DRAG + SPEED_DRAG * rimSpeed)
+	local spinAcceleration = totalTorque / self.SpinInertia + twist
+	spinSpeed = (spinSpeed + spinAcceleration * deltaTime) / (1 + spinDrag * deltaTime)
 
 	-- Up and down: Buoyancy holds the boat's weight while it's in the water, the water
 	-- pushes back up on a boat that's pushed under, and damping settles the bobbing
@@ -1057,14 +1074,14 @@ function Hull.Step(self: Hull, water: Water?, thrust: Vector3, turn: number, tur
 
 	primaryPart.AssemblyLinearVelocity = Vector3.new(flatVelocity.X, verticalSpeed, flatVelocity.Z)
 	local tiltDamping = math.exp(-WaterConfig.TILT_DAMPING * wetness * deltaTime)
-	primaryPart.AssemblyAngularVelocity = Vector3.new(spin.X * tiltDamping, turnSpeed, spin.Z * tiltDamping)
+	primaryPart.AssemblyAngularVelocity = Vector3.new(spin.X * tiltDamping, spinSpeed, spin.Z * tiltDamping)
 
 	-- Tilt: with the waves, and away from the way it's speeding up, slowing down or
 	-- turning (bumps included), smoothed so it eases into and out of each lean.
-	local acceleration = (flatVelocity - self.LastFlatVelocity) / deltaTime
+	local flatAcceleration = (flatVelocity - self.LastFlatVelocity) / deltaTime
 	self.LastFlatVelocity = flatVelocity
 	local leanBlend = 1 - math.exp(-BoatConfig.LEAN_SMOOTHING * deltaTime)
-	self.LeanAcceleration = self.LeanAcceleration:Lerp(acceleration, leanBlend)
+	self.LeanAcceleration = self.LeanAcceleration:Lerp(flatAcceleration, leanBlend)
 	self:SetUpDirection(surfaceUp - self.LeanAcceleration * BoatConfig.LEAN_PER_ACCELERATION)
 end
 
@@ -2378,8 +2395,8 @@ return DockServiceServer :: DockServiceServer
 -- refills while not. Other players are told when someone starts, switches or stops,
 -- so they can show it.
 --
--- This service doesn't move boats. WaterService asks GetThrust for how hard each
--- boat's crew is farting and moves the boat with everything else acting on it.
+-- This service doesn't move boats. WaterService asks GetFartForces for the pushes from
+-- each boat's crew and moves the boat with everything else acting on it.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -2387,6 +2404,7 @@ local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 local Boat = require(ServerScriptService.Classes.Boat)
+local Hull = require(ServerScriptService.Classes.Hull)
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
@@ -2394,13 +2412,13 @@ local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 
 local SERVICE_NAME = FartServiceShared.SERVICE_NAME
-local MIN_OUTPUT = 0.01 -- a fart that has eased below this (studs/s² or rad/s²) has finished
+local MIN_OUTPUT = 0.01 -- a fart that has eased below this (studs/s²) has finished
 
 -- What a rider's fart is doing right now, in their own terms (see FartPhysics.GetOutput).
 -- It eases toward what their fart is aimed to do.
 type Output = {
 	Forward: number,
-	Turn: number,
+	Left: number,
 }
 
 -- How far something easing with `responseTime` (see FartConfig) moves toward its
@@ -2533,57 +2551,48 @@ function FartServiceServer.StopStream(self: FartServiceServer, player: Player, n
 	end
 end
 
--- How hard `boat`'s crew is farting right now, all added up: the push in studs/s² and
--- the turn in rad/s² (positive turns left). This is the raw push from the farts; the
--- boat's size decides how much it moves (see the Hull class). Also where the boat
--- turns around: the middle of the riders who are turning it, each counted by how hard
--- they're turning (nil when nobody is).
-function FartServiceServer.GetThrust(self: FartServiceServer, boat: Boat.Boat): (Vector3, number, Vector3?)
-	local totalPush = Vector3.zero
-	local totalTurn = 0
+-- The pushes from `boat`'s crew's farts right now: each rider's fart as a force at
+-- their seat. Hull does the physics of what they do to the boat.
+function FartServiceServer.GetFartForces(self: FartServiceServer, boat: Boat.Boat): { Hull.AppliedForce }
+	local forces: { Hull.AppliedForce } = {}
 	if not boat:IsFloating() then
-		return totalPush, totalTurn, nil
+		return forces
 	end
 	local boatPosition = boat:GetPosition()
-	local pivotSum = Vector3.zero
-	local pivotWeight = 0
 	for _, player in boat.Crew do
 		local output = self.Outputs[player]
 		local seat = if output then boat:GetSeatOf(player) else nil
 		if output and seat then
-			totalPush += FartPhysics.GetPush(boatPosition, seat.CFrame, output.Forward)
-			totalTurn += output.Turn
-			local weight = math.abs(output.Turn)
-			pivotSum += seat.Position * weight
-			pivotWeight += weight
+			table.insert(forces, {
+				Position = seat.Position,
+				Force = FartPhysics.GetForce(boatPosition, seat.CFrame, output.Forward, output.Left),
+			})
 		end
 	end
-	local turnPivot = if pivotWeight > MIN_OUTPUT then pivotSum / pivotWeight else nil
-	return totalPush, totalTurn, turnPivot
+	return forces
 end
 
 -- Eases `player`'s fart output toward what a fart in `direction` (nil when they're not
--- farting) does at `rampTime`, by the given fractions of the way.
+-- farting) pushes at `rampTime`, by the fraction `blend` of the way.
 function FartServiceServer.UpdateOutput(
 	self: FartServiceServer,
 	player: Player,
 	direction: FartPhysics.Direction?,
 	rampTime: number,
-	pushBlend: number,
-	turnBlend: number
+	blend: number
 )
 	local output = self.Outputs[player]
 	if not output then
 		if not direction then
 			return
 		end
-		output = { Forward = 0, Turn = 0 }
+		output = { Forward = 0, Left = 0 }
 		self.Outputs[player] = output
 	end
-	local forward, turn = FartPhysics.GetOutput(direction, rampTime)
-	output.Forward += (forward - output.Forward) * pushBlend
-	output.Turn += (turn - output.Turn) * turnBlend
-	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Turn) < MIN_OUTPUT
+	local forward, left = FartPhysics.GetOutput(direction, rampTime)
+	output.Forward += (forward - output.Forward) * blend
+	output.Left += (left - output.Left) * blend
+	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Left) < MIN_OUTPUT
 	if not direction and hasFinished then
 		self.Outputs[player] = nil
 	end
@@ -2610,8 +2619,7 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 		self:SetGas(player, math.max(0, gas - FartConfig.GAS_DRAIN * deltaTime))
 	end
 
-	local pushBlend = GetBlend(FartConfig.PUSH_RESPONSE_TIME, deltaTime)
-	local turnBlend = GetBlend(FartConfig.TURN_RESPONSE_TIME, deltaTime)
+	local blend = GetBlend(FartConfig.PUSH_RESPONSE_TIME, deltaTime)
 	for player, gas in self.Gas do
 		local direction: FartPhysics.Direction? = self.Streams[player]
 		local isFarting = direction ~= nil
@@ -2621,7 +2629,7 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 		else
 			self.RampTimes[player] = nil
 		end
-		self:UpdateOutput(player, direction, rampTime, pushBlend, turnBlend)
+		self:UpdateOutput(player, direction, rampTime, blend)
 		if not isFarting and gas < FartConfig.GAS_MAX then
 			self:SetGas(player, math.min(FartConfig.GAS_MAX, gas + FartConfig.GAS_REGEN * deltaTime))
 		end
@@ -2641,7 +2649,7 @@ return FartServiceServer :: FartServiceServer
 --
 -- Moves every boat on the river. Each frame, for each boat, it works out what the
 -- water under the boat is doing (its surface with the waves, its current and how rough
--- it is), asks FartService how hard the crew is farting, and steps the boat's Hull
+-- it is), asks FartService for the pushes from the crew's farts, and steps the boat's Hull
 -- with both. Where there's no water under a boat, nothing holds it up and it falls. A
 -- boat that falls FALL_DISTANCE below the last water it was over has fallen off the
 -- river, and BoatService wipes it.
@@ -2789,8 +2797,7 @@ function WaterServiceServer.Update(self: WaterServiceServer, deltaTime: number)
 			BoatServiceServer:WipeBoat(boat)
 			continue
 		end
-		local thrust, turn, turnPivot = FartServiceServer:GetThrust(boat)
-		hull:Step(water, thrust, turn, turnPivot, stepTime)
+		hull:Step(water, FartServiceServer:GetFartForces(boat), stepTime)
 	end
 end
 
@@ -2876,12 +2883,6 @@ return Remotes
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.BoatConfig
 
-export type Handling = {
-	PushScale: number,
-	TurnScale: number,
-	TopTurnSpeed: number,
-}
-
 local BoatConfig = {
 	MIN_SEATS = 1,
 	MAX_SEATS = 6,
@@ -2897,22 +2898,6 @@ local BoatConfig = {
 		[6] = "Boat6",
 	} :: { [number]: string },
 
-	-- How each boat size handles (ServerScriptService.Classes.Hull). Small boats are nimble,
-	-- so one rider can steer them alone. Big boats are heavy: one rider turns them slowly,
-	-- and the crew has to fart together to turn them quickly (every rider's turn adds up).
-	--   PushScale      multiplies how hard farts (and rough water) push the boat along
-	--   TurnScale      multiplies how hard farts (and rough water) turn it
-	--   TopTurnSpeed   how fast it turns (rad/s) with ONE rider turning at full strength.
-	--                  More riders turning together go past it.
-	HANDLING = {
-		[1] = { PushScale = 1.1, TurnScale = 1.5, TopTurnSpeed = math.rad(150) },
-		[2] = { PushScale = 1.05, TurnScale = 1, TopTurnSpeed = math.rad(115) },
-		[3] = { PushScale = 1, TurnScale = 0.75, TopTurnSpeed = math.rad(90) },
-		[4] = { PushScale = 0.95, TurnScale = 0.6, TopTurnSpeed = math.rad(75) },
-		[5] = { PushScale = 0.9, TurnScale = 0.5, TopTurnSpeed = math.rad(63) },
-		[6] = { PushScale = 0.85, TurnScale = 0.4, TopTurnSpeed = math.rad(52) },
-	} :: { [number]: Handling },
-
 	-- Joining
 	JOIN_TIME = 30, -- seconds players have to get in after the party leader spawns a boat
 	LAUNCH_DELAY = 3, -- countdown (seconds) once every seat is taken or the leader starts the run early
@@ -2920,14 +2905,6 @@ local BoatConfig = {
 	REQUEST_COOLDOWN = 1, -- seconds a player has to wait between join or start requests
 	CLEANUP_INTERVAL = 1, -- seconds between checks for removed boats to forget
 	WIPE_DELAY = 1.5, -- seconds a boat that fell off the river hangs frozen before its crew respawns
-
-	-- Turning. A boat turns around whoever is turning it (the middle of the riders farting
-	-- Left/Right), so a lone rider's boat swings round them like a steered boat instead of
-	-- flinging them round its middle. When nobody turns it any more, it goes back to
-	-- turning around its own middle.
-	TURN_PIVOT_RESPONSE_TIME = 0.4, -- seconds for where it turns around to move most of the way (63%)
-	KEEL_GRIP = 0.8, -- how much a boat's motion swings round with it as it turns: 1 carves
-	-- like it's on rails, 0 slides on the old way like it's on ice
 
 	-- Tilting. A boat on the river rocks with the waves and leans away from the way it's
 	-- speeding up or turning (its far side lifts when it surges forward, and it heels over
@@ -3067,31 +3044,22 @@ return DockConfig
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.FartConfig
 
 local FartConfig = {
-	-- Strength. Holding a fart key pushes the boat with a set acceleration that builds up
-	-- the longer you keep farting, up to a maximum. Switching direction keeps it built up,
-	-- and after you let go it fades instead of resetting, so a quick re-press picks up
-	-- close to where you left off. How much a push moves a boat depends on the boat's size
-	-- (BoatConfig.HANDLING); water drag decides how fast it ends up going (WaterConfig).
+	-- A fart is a push on the boat, applied where the rider sits: Straight pushes it the way
+	-- the rider faces, Left to their left and Right to their right. The boat moves the way
+	-- real physics says (the Hull class): a push through its middle just moves it, and a
+	-- push off to one side also spins it.
 
-	-- Pushing, in studs/s²: how much speed a fart adds every second
-	STRAIGHT_ACCELERATION = 18, -- when a fart starts
-	STRAIGHT_ACCELERATION_GAIN = 12, -- added for every second you keep farting
-	MAX_STRAIGHT_ACCELERATION = 45, -- reached after 2.25 seconds of farting
-
-	-- Turning, in rad/s² (1 rad is about 57 degrees). A Left/Right fart turns the boat
-	-- around the rider (see the Hull class), so it swings round them like a steered boat.
-	TURN_ACCELERATION = 1.6, -- when a Left/Right fart starts
-	TURN_ACCELERATION_GAIN = 1.2, -- added for every second you keep farting
-	MAX_TURN_ACCELERATION = 4, -- reached after 2 seconds of farting
-
+	-- Strength. Holding a fart key pushes with a strength that builds up the longer you
+	-- keep farting, up to a maximum. Switching direction keeps it built up, and after you
+	-- let go it fades instead of resetting, so a quick re-press picks up close to where you
+	-- left off. Strengths are in studs/s²: how much speed a fart adds every second to a
+	-- boat weighing REFERENCE_MASS. Heavier boats speed up slower, lighter ones faster.
+	PUSH_ACCELERATION = 18, -- when a fart starts
+	PUSH_ACCELERATION_GAIN = 12, -- added for every second you keep farting
+	MAX_PUSH_ACCELERATION = 45, -- reached after 2.25 seconds of farting
+	REFERENCE_MASS = 89, -- the test kit's one-seat boat with its rider aboard
 	RAMP_DECAY = 3, -- after you let go, built-up strength fades this many times faster than it built up
-
-	-- Smoothness. A fart doesn't snap on, off or around: what it does eases toward where
-	-- it's aimed, getting most of the way there (63%) in this many seconds. So starting
-	-- swells in, letting go trails off, and switching from Straight to Left fades the
-	-- push out as the turn builds in.
-	PUSH_RESPONSE_TIME = 0.2,
-	TURN_RESPONSE_TIME = 0.35, -- a little slower, so turns ease in instead of jerking the boat around
+	PUSH_RESPONSE_TIME = 0.2, -- a fart eases in, out and round to a new direction, most of the way in this many seconds
 
 	-- Gas meter (each player's is in their "Gas" attribute)
 	GAS_MAX = 100,
@@ -3103,7 +3071,7 @@ local FartConfig = {
 
 	-- Effects. They grow with the fart's strength, from when it starts to full acceleration.
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
-	GAS_ANGLE = math.rad(45), -- how far left or right of straight back the gas comes out on a Left/Right fart
+	GAS_ANGLE = math.rad(90), -- how far round from straight back the gas comes out on a Left/Right fart
 	MIN_PARTICLE_RATE = 20, -- particles per second when a fart starts...
 	MAX_PARTICLE_RATE = 60, -- ...and at full acceleration
 	MAX_PARTICLE_SPEED_MULTIPLIER = 2.5, -- the cloud's Speed is multiplied by up to this at full acceleration
@@ -3151,9 +3119,10 @@ local WaterConfig = {
 	-- drag that grows with speed, so a boat levels off smoothly at its top speed instead
 	-- of hitting a limit.
 	GLIDE_DRAG = 0.5, -- per second
-	TOP_SPEED = 30, -- studs/s that one rider farting Straight at full strength levels off at
-	TURN_GLIDE_DRAG = 1.2, -- per second: how fast a boat stops turning once nobody turns it
-	-- (a boat's top turn speed is its TopTurnSpeed in BoatConfig.HANDLING)
+	TOP_SPEED = 30, -- studs/s one rider pushing at full strength levels a boat of FartConfig.REFERENCE_MASS off at
+	-- Spinning is slowed by the same water drag acting round the boat's rim, times this
+	-- (the hull and the riders' legs churn the water as it spins). Higher = less spin.
+	SPIN_DRAG_SCALE = 8,
 	AIR_DRAG = 0.15, -- out of the water, drag is this fraction of the water's
 
 	-- Floating. The water holds a boat up at the surface like a soft spring, so it bobs on
@@ -3722,15 +3691,16 @@ return DockServiceShared
 -- is its "ramp time": it rises while the player farts, in any direction, and falls
 -- RAMP_DECAY times as fast once they stop.
 --
--- Direction: riders face the middle of the boat. "Straight" pushes the boat away from
--- the rider. "Left" turns the boat left, the same way from every seat; the boat turns
--- around whoever is turning it (see the Hull class). So with seats spread around the
--- ring, everyone farting Straight cancels out, and everyone farting Left spins the boat
--- on the spot.
+-- Direction: a fart is a push on the boat at the rider's seat, like a jet. Riders face
+-- the middle of the boat. "Straight" pushes the boat the way the rider faces, "Left" to
+-- their left and "Right" to their right. Where it pushes matters (the Hull class does
+-- the physics): Straight pushes through the middle of the boat, so it only moves it;
+-- Left and Right push across the edge, so they move it and spin it too. Everyone on a
+-- ring farting Straight cancels out, and everyone farting Left spins it on the spot.
 --
--- What a fart does is worked out in the rider's own terms (GetOutput): forward push and
--- turn. FartService eases each rider's output toward that, then GetPush turns the
--- forward push into a push on the boat.
+-- What a fart does is worked out in the rider's own terms (GetOutput): forward and
+-- leftward push. FartService eases each rider's output toward that, then GetForce turns
+-- it into a force on the boat.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -3739,24 +3709,14 @@ local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 
 export type Direction = "Left" | "Straight" | "Right"
 
--- Seconds of farting it takes to build up to full strength, pushing and turning both.
-local function GetRampDuration(startAcceleration: number, gain: number, maxAcceleration: number): number
-	return if gain > 0 then math.max(0, (maxAcceleration - startAcceleration) / gain) else 0
-end
-
 local FartPhysics = {
-	MAX_RAMP_TIME = math.max(
-		GetRampDuration(
-			FartConfig.STRAIGHT_ACCELERATION,
-			FartConfig.STRAIGHT_ACCELERATION_GAIN,
-			FartConfig.MAX_STRAIGHT_ACCELERATION
-		),
-		GetRampDuration(
-			FartConfig.TURN_ACCELERATION,
-			FartConfig.TURN_ACCELERATION_GAIN,
-			FartConfig.MAX_TURN_ACCELERATION
+	-- Seconds of farting it takes to build up to full strength
+	MAX_RAMP_TIME = if FartConfig.PUSH_ACCELERATION_GAIN > 0
+		then math.max(
+			0,
+			(FartConfig.MAX_PUSH_ACCELERATION - FartConfig.PUSH_ACCELERATION) / FartConfig.PUSH_ACCELERATION_GAIN
 		)
-	),
+		else 0,
 }
 
 function FartPhysics.IsDirection(value: unknown): boolean
@@ -3771,19 +3731,11 @@ function FartPhysics.UpdateRampTime(rampTime: number, isFarting: boolean, deltaT
 	return math.max(0, rampTime - deltaTime * FartConfig.RAMP_DECAY)
 end
 
--- Studs/s² of push after `rampTime` seconds of build-up.
-function FartPhysics.GetStraightAcceleration(rampTime: number): number
+-- Studs/s² of push (on a boat of FartConfig.REFERENCE_MASS) after `rampTime` seconds of build-up.
+function FartPhysics.GetPushAcceleration(rampTime: number): number
 	return math.min(
-		FartConfig.MAX_STRAIGHT_ACCELERATION,
-		FartConfig.STRAIGHT_ACCELERATION + FartConfig.STRAIGHT_ACCELERATION_GAIN * rampTime
-	)
-end
-
--- Rad/s² of turn after `rampTime` seconds of build-up.
-function FartPhysics.GetTurnAcceleration(rampTime: number): number
-	return math.min(
-		FartConfig.MAX_TURN_ACCELERATION,
-		FartConfig.TURN_ACCELERATION + FartConfig.TURN_ACCELERATION_GAIN * rampTime
+		FartConfig.MAX_PUSH_ACCELERATION,
+		FartConfig.PUSH_ACCELERATION + FartConfig.PUSH_ACCELERATION_GAIN * rampTime
 	)
 end
 
@@ -3796,28 +3748,30 @@ function FartPhysics.GetRampProgress(rampTime: number): number
 	return math.clamp(rampTime / FartPhysics.MAX_RAMP_TIME, 0, 1)
 end
 
--- What a fart in `direction` (nil when not farting) does after `rampTime` seconds of
--- build-up, in the rider's own terms:
---   forward   studs/s² pushing the boat away from the rider
---   turn      rad/s² turning the boat; positive is a LEFT turn (counter-clockwise seen
---             from above)
--- This is the raw fart; the boat's size scales what it does (BoatConfig.HANDLING).
+-- What a fart in `direction` (nil when not farting) pushes after `rampTime` seconds of
+-- build-up, in the rider's own terms (studs/s² on a boat of FartConfig.REFERENCE_MASS):
+--   forward   the way the rider faces
+--   left      to the rider's left (negative is to their right)
 function FartPhysics.GetOutput(direction: Direction?, rampTime: number): (number, number)
-	if direction == "Straight" then
-		-- Gas goes out behind the rider, so the boat moves away from them.
-		return FartPhysics.GetStraightAcceleration(rampTime), 0
-	elseif direction == "Left" then
-		return 0, FartPhysics.GetTurnAcceleration(rampTime)
-	elseif direction == "Right" then
-		return 0, -FartPhysics.GetTurnAcceleration(rampTime)
+	if not direction then
+		return 0, 0
 	end
-	return 0, 0
+	-- The gas goes out the opposite way, behind or beside the rider.
+	local pushAcceleration = FartPhysics.GetPushAcceleration(rampTime)
+	if direction == "Straight" then
+		return pushAcceleration, 0
+	elseif direction == "Left" then
+		return 0, pushAcceleration
+	end
+	return 0, -pushAcceleration
 end
 
--- A rider's `forward` push (see GetOutput) from `seatCFrame`, as a push on the boat in
--- world space (studs/s²).
-function FartPhysics.GetPush(boatPosition: Vector3, seatCFrame: CFrame, forward: number): Vector3
-	return BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame) * forward
+-- A rider's `forward` and `left` push (see GetOutput) from `seatCFrame`, as a force on
+-- the boat in world space (Roblox force units).
+function FartPhysics.GetForce(boatPosition: Vector3, seatCFrame: CFrame, forward: number, left: number): Vector3
+	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame)
+	local leftward = Vector3.yAxis:Cross(facing) -- the rider's left hand
+	return (facing * forward + leftward * left) * FartConfig.REFERENCE_MASS
 end
 
 return FartPhysics
@@ -3914,12 +3868,14 @@ local function IsRiding(): boolean
 	return boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
 end
 
--- Gas comes out behind the rider, angled to the side on a Left or Right fart.
+-- Which way the gas comes out, turned from straight behind the rider: the opposite way
+-- to the push. A Left fart pushes the boat left, so its gas goes out to the right (a
+-- positive turn of the butt attachment points its back toward the rider's right).
 local function GetGasAngle(direction: string): number
 	if direction == "Left" then
-		return -FartConfig.GAS_ANGLE
-	elseif direction == "Right" then
 		return FartConfig.GAS_ANGLE
+	elseif direction == "Right" then
+		return -FartConfig.GAS_ANGLE
 	end
 	return 0
 end

@@ -10,8 +10,8 @@
 -- refills while not. Other players are told when someone starts, switches or stops,
 -- so they can show it.
 --
--- This service doesn't move boats. WaterService asks GetThrust for how hard each
--- boat's crew is farting and moves the boat with everything else acting on it.
+-- This service doesn't move boats. WaterService asks GetFartForces for the pushes from
+-- each boat's crew and moves the boat with everything else acting on it.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -19,6 +19,7 @@ local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
 local Boat = require(ServerScriptService.Classes.Boat)
+local Hull = require(ServerScriptService.Classes.Hull)
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
@@ -26,13 +27,13 @@ local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 
 local SERVICE_NAME = FartServiceShared.SERVICE_NAME
-local MIN_OUTPUT = 0.01 -- a fart that has eased below this (studs/s² or rad/s²) has finished
+local MIN_OUTPUT = 0.01 -- a fart that has eased below this (studs/s²) has finished
 
 -- What a rider's fart is doing right now, in their own terms (see FartPhysics.GetOutput).
 -- It eases toward what their fart is aimed to do.
 type Output = {
 	Forward: number,
-	Turn: number,
+	Left: number,
 }
 
 -- How far something easing with `responseTime` (see FartConfig) moves toward its
@@ -165,57 +166,48 @@ function FartServiceServer.StopStream(self: FartServiceServer, player: Player, n
 	end
 end
 
--- How hard `boat`'s crew is farting right now, all added up: the push in studs/s² and
--- the turn in rad/s² (positive turns left). This is the raw push from the farts; the
--- boat's size decides how much it moves (see the Hull class). Also where the boat
--- turns around: the middle of the riders who are turning it, each counted by how hard
--- they're turning (nil when nobody is).
-function FartServiceServer.GetThrust(self: FartServiceServer, boat: Boat.Boat): (Vector3, number, Vector3?)
-	local totalPush = Vector3.zero
-	local totalTurn = 0
+-- The pushes from `boat`'s crew's farts right now: each rider's fart as a force at
+-- their seat. Hull does the physics of what they do to the boat.
+function FartServiceServer.GetFartForces(self: FartServiceServer, boat: Boat.Boat): { Hull.AppliedForce }
+	local forces: { Hull.AppliedForce } = {}
 	if not boat:IsFloating() then
-		return totalPush, totalTurn, nil
+		return forces
 	end
 	local boatPosition = boat:GetPosition()
-	local pivotSum = Vector3.zero
-	local pivotWeight = 0
 	for _, player in boat.Crew do
 		local output = self.Outputs[player]
 		local seat = if output then boat:GetSeatOf(player) else nil
 		if output and seat then
-			totalPush += FartPhysics.GetPush(boatPosition, seat.CFrame, output.Forward)
-			totalTurn += output.Turn
-			local weight = math.abs(output.Turn)
-			pivotSum += seat.Position * weight
-			pivotWeight += weight
+			table.insert(forces, {
+				Position = seat.Position,
+				Force = FartPhysics.GetForce(boatPosition, seat.CFrame, output.Forward, output.Left),
+			})
 		end
 	end
-	local turnPivot = if pivotWeight > MIN_OUTPUT then pivotSum / pivotWeight else nil
-	return totalPush, totalTurn, turnPivot
+	return forces
 end
 
 -- Eases `player`'s fart output toward what a fart in `direction` (nil when they're not
--- farting) does at `rampTime`, by the given fractions of the way.
+-- farting) pushes at `rampTime`, by the fraction `blend` of the way.
 function FartServiceServer.UpdateOutput(
 	self: FartServiceServer,
 	player: Player,
 	direction: FartPhysics.Direction?,
 	rampTime: number,
-	pushBlend: number,
-	turnBlend: number
+	blend: number
 )
 	local output = self.Outputs[player]
 	if not output then
 		if not direction then
 			return
 		end
-		output = { Forward = 0, Turn = 0 }
+		output = { Forward = 0, Left = 0 }
 		self.Outputs[player] = output
 	end
-	local forward, turn = FartPhysics.GetOutput(direction, rampTime)
-	output.Forward += (forward - output.Forward) * pushBlend
-	output.Turn += (turn - output.Turn) * turnBlend
-	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Turn) < MIN_OUTPUT
+	local forward, left = FartPhysics.GetOutput(direction, rampTime)
+	output.Forward += (forward - output.Forward) * blend
+	output.Left += (left - output.Left) * blend
+	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Left) < MIN_OUTPUT
 	if not direction and hasFinished then
 		self.Outputs[player] = nil
 	end
@@ -242,8 +234,7 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 		self:SetGas(player, math.max(0, gas - FartConfig.GAS_DRAIN * deltaTime))
 	end
 
-	local pushBlend = GetBlend(FartConfig.PUSH_RESPONSE_TIME, deltaTime)
-	local turnBlend = GetBlend(FartConfig.TURN_RESPONSE_TIME, deltaTime)
+	local blend = GetBlend(FartConfig.PUSH_RESPONSE_TIME, deltaTime)
 	for player, gas in self.Gas do
 		local direction: FartPhysics.Direction? = self.Streams[player]
 		local isFarting = direction ~= nil
@@ -253,7 +244,7 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 		else
 			self.RampTimes[player] = nil
 		end
-		self:UpdateOutput(player, direction, rampTime, pushBlend, turnBlend)
+		self:UpdateOutput(player, direction, rampTime, blend)
 		if not isFarting and gas < FartConfig.GAS_MAX then
 			self:SetGas(player, math.min(FartConfig.GAS_MAX, gas + FartConfig.GAS_REGEN * deltaTime))
 		end

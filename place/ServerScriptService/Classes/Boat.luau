@@ -9,9 +9,8 @@
 --   - LAUNCH_DELAY after the leader starts the run early
 -- If nobody is aboard when it's time to leave, it's removed instead.
 -- On the river it moves under physics that the server runs: its Hull (the Hull class)
--- is stepped by WaterService every frame. While it's out there its riders don't bump
--- into anything and weigh nothing, so only the hull touches the world and every boat of
--- a size handles the same however its crew is spread around it.
+-- is stepped by WaterService every frame. Riders weigh what they weigh, but while it's
+-- out there they don't bump into anything, so only the hull touches the world.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
 --   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
@@ -40,12 +39,6 @@ local Signal = require(ReplicatedStorage.Packages.Signal)
 local Boat = {}
 Boat.__index = Boat
 
--- What a rider's body part was like before they launched, to put back when they leave.
-type RiderPartSettings = {
-	CollisionGroup: string,
-	Massless: boolean,
-}
-
 type BoatMembers = {
 	Model: Model,
 	Leader: Player, -- the party leader: who spawned it, or who took over after they left
@@ -54,7 +47,7 @@ type BoatMembers = {
 	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	Hull: Hull.Hull?, -- how it moves on the river; made when it launches
-	RiderParts: { [Player]: { [BasePart]: RiderPartSettings } }, -- each rider's body parts, changed for the ride
+	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
 	JoinDeadline: number, -- server time the join timer runs out
@@ -379,23 +372,21 @@ function Boat.Launch(self: Boat)
 	end
 	local primaryPart = self.Model.PrimaryPart
 	if primaryPart then
-		self.Hull = Hull.new(primaryPart, #self.Seats)
+		self.Hull = Hull.new(primaryPart)
 	end
 end
 
--- For the ride, `player`'s body doesn't bump into anything (only the hull does) and
--- weighs nothing, so the boat turns around its own middle wherever they sit.
+-- For the ride, `player`'s body doesn't bump into anything; only the hull does.
 function Boat.PrepareRider(self: Boat, player: Player)
 	local character = player.Character
 	if not character or self.RiderParts[player] then
 		return
 	end
-	local riderParts: { [BasePart]: RiderPartSettings } = {}
+	local riderParts: { [BasePart]: string } = {}
 	for _, descendant in character:GetDescendants() do
 		if descendant:IsA("BasePart") then
-			riderParts[descendant] = { CollisionGroup = descendant.CollisionGroup, Massless = descendant.Massless }
+			riderParts[descendant] = descendant.CollisionGroup
 			descendant.CollisionGroup = BoatServiceShared.RIDER_COLLISION_GROUP
-			descendant.Massless = true
 		end
 	end
 	self.RiderParts[player] = riderParts
@@ -408,10 +399,9 @@ function Boat.ReleaseRider(self: Boat, player: Player)
 		return
 	end
 	self.RiderParts[player] = nil
-	for part, settings in riderParts do
+	for part, collisionGroup in riderParts do
 		if part.Parent then
-			part.CollisionGroup = settings.CollisionGroup
-			part.Massless = settings.Massless
+			part.CollisionGroup = collisionGroup
 		end
 	end
 end

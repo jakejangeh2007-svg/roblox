@@ -1,12 +1,6 @@
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.BoatConfig
 
-export type Handling = {
-	PushScale: number,
-	TurnScale: number,
-	TopTurnSpeed: number,
-}
-
 local BoatConfig = {
 	MIN_SEATS = 1,
 	MAX_SEATS = 6,
@@ -22,22 +16,6 @@ local BoatConfig = {
 		[6] = "Boat6",
 	} :: { [number]: string },
 
-	-- How each boat size handles (ServerScriptService.Classes.Hull). Small boats are nimble,
-	-- so one rider can steer them alone. Big boats are heavy: one rider turns them slowly,
-	-- and the crew has to fart together to turn them quickly (every rider's turn adds up).
-	--   PushScale      multiplies how hard farts (and rough water) push the boat along
-	--   TurnScale      multiplies how hard farts (and rough water) turn it
-	--   TopTurnSpeed   how fast it turns (rad/s) with ONE rider turning at full strength.
-	--                  More riders turning together go past it.
-	HANDLING = {
-		[1] = { PushScale = 1.1, TurnScale = 1.5, TopTurnSpeed = math.rad(150) },
-		[2] = { PushScale = 1.05, TurnScale = 1, TopTurnSpeed = math.rad(115) },
-		[3] = { PushScale = 1, TurnScale = 0.75, TopTurnSpeed = math.rad(90) },
-		[4] = { PushScale = 0.95, TurnScale = 0.6, TopTurnSpeed = math.rad(75) },
-		[5] = { PushScale = 0.9, TurnScale = 0.5, TopTurnSpeed = math.rad(63) },
-		[6] = { PushScale = 0.85, TurnScale = 0.4, TopTurnSpeed = math.rad(52) },
-	} :: { [number]: Handling },
-
 	-- Joining
 	JOIN_TIME = 30, -- seconds players have to get in after the party leader spawns a boat
 	LAUNCH_DELAY = 3, -- countdown (seconds) once every seat is taken or the leader starts the run early
@@ -45,14 +23,6 @@ local BoatConfig = {
 	REQUEST_COOLDOWN = 1, -- seconds a player has to wait between join or start requests
 	CLEANUP_INTERVAL = 1, -- seconds between checks for removed boats to forget
 	WIPE_DELAY = 1.5, -- seconds a boat that fell off the river hangs frozen before its crew respawns
-
-	-- Turning. A boat turns around whoever is turning it (the middle of the riders farting
-	-- Left/Right), so a lone rider's boat swings round them like a steered boat instead of
-	-- flinging them round its middle. When nobody turns it any more, it goes back to
-	-- turning around its own middle.
-	TURN_PIVOT_RESPONSE_TIME = 0.4, -- seconds for where it turns around to move most of the way (63%)
-	KEEL_GRIP = 0.8, -- how much a boat's motion swings round with it as it turns: 1 carves
-	-- like it's on rails, 0 slides on the old way like it's on ice
 
 	-- Tilting. A boat on the river rocks with the waves and leans away from the way it's
 	-- speeding up or turning (its far side lifts when it surges forward, and it heels over

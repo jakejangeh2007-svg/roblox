@@ -1,17 +1,18 @@
 --!strict
 -- ModuleScript: ServerScriptService.Classes.Hull
 --
--- How a boat on the river moves. This is the one place a floating boat's velocity is
--- worked out, all in one go every frame, so nothing fights over it. A Boat makes its
--- Hull when it launches, and WaterService steps it every frame with what the water
--- under it is doing and how hard its crew is farting (FartService):
---   - Farts push and turn it, scaled by its size's handling (BoatConfig.HANDLING).
---   - It turns around whoever is turning it, and its motion swings round with it as it
---     turns (BoatConfig.KEEL_GRIP), so it carves through a turn like a steered boat
---     instead of flinging its riders round its middle or sliding on the old way.
+-- How a boat on the river moves: as a real rigid body. This is the one place a floating
+-- boat's velocity is worked out, all in one go every frame, so nothing fights over it.
+-- A Boat makes its Hull when it launches, and WaterService steps it every frame with
+-- what the water under it is doing and the pushes from its crew's farts (FartService).
+--   - Each fart is a force applied where its rider sits. The forces speed the boat up by
+--     force / mass, and spin it by torque / moment of inertia, both worked out from the
+--     boat's real parts and riders. A push through the middle only moves the boat; a push
+--     off to one side also spins it. Big, heavy boats are slower to move and to spin.
 --   - Water drags it toward the water's own speed: gently when it's slow, so it glides
 --     on when the crew stops, and harder when it's fast, so it levels off smoothly at
---     its top speed. Currents carry it along, and rough water shoves and twists it.
+--     its top speed. The same water drag, acting round the rim, slows its spinning.
+--     Currents carry it along, and rough water shoves and twists it.
 --   - The water holds it up like a soft spring, so it bobs on the waves and settles
 --     after a drop instead of bouncing back out. Above the surface that hold fades out;
 --     in the air only gravity, a little air drag and the farts act on it.
@@ -33,11 +34,17 @@ export type Water = {
 	TurnTurbulence: number, -- twist from rough water, in rad/s² (positive turns left)
 }
 
--- The part of water drag that grows with speed, sized so one rider farting Straight at
--- full strength (on a boat with PushScale 1) levels off at TOP_SPEED.
+-- A force on the boat (in Roblox force units) and the point in the world it acts at.
+export type AppliedForce = {
+	Position: Vector3,
+	Force: Vector3,
+}
+
+-- The part of water drag that grows with speed, sized so one rider pushing at full
+-- strength levels a boat of FartConfig.REFERENCE_MASS off at TOP_SPEED.
 local SPEED_DRAG = math.max(
 	0,
-	(FartConfig.MAX_STRAIGHT_ACCELERATION - WaterConfig.GLIDE_DRAG * WaterConfig.TOP_SPEED) / WaterConfig.TOP_SPEED ^ 2
+	(FartConfig.MAX_PUSH_ACCELERATION - WaterConfig.GLIDE_DRAG * WaterConfig.TOP_SPEED) / WaterConfig.TOP_SPEED ^ 2
 )
 -- Changes to the tilt the boat aims for smaller than this aren't worth sending to the
 -- Upright constraint (every change is sent to every player).
@@ -48,39 +55,60 @@ Hull.__index = Hull
 
 type HullMembers = {
 	PrimaryPart: BasePart,
-	Handling: BoatConfig.Handling,
-	TurnSpeedDrag: number, -- like SPEED_DRAG but for turning, sized from Handling.TopTurnSpeed
 	Upright: AlignOrientation, -- tilts the boat toward the up direction it should have
 	Buoyancy: VectorForce, -- holds up the boat's weight while it's in the water
+	Mass: number, -- what the boat and its riders weigh, when SpinInertia was worked out
+	SpinInertia: number, -- moment of inertia for spinning flat on the water, about its center of mass
 	LastWaterHeight: number, -- the surface height it was last over (its launch height at first)
 	LastFlatVelocity: Vector3, -- its velocity across the water after the last step
-	PivotOffset: Vector3, -- where it turns around, from its center of mass, in its own space
 	LeanAcceleration: Vector3, -- its recent acceleration across the water, smoothed, for leaning
 }
 
 export type Hull = typeof(setmetatable({} :: HullMembers, Hull))
 
--- The turning drag that grows with turn speed, sized so one rider turning at full
--- strength levels off at the boat's TopTurnSpeed.
-local function GetTurnSpeedDrag(handling: BoatConfig.Handling): number
-	local topTurnSpeed = handling.TopTurnSpeed
-	if topTurnSpeed <= 0 then
-		return 0
+-- `part`'s moment of inertia for spinning about a vertical line through its own middle.
+-- Balls and cylinders use their own shapes; anything else counts as a box.
+local function GetPartSpinInertia(part: BasePart): number
+	local mass = part:GetMass()
+	local size = part.Size
+	if part:IsA("Part") and part.Shape == Enum.PartType.Ball then
+		return 0.4 * mass * (math.min(size.X, size.Y, size.Z) / 2) ^ 2
 	end
-	local maxTurnAcceleration = FartConfig.MAX_TURN_ACCELERATION * handling.TurnScale
-	return math.max(0, (maxTurnAcceleration - WaterConfig.TURN_GLIDE_DRAG * topTurnSpeed) / topTurnSpeed ^ 2)
+
+	-- About the part's own X, Y and Z axes
+	local inertiaX, inertiaY, inertiaZ
+	if part:IsA("Part") and part.Shape == Enum.PartType.Cylinder then
+		-- A cylinder's length runs along its X axis.
+		local radius = math.min(size.Y, size.Z) / 2
+		inertiaX = 0.5 * mass * radius ^ 2
+		inertiaY = mass * (3 * radius ^ 2 + size.X ^ 2) / 12
+		inertiaZ = inertiaY
+	else
+		inertiaX = mass * (size.Y ^ 2 + size.Z ^ 2) / 12
+		inertiaY = mass * (size.X ^ 2 + size.Z ^ 2) / 12
+		inertiaZ = mass * (size.X ^ 2 + size.Y ^ 2) / 12
+	end
+	-- Straight up, in the part's own axes
+	local up = part.CFrame:VectorToObjectSpace(Vector3.yAxis)
+	return inertiaX * up.X ^ 2 + inertiaY * up.Y ^ 2 + inertiaZ * up.Z ^ 2
 end
 
--- How far something easing with `responseTime` moves toward its target in `deltaTime`
--- seconds, from 0 (not at all) to 1 (all the way).
-local function GetBlend(responseTime: number, deltaTime: number): number
-	return if responseTime > 0 then 1 - math.exp(-deltaTime / responseTime) else 1
-end
-
--- `localOffset` (in the space of `primaryCFrame`) as a flat offset in world space.
-local function GetFlatWorldOffset(primaryCFrame: CFrame, localOffset: Vector3): Vector3
-	local offset = primaryCFrame:VectorToWorldSpace(localOffset)
-	return Vector3.new(offset.X, 0, offset.Z)
+-- The moment of inertia for spinning flat on the water of everything joined to
+-- `primaryPart` (the boat and its seated riders), about their shared center of mass.
+local function GetSpinInertia(primaryPart: BasePart): number
+	local centerOfMass = primaryPart.AssemblyCenterOfMass
+	local parts: { [BasePart]: boolean } = { [primaryPart] = true }
+	for _, part in primaryPart:GetConnectedParts(true) do
+		parts[part] = true
+	end
+	local inertia = 0
+	for part in parts do
+		if not part.Massless then
+			local offset = part.Position - centerOfMass
+			inertia += GetPartSpinInertia(part) + part:GetMass() * (offset.X ^ 2 + offset.Z ^ 2)
+		end
+	end
+	return math.max(inertia, 1e-3)
 end
 
 -- `up` (made unit length), tilted back toward straight up if it's more than `maxTilt`
@@ -98,10 +126,8 @@ local function LimitTilt(up: Vector3, maxTilt: number): Vector3
 end
 
 -- Hands the boat whose PrimaryPart is `primaryPart` over to physics: unanchors it,
--- makes the server run it and starts keeping it upright. `seatCount` picks its handling.
-function Hull.new(primaryPart: BasePart, seatCount: number): Hull
-	local handling = BoatConfig.HANDLING[seatCount] or BoatConfig.HANDLING[BoatConfig.MAX_SEATS]
-
+-- makes the server run it and starts keeping it upright. Its riders must be seated.
+function Hull.new(primaryPart: BasePart): Hull
 	local attachment = Instance.new("Attachment")
 	attachment.Name = "HullAttachment"
 	-- The attachment's primary axis (its X axis) points along the boat's up direction.
@@ -129,13 +155,12 @@ function Hull.new(primaryPart: BasePart, seatCount: number): Hull
 	local self = setmetatable(
 		{
 			PrimaryPart = primaryPart,
-			Handling = handling,
-			TurnSpeedDrag = GetTurnSpeedDrag(handling),
 			Upright = upright,
 			Buoyancy = buoyancy,
+			Mass = primaryPart.AssemblyMass,
+			SpinInertia = GetSpinInertia(primaryPart),
 			LastWaterHeight = primaryPart.Position.Y,
 			LastFlatVelocity = Vector3.zero,
-			PivotOffset = Vector3.zero,
 			LeanAcceleration = Vector3.zero,
 		} :: HullMembers,
 		Hull
@@ -161,18 +186,22 @@ function Hull.ClaimNetworkOwnership(self: Hull)
 end
 
 -- Moves the boat on by `deltaTime` seconds. `water` is what the water under it is doing,
--- or nil if there's no water under it. `thrust` (studs/s²) and `turn` (rad/s², positive
--- turns left) are its crew's farts, before its handling scales them, and `turnPivot` is
--- the point the farts are turning it around (nil when nobody is turning it).
-function Hull.Step(self: Hull, water: Water?, thrust: Vector3, turn: number, turnPivot: Vector3?, deltaTime: number)
+-- or nil if there's no water under it. `forces` are the pushes from its crew's farts.
+function Hull.Step(self: Hull, water: Water?, forces: { AppliedForce }, deltaTime: number)
 	if deltaTime <= 0 then
 		return
 	end
 	self:ClaimNetworkOwnership()
 	local primaryPart = self.PrimaryPart
-	local handling = self.Handling
 	local velocity = primaryPart.AssemblyLinearVelocity
 	local spin = primaryPart.AssemblyAngularVelocity
+
+	-- What it weighs changes when a rider leaves; its moment of inertia changes with it.
+	local mass = primaryPart.AssemblyMass
+	if mass ~= self.Mass then
+		self.Mass = mass
+		self.SpinInertia = GetSpinInertia(primaryPart)
+	end
 
 	-- How much the boat is in the water: 1 at or below the surface, fading to 0 at
 	-- AIRBORNE_HEIGHT above it. Everything the water does is scaled by this.
@@ -193,37 +222,35 @@ function Hull.Step(self: Hull, water: Water?, thrust: Vector3, turn: number, tur
 	end
 	local dragScale = WaterConfig.AIR_DRAG + (1 - WaterConfig.AIR_DRAG) * wetness
 
-	-- The boat's motion is worked out for the point it turns around (its pivot), and its
-	-- middle swings round that point as it turns.
-	local primaryCFrame = primaryPart.CFrame
-	local pivotOffset = GetFlatWorldOffset(primaryCFrame, self.PivotOffset)
-	local pivotVelocity = Vector3.new(velocity.X, 0, velocity.Z) + Vector3.new(0, spin.Y, 0):Cross(pivotOffset)
-
-	-- Across the water: the motion swings round as the boat turns (keel grip), farts and
-	-- rough water push it, and drag pulls its speed toward the water's. Drag is applied
-	-- implicitly (dividing instead of subtracting), so it can never overshoot and send
-	-- the boat backwards, however long the frame.
-	local push = Vector3.new(thrust.X, 0, thrust.Z) + shove
-	local carve = CFrame.fromAxisAngle(Vector3.yAxis, spin.Y * deltaTime * BoatConfig.KEEL_GRIP * wetness)
-	local relativeVelocity = carve:VectorToWorldSpace(pivotVelocity - flow)
-	local drag = dragScale * (WaterConfig.GLIDE_DRAG + SPEED_DRAG * relativeVelocity.Magnitude)
-	relativeVelocity = (relativeVelocity + push * handling.PushScale * deltaTime) / (1 + drag * deltaTime)
-
-	-- Turning, the same way.
-	local turnSpeed = spin.Y
-	local turnDrag = dragScale * (WaterConfig.TURN_GLIDE_DRAG + self.TurnSpeedDrag * math.abs(turnSpeed))
-	turnSpeed = (turnSpeed + (turn + twist) * handling.TurnScale * deltaTime) / (1 + turnDrag * deltaTime)
-
-	-- The pivot eases toward the riders turning the boat, or back to its middle once
-	-- nobody is, so the way it swings round never jumps.
-	local targetOffset = Vector3.zero
-	if turnPivot then
-		local offset = turnPivot - primaryPart.AssemblyCenterOfMass
-		targetOffset = primaryCFrame:VectorToObjectSpace(Vector3.new(offset.X, 0, offset.Z))
+	-- The farts, added up: their total force and their total torque about the center of
+	-- mass (only the flat parts matter; the boat is kept upright).
+	local centerOfMass = primaryPart.AssemblyCenterOfMass
+	local totalForce = Vector3.zero
+	local totalTorque = 0 -- about the vertical axis; positive spins it left (counter-clockwise from above)
+	for _, appliedForce in forces do
+		local force = Vector3.new(appliedForce.Force.X, 0, appliedForce.Force.Z)
+		local offset = appliedForce.Position - centerOfMass
+		totalForce += force
+		totalTorque += offset.Z * force.X - offset.X * force.Z
 	end
-	self.PivotOffset = self.PivotOffset:Lerp(targetOffset, GetBlend(BoatConfig.TURN_PIVOT_RESPONSE_TIME, deltaTime))
-	pivotOffset = GetFlatWorldOffset(primaryCFrame, self.PivotOffset)
-	local flatVelocity = relativeVelocity + flow - Vector3.new(0, turnSpeed, 0):Cross(pivotOffset)
+
+	-- Across the water: the farts and rough water speed it up, and drag pulls its speed
+	-- toward the water's. Drag is applied implicitly (dividing instead of subtracting), so
+	-- it can never overshoot and send the boat backwards, however long the frame.
+	local acceleration = totalForce / mass + shove
+	local relativeVelocity = Vector3.new(velocity.X, 0, velocity.Z) - flow
+	local drag = dragScale * (WaterConfig.GLIDE_DRAG + SPEED_DRAG * relativeVelocity.Magnitude)
+	relativeVelocity = (relativeVelocity + acceleration * deltaTime) / (1 + drag * deltaTime)
+	local flatVelocity = relativeVelocity + flow
+
+	-- Spinning: the torque turns it by torque / moment of inertia, and the water drags on
+	-- its rim, which moves at the spin speed times its radius of gyration.
+	local spinSpeed = spin.Y
+	local gyrationRadius = math.sqrt(self.SpinInertia / mass)
+	local rimSpeed = math.abs(spinSpeed) * gyrationRadius
+	local spinDrag = dragScale * WaterConfig.SPIN_DRAG_SCALE * (WaterConfig.GLIDE_DRAG + SPEED_DRAG * rimSpeed)
+	local spinAcceleration = totalTorque / self.SpinInertia + twist
+	spinSpeed = (spinSpeed + spinAcceleration * deltaTime) / (1 + spinDrag * deltaTime)
 
 	-- Up and down: Buoyancy holds the boat's weight while it's in the water, the water
 	-- pushes back up on a boat that's pushed under, and damping settles the bobbing
@@ -237,14 +264,14 @@ function Hull.Step(self: Hull, water: Water?, thrust: Vector3, turn: number, tur
 
 	primaryPart.AssemblyLinearVelocity = Vector3.new(flatVelocity.X, verticalSpeed, flatVelocity.Z)
 	local tiltDamping = math.exp(-WaterConfig.TILT_DAMPING * wetness * deltaTime)
-	primaryPart.AssemblyAngularVelocity = Vector3.new(spin.X * tiltDamping, turnSpeed, spin.Z * tiltDamping)
+	primaryPart.AssemblyAngularVelocity = Vector3.new(spin.X * tiltDamping, spinSpeed, spin.Z * tiltDamping)
 
 	-- Tilt: with the waves, and away from the way it's speeding up, slowing down or
 	-- turning (bumps included), smoothed so it eases into and out of each lean.
-	local acceleration = (flatVelocity - self.LastFlatVelocity) / deltaTime
+	local flatAcceleration = (flatVelocity - self.LastFlatVelocity) / deltaTime
 	self.LastFlatVelocity = flatVelocity
 	local leanBlend = 1 - math.exp(-BoatConfig.LEAN_SMOOTHING * deltaTime)
-	self.LeanAcceleration = self.LeanAcceleration:Lerp(acceleration, leanBlend)
+	self.LeanAcceleration = self.LeanAcceleration:Lerp(flatAcceleration, leanBlend)
 	self:SetUpDirection(surfaceUp - self.LeanAcceleration * BoatConfig.LEAN_PER_ACCELERATION)
 end
 

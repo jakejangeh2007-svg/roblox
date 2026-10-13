@@ -84,12 +84,14 @@ local function IsRiding(): boolean
 	return boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
 end
 
--- Gas comes out behind the rider, angled to the side on a Left or Right fart.
+-- Which way the gas comes out, turned from straight behind the rider: the opposite way
+-- to the push. A Left fart pushes the boat left, so its gas goes out to the right (a
+-- positive turn of the butt attachment points its back toward the rider's right).
 local function GetGasAngle(direction: string): number
 	if direction == "Left" then
-		return -FartConfig.GAS_ANGLE
-	elseif direction == "Right" then
 		return FartConfig.GAS_ANGLE
+	elseif direction == "Right" then
+		return -FartConfig.GAS_ANGLE
 	end
 	return 0
 end

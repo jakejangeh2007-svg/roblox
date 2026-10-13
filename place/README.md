@@ -198,28 +198,32 @@ Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`
 
 | Fart | Keyboard | Controller | What it does |
 | ---- | -------- | ---------- | ------------ |
-| Left | `A`, `←`, `Q` | `LB` | turns the boat left (the same way from every seat) |
-| Straight | `W`, `↑`, `Space` | `RT` | pushes the boat away from you |
-| Right | `D`, `→`, `E` | `RB` | turns the boat right |
+| Straight | `W`, `↑`, `Space` | `RT` | pushes the boat the way you face |
+| Left | `A`, `←`, `Q` | `LB` | pushes the boat to your left |
+| Right | `D`, `→`, `E` | `RB` | pushes the boat to your right |
 
-**Hold a key to keep farting.** A fart speeds the boat up at a set acceleration
-(18 studs/s² to start) that builds up by a set amount every second you keep going (+12
-per second), up to 45. Turning builds up the same way. If you hold two keys, the one you
-pressed last wins, and **switching direction keeps the strength you've built up**.
-Letting go stops, but the built-up strength fades out instead of resetting (3 times as
-fast as it built up), so a quick re-press picks up close to where you left off.
+Every fart is a **push at your seat**, like a jet, and the boat moves the way real
+physics says (see *How boats move*). You sit at the edge of the boat facing its middle,
+so Straight pushes through the middle and just moves the boat. Left and Right push
+across the edge, so they move the boat sideways **and spin it**: pushing your side left
+swings the far side right, like pushing the back of a boat. To steer on your own, tap
+Left or Right to swing round, then push Straight. With a crew, riders on the sides can
+push the same way so the boat goes straight without spinning.
 
-Farts never snap: a fart swells in when you start, trails off when you let go, and when
-you switch (say from `W` to `A`) the push blends out as the turn eases in over about a
-second, and the gas cloud swings round to match. The timings are `PUSH_RESPONSE_TIME` and
-`TURN_RESPONSE_TIME` in `FartConfig`; lower them for snappier controls.
+**Hold a key to keep farting.** A fart starts at 18 studs/s² and builds up by 12 every
+second you keep going, up to 45 (on a boat weighing `FartConfig.REFERENCE_MASS`; heavier
+boats speed up slower). If you hold two keys, the one you pressed last wins, and
+**switching direction keeps the strength you've built up**. Letting go stops, but the
+built-up strength fades out instead of resetting (3 times as fast as it built up), so a
+quick re-press picks up close to where you left off. Farts never snap: a push swells in,
+trails off and swings round to a new direction over about a fifth of a second
+(`PUSH_RESPONSE_TIME`), and the gas cloud swings round with it.
 
 **Gas** drains at a flat 10 per second while you fart, however long you've been going, so a full tank
 (100) lasts 10 seconds. It refills at 15 per second while you're not farting. When it runs
 out you stop; let go and press again once there's gas. All of these numbers are in `FartConfig`.
 
 Everyone farting Straight cancels out; everyone farting Left spins the boat on the spot.
-Riders' turns add up, so a big boat turns quickly only when its crew turns together.
 
 **Seat Cam:** on the river the camera sits behind your seat, so Straight always pushes
 up your screen. It bobs gently with the boat and shakes on hard bumps and splashes.
@@ -229,43 +233,44 @@ Touch devices need on-screen buttons, which are UI, so they come with the menus.
 ## How boats move
 
 One thing moves a boat on the river: its **Hull** (`ServerScriptService.Classes.Hull`),
-which WaterService steps every frame on the server. It works out the boat's whole
-velocity in one go, so nothing fights over it and there are no hard speed caps:
+which WaterService steps every frame on the server. It treats the boat as a real rigid
+body and works out its whole motion in one go, so nothing fights over it and there are
+no hard speed caps:
 
-- **Farts** push and turn it, scaled by its size's **handling** (`BoatConfig.HANDLING`).
-- It **turns around whoever is turning it**, so a lone rider's boat swings round them like
-  a steered boat, and its motion **carves round with the turn** (`BoatConfig.KEEL_GRIP`)
-  instead of sliding on the old way. Holding `W` then pressing `A` curves you left and
-  keeps you moving forward. When nobody turns it any more, it goes back to turning around
-  its middle.
+- **Farts** are forces at the riders' seats. Together they speed the boat up by
+  force ÷ mass and spin it by torque ÷ moment of inertia. The mass and the moment of
+  inertia come from the boat's actual parts plus its riders, so **big, heavy boats are
+  slower to get going and much slower to spin**, and a boat is lighter once a rider leaves.
 - **Water drag** pulls its speed toward the water's own speed. It's gentle at low speed,
   so a boat glides on for a few seconds after the crew stops, and grows with speed, so a
-  boat levels off smoothly at its top speed: one rider at full strength cruises at about
-  30 studs/s (`WaterConfig.TOP_SPEED`). Two riders pushing the same way go faster.
-  Turning works the same way, with each size's own top turn speed.
+  boat levels off smoothly at its top speed: one rider at full strength cruises a boat of
+  `REFERENCE_MASS` at about 30 studs/s (`WaterConfig.TOP_SPEED`). The same drag acting
+  round the rim slows its spinning, times `WaterConfig.SPIN_DRAG_SCALE` (raise it for less
+  spin from Left and Right).
 - **Currents** carry it along, and **rapids** shove and twist it around at random.
 - **Buoyancy** holds it at the surface like a soft spring: it bobs on gentle **waves**,
   and a boat that drops in plunges, then settles in about 2 seconds without bouncing
   back out. Off the water, only gravity, a little air drag and the farts act on it.
 - It **rocks** with the waves and **leans** away from the way it's speeding up, turning or
   bumping into things, then rights itself.
-- Riders don't bump into anything and weigh nothing while they ride, so only the hull
-  touches the world, and the boat turns around its middle wherever the crew sits.
-  The hull is slippery and a little bouncy, so it glances off rocks and banks.
+- Riders weigh what they weigh, but they don't bump into anything while they ride, so
+  only the hull touches the world. The hull is slippery and a little bouncy, so it
+  glances off rocks and banks.
 
-| Boat | Speed after 1 s / 2 s of one rider pushing | Turn speed after 1 s / 3 s of one rider turning |
-| ---- | ---- | ---- |
-| 1 seat | 15 / 26 studs/s | 72 / 148 °/s |
-| 2 seats | 14 / 25 | 50 / 112 |
-| 3 seats | 14 / 24 | 38 / 87 |
-| 4 seats | 13 / 24 | 31 / 73 (4 riders turning together: 106 / 192) |
-| 5 seats | 13 / 23 | 26 / 61 |
-| 6 seats | 12 / 22 | 21 / 50 (3 together: 57 / 112; all 6: 102 / 175) |
+With the test kit's boats and one rider:
 
-A boat stops turning about 2 seconds after everyone lets go. To make a size nimbler or
-heavier, change its `PushScale`, `TurnScale` and `TopTurnSpeed` in `BoatConfig.HANDLING`.
-Water feel (drag, bobbing, waves, rapids) is in `WaterConfig`; leaning and the hull's
-bounce are in `BoatConfig`.
+| Boat | Weight (boat + rider) | Holding Straight: speed after 1 s / 3 s | Holding Left: spin after 1 s / 2 s | Tapping Left for 0.3 s: turns |
+| ---- | ---- | ---- | ---- | ---- |
+| 1 seat | 74 + 14 | 14 / 29 studs/s | 72 / 100 °/s | 20° |
+| 2 seats | 97 + 14 | 11 / 25 | 49 / 69 | 14° |
+| 3 seats | 121 + 14 | 9 / 22 | 35 / 50 | 10° |
+| 4 seats | 146 + 14 | 8 / 20 | 27 / 38 | 7° |
+| 5 seats | 173 + 14 | 7 / 18 | 21 / 30 | 6° |
+| 6 seats | 200 + 14 | 6 / 16 | 17 / 24 | 4° |
+
+To make a boat nimbler or heavier, change its parts (their size and Material set how
+much they weigh). Fart strength is in `FartConfig`; water feel (drag, spin drag, bobbing,
+waves, rapids) is in `WaterConfig`; leaning and the hull's bounce are in `BoatConfig`.
 
 The server runs boat physics, so in a live game there's a small delay (your ping)
 between pressing a key and seeing the boat react. Your own fart effects start instantly.
@@ -332,7 +337,8 @@ Put one Model per size in **`ReplicatedStorage.Assets.Boats`**, named as in
   facing forward.
 - No scripts inside.
 - Every part's friction and bounciness is set by the code (`BoatConfig.HULL_...`); its
-  density (from its Material) is kept. Make the hull the parts that should touch rocks
+  density (from its Material) is kept. What the parts weigh, and how far out they sit,
+  decides how quickly the boat gets going and spins (see *How boats move*). Make the hull the parts that should touch rocks
   and banks; riders never touch anything.
 
 Output warns at startup about any template that's missing or doesn't follow these rules.

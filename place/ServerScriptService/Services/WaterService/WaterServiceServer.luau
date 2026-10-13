@@ -3,7 +3,7 @@
 --
 -- Moves every boat on the river. Each frame, for each boat, it works out what the
 -- water under the boat is doing (its surface with the waves, its current and how rough
--- it is), asks FartService how hard the crew is farting, and steps the boat's Hull
+-- it is), asks FartService for the pushes from the crew's farts, and steps the boat's Hull
 -- with both. Where there's no water under a boat, nothing holds it up and it falls. A
 -- boat that falls FALL_DISTANCE below the last water it was over has fallen off the
 -- river, and BoatService wipes it.
@@ -151,8 +151,7 @@ function WaterServiceServer.Update(self: WaterServiceServer, deltaTime: number)
 			BoatServiceServer:WipeBoat(boat)
 			continue
 		end
-		local thrust, turn, turnPivot = FartServiceServer:GetThrust(boat)
-		hull:Step(water, thrust, turn, turnPivot, stepTime)
+		hull:Step(water, FartServiceServer:GetFartForces(boat), stepTime)
 	end
 end
 

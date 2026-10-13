@@ -2,31 +2,22 @@
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.FartConfig
 
 local FartConfig = {
-	-- Strength. Holding a fart key pushes the boat with a set acceleration that builds up
-	-- the longer you keep farting, up to a maximum. Switching direction keeps it built up,
-	-- and after you let go it fades instead of resetting, so a quick re-press picks up
-	-- close to where you left off. How much a push moves a boat depends on the boat's size
-	-- (BoatConfig.HANDLING); water drag decides how fast it ends up going (WaterConfig).
+	-- A fart is a push on the boat, applied where the rider sits: Straight pushes it the way
+	-- the rider faces, Left to their left and Right to their right. The boat moves the way
+	-- real physics says (the Hull class): a push through its middle just moves it, and a
+	-- push off to one side also spins it.
 
-	-- Pushing, in studs/s²: how much speed a fart adds every second
-	STRAIGHT_ACCELERATION = 18, -- when a fart starts
-	STRAIGHT_ACCELERATION_GAIN = 12, -- added for every second you keep farting
-	MAX_STRAIGHT_ACCELERATION = 45, -- reached after 2.25 seconds of farting
-
-	-- Turning, in rad/s² (1 rad is about 57 degrees). A Left/Right fart turns the boat
-	-- around the rider (see the Hull class), so it swings round them like a steered boat.
-	TURN_ACCELERATION = 1.6, -- when a Left/Right fart starts
-	TURN_ACCELERATION_GAIN = 1.2, -- added for every second you keep farting
-	MAX_TURN_ACCELERATION = 4, -- reached after 2 seconds of farting
-
+	-- Strength. Holding a fart key pushes with a strength that builds up the longer you
+	-- keep farting, up to a maximum. Switching direction keeps it built up, and after you
+	-- let go it fades instead of resetting, so a quick re-press picks up close to where you
+	-- left off. Strengths are in studs/s²: how much speed a fart adds every second to a
+	-- boat weighing REFERENCE_MASS. Heavier boats speed up slower, lighter ones faster.
+	PUSH_ACCELERATION = 18, -- when a fart starts
+	PUSH_ACCELERATION_GAIN = 12, -- added for every second you keep farting
+	MAX_PUSH_ACCELERATION = 45, -- reached after 2.25 seconds of farting
+	REFERENCE_MASS = 89, -- the test kit's one-seat boat with its rider aboard
 	RAMP_DECAY = 3, -- after you let go, built-up strength fades this many times faster than it built up
-
-	-- Smoothness. A fart doesn't snap on, off or around: what it does eases toward where
-	-- it's aimed, getting most of the way there (63%) in this many seconds. So starting
-	-- swells in, letting go trails off, and switching from Straight to Left fades the
-	-- push out as the turn builds in.
-	PUSH_RESPONSE_TIME = 0.2,
-	TURN_RESPONSE_TIME = 0.35, -- a little slower, so turns ease in instead of jerking the boat around
+	PUSH_RESPONSE_TIME = 0.2, -- a fart eases in, out and round to a new direction, most of the way in this many seconds
 
 	-- Gas meter (each player's is in their "Gas" attribute)
 	GAS_MAX = 100,
@@ -38,7 +29,7 @@ local FartConfig = {
 
 	-- Effects. They grow with the fart's strength, from when it starts to full acceleration.
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
-	GAS_ANGLE = math.rad(45), -- how far left or right of straight back the gas comes out on a Left/Right fart
+	GAS_ANGLE = math.rad(90), -- how far round from straight back the gas comes out on a Left/Right fart
 	MIN_PARTICLE_RATE = 20, -- particles per second when a fart starts...
 	MAX_PARTICLE_RATE = 60, -- ...and at full acceleration
 	MAX_PARTICLE_SPEED_MULTIPLIER = 2.5, -- the cloud's Speed is multiplied by up to this at full acceleration

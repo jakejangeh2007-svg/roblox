@@ -23,9 +23,10 @@ local WaterConfig = {
 	-- drag that grows with speed, so a boat levels off smoothly at its top speed instead
 	-- of hitting a limit.
 	GLIDE_DRAG = 0.5, -- per second
-	TOP_SPEED = 30, -- studs/s that one rider farting Straight at full strength levels off at
-	TURN_GLIDE_DRAG = 1.2, -- per second: how fast a boat stops turning once nobody turns it
-	-- (a boat's top turn speed is its TopTurnSpeed in BoatConfig.HANDLING)
+	TOP_SPEED = 30, -- studs/s one rider pushing at full strength levels a boat of FartConfig.REFERENCE_MASS off at
+	-- Spinning is slowed by the same water drag acting round the boat's rim, times this
+	-- (the hull and the riders' legs churn the water as it spins). Higher = less spin.
+	SPIN_DRAG_SCALE = 8,
 	AIR_DRAG = 0.15, -- out of the water, drag is this fraction of the water's
 
 	-- Floating. The water holds a boat up at the surface like a soft spring, so it bobs on
