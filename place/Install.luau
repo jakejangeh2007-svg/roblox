@@ -2337,8 +2337,10 @@ return DockServiceServer :: DockServiceServer
 -- switch direction, or to stop); this checks they're riding a boat on the river and
 -- have gas, and keeps them farting until they stop, run out of gas or leave the boat.
 -- Their fart builds up strength while they keep it going and fades after they stop
--- (FartPhysics). Gas drains at a flat rate while farting and refills while not. Other
--- players are told when someone starts, switches or stops, so they can show it.
+-- (FartPhysics), and what it does eases toward where it's aimed, so starting, stopping
+-- and switching direction blend smoothly. Gas drains at a flat rate while farting and
+-- refills while not. Other players are told when someone starts, switches or stops,
+-- so they can show it.
 --
 -- This service doesn't move boats. WaterService asks GetThrust for how hard each
 -- boat's crew is farting and moves the boat with everything else acting on it.
@@ -2356,6 +2358,21 @@ local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 
 local SERVICE_NAME = FartServiceShared.SERVICE_NAME
+local MIN_OUTPUT = 0.01 -- a fart that has eased below this (studs/s² or rad/s²) has finished
+
+-- What a rider's fart is doing right now, in their own terms (see FartPhysics.GetOutput).
+-- It eases toward what their fart is aimed to do.
+type Output = {
+	Forward: number,
+	Side: number,
+	Turn: number,
+}
+
+-- How far something easing with `responseTime` (see FartConfig) moves toward its
+-- target in `deltaTime` seconds, from 0 (not at all) to 1 (all the way).
+local function GetBlend(responseTime: number, deltaTime: number): number
+	return if responseTime > 0 then 1 - math.exp(-deltaTime / responseTime) else 1
+end
 
 local FartServiceServer = {}
 
@@ -2363,6 +2380,7 @@ type FartServiceServerMembers = {
 	Gas: { [Player]: number },
 	Streams: { [Player]: FartPhysics.Direction }, -- everyone farting right now, and which way
 	RampTimes: { [Player]: number }, -- how far each player's fart has built up (missing = not at all)
+	Outputs: { [Player]: Output }, -- what each player's fart is doing right now (missing = nothing)
 	PendingDirections: { [Player]: FartPhysics.Direction }, -- start or switch requests waiting out the cooldown
 	LastStartTimes: { [Player]: number },
 	PlayFartRemote: RemoteEvent,
@@ -2375,6 +2393,7 @@ function FartServiceServer.Init(self: FartServiceServer)
 	self.Gas = {}
 	self.Streams = {}
 	self.RampTimes = {}
+	self.Outputs = {}
 	self.PendingDirections = {}
 	self.LastStartTimes = {}
 	self.PlayFartRemote = Remotes.CreateEvent(SERVICE_NAME, FartServiceShared.PLAY_FART)
@@ -2399,6 +2418,7 @@ function FartServiceServer.Init(self: FartServiceServer)
 		self:StopStream(player, false)
 		self.Gas[player] = nil
 		self.RampTimes[player] = nil
+		self.Outputs[player] = nil
 		self.LastStartTimes[player] = nil
 	end)
 
@@ -2489,15 +2509,44 @@ function FartServiceServer.GetThrust(self: FartServiceServer, boat: Boat.Boat): 
 	end
 	local boatPosition = boat:GetPosition()
 	for _, player in boat.Crew do
-		local direction: FartPhysics.Direction? = self.Streams[player]
-		local seat = if direction then boat:GetSeatOf(player) else nil
-		if direction and seat and (self.Gas[player] or 0) > 0 then
-			local push, turn = FartPhysics.GetThrust(boatPosition, seat.CFrame, direction, self.RampTimes[player] or 0)
-			totalPush += push
-			totalTurn += turn
+		local output = self.Outputs[player]
+		local seat = if output then boat:GetSeatOf(player) else nil
+		if output and seat then
+			totalPush += FartPhysics.GetPush(boatPosition, seat.CFrame, output.Forward, output.Side)
+			totalTurn += output.Turn
 		end
 	end
 	return totalPush, totalTurn
+end
+
+-- Eases `player`'s fart output toward what a fart in `direction` (nil when they're not
+-- farting) does at `rampTime`, by the given fractions of the way.
+function FartServiceServer.UpdateOutput(
+	self: FartServiceServer,
+	player: Player,
+	direction: FartPhysics.Direction?,
+	rampTime: number,
+	pushBlend: number,
+	turnBlend: number
+)
+	local output = self.Outputs[player]
+	if not output then
+		if not direction then
+			return
+		end
+		output = { Forward = 0, Side = 0, Turn = 0 }
+		self.Outputs[player] = output
+	end
+	local forward, side, turn = FartPhysics.GetOutput(direction, rampTime)
+	output.Forward += (forward - output.Forward) * pushBlend
+	output.Side += (side - output.Side) * pushBlend
+	output.Turn += (turn - output.Turn) * turnBlend
+	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT
+		and math.abs(output.Side) < MIN_OUTPUT
+		and math.abs(output.Turn) < MIN_OUTPUT
+	if not direction and hasFinished then
+		self.Outputs[player] = nil
+	end
 end
 
 function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
@@ -2521,14 +2570,18 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 		self:SetGas(player, math.max(0, gas - FartConfig.GAS_DRAIN * deltaTime))
 	end
 
+	local pushBlend = GetBlend(FartConfig.PUSH_RESPONSE_TIME, deltaTime)
+	local turnBlend = GetBlend(FartConfig.TURN_RESPONSE_TIME, deltaTime)
 	for player, gas in self.Gas do
-		local isFarting = self.Streams[player] ~= nil
+		local direction: FartPhysics.Direction? = self.Streams[player]
+		local isFarting = direction ~= nil
 		local rampTime = FartPhysics.UpdateRampTime(self.RampTimes[player] or 0, isFarting, deltaTime)
 		if rampTime > 0 then
 			self.RampTimes[player] = rampTime
 		else
 			self.RampTimes[player] = nil
 		end
+		self:UpdateOutput(player, direction, rampTime, pushBlend, turnBlend)
 		if not isFarting and gas < FartConfig.GAS_MAX then
 			self:SetGas(player, math.min(FartConfig.GAS_MAX, gas + FartConfig.GAS_REGEN * deltaTime))
 		end
@@ -2976,7 +3029,7 @@ local FartConfig = {
 	STRAIGHT_ACCELERATION = 18, -- when a fart starts
 	STRAIGHT_ACCELERATION_GAIN = 12, -- added for every second you keep farting
 	MAX_STRAIGHT_ACCELERATION = 45, -- reached after 2.25 seconds of farting
-	SIDE_PUSH_FRACTION = 0.45, -- a Left/Right fart also pushes sideways at this fraction of the above
+	SIDE_PUSH_FRACTION = 0.3, -- a Left/Right fart also pushes sideways at this fraction of the above
 
 	-- Turning, in rad/s² (1 rad is about 57 degrees)
 	TURN_ACCELERATION = 1.6, -- when a Left/Right fart starts
@@ -2984,6 +3037,13 @@ local FartConfig = {
 	MAX_TURN_ACCELERATION = 4, -- reached after 2 seconds of farting
 
 	RAMP_DECAY = 3, -- after you let go, built-up strength fades this many times faster than it built up
+
+	-- Smoothness. A fart doesn't snap on, off or around: what it does eases toward where
+	-- it's aimed, getting most of the way there (63%) in this many seconds. So starting
+	-- swells in, letting go trails off, and switching from Straight to Left blends the
+	-- push out as the turn builds in.
+	PUSH_RESPONSE_TIME = 0.2,
+	TURN_RESPONSE_TIME = 0.35, -- a little slower, so turns ease in instead of jerking the boat around
 
 	-- Gas meter (each player's is in their "Gas" attribute)
 	GAS_MAX = 100,
@@ -3618,6 +3678,10 @@ return DockServiceShared
 -- the rider. "Left" turns the boat left, the same way from every seat, plus a small
 -- sideways push. So with seats spread around the ring, everyone farting Straight
 -- cancels out, and everyone farting Left spins the boat on the spot.
+--
+-- What a fart does is worked out in the rider's own terms (GetOutput): forward push,
+-- sideways push and turn. FartService eases each rider's output toward that, then
+-- GetPush turns it into a push on the boat.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -3683,32 +3747,37 @@ function FartPhysics.GetRampProgress(rampTime: number): number
 	return math.clamp(rampTime / FartPhysics.MAX_RAMP_TIME, 0, 1)
 end
 
--- How fast a fart from `seatCFrame` speeds the boat up (studs/s²) and turns it (rad/s²)
--- after `rampTime` seconds of build-up. A positive turn is a LEFT turn (counter-clockwise
--- seen from above). This is the raw fart; the boat's size scales what it does
--- (BoatConfig.HANDLING).
-function FartPhysics.GetThrust(
-	boatPosition: Vector3,
-	seatCFrame: CFrame,
-	direction: Direction,
-	rampTime: number
-): (Vector3, number)
-	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame)
-	local right = facing:Cross(Vector3.yAxis) -- the rider's right hand
+-- What a fart in `direction` (nil when not farting) does after `rampTime` seconds of
+-- build-up, in the rider's own terms:
+--   forward   studs/s² pushing the boat away from the rider
+--   side      studs/s² pushing the boat toward the rider's right
+--   turn      rad/s² turning the boat; positive is a LEFT turn (counter-clockwise seen
+--             from above)
+-- This is the raw fart; the boat's size scales what it does (BoatConfig.HANDLING).
+function FartPhysics.GetOutput(direction: Direction?, rampTime: number): (number, number, number)
+	if not direction then
+		return 0, 0, 0
+	end
 	local straightAcceleration = FartPhysics.GetStraightAcceleration(rampTime)
-
 	if direction == "Straight" then
 		-- Gas goes out behind the rider, so the boat moves away from them.
-		return facing * straightAcceleration, 0
+		return straightAcceleration, 0, 0
 	end
 	local sidePush = straightAcceleration * FartConfig.SIDE_PUSH_FRACTION
 	local turnAcceleration = FartPhysics.GetTurnAcceleration(rampTime)
 	if direction == "Left" then
 		-- Like an outboard motor: shove our side right so the far side swings left.
-		return right * sidePush, turnAcceleration
-	else
-		return -right * sidePush, -turnAcceleration
+		return 0, sidePush, turnAcceleration
 	end
+	return 0, -sidePush, -turnAcceleration
+end
+
+-- A rider's `forward` and `side` push (see GetOutput) from `seatCFrame`, as a push on
+-- the boat in world space (studs/s²).
+function FartPhysics.GetPush(boatPosition: Vector3, seatCFrame: CFrame, forward: number, side: number): Vector3
+	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame)
+	local right = facing:Cross(Vector3.yAxis) -- the rider's right hand
+	return facing * forward + right * side
 end
 
 return FartPhysics
@@ -3771,6 +3840,8 @@ local localPlayer = Players.LocalPlayer
 -- One player's fart that's happening right now, and its effects.
 type Stream = {
 	Direction: string,
+	Butt: Attachment, -- where the gas comes out; it turns to aim the gas
+	GasAngle: number, -- radians the gas is aimed to the side right now; it swings toward the direction's angle
 	Emitter: ParticleEmitter?,
 	Sound: Sound?,
 	BasePitch: number,
@@ -3801,6 +3872,16 @@ local function IsRiding(): boolean
 	local seat = if humanoid then humanoid.SeatPart else nil
 	local boatModel = if seat then BoatServiceShared.GetBoatModelFromPart(seat) else nil
 	return boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
+end
+
+-- Gas comes out behind the rider, angled to the side on a Left or Right fart.
+local function GetGasAngle(direction: string): number
+	if direction == "Left" then
+		return -FartConfig.GAS_ANGLE
+	elseif direction == "Right" then
+		return FartConfig.GAS_ANGLE
+	end
+	return 0
 end
 
 local function GetLocalGas(): number
@@ -3968,7 +4049,8 @@ function FartServiceClient.SetLocalDirection(self: FartServiceClient, direction:
 end
 
 -- Every frame: build up (or fade) everyone's fart strength, grow each fart's effects
--- with it, and stop the local fart if the player ran out of gas or isn't riding any more.
+-- with it, swing each fart's gas round to where it's aimed, and stop the local fart if
+-- the player ran out of gas or isn't riding any more.
 function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 	if self.LocalDirection and (GetLocalGas() <= 0 or not IsRiding()) then
 		table.clear(self.HeldDirections)
@@ -3985,6 +4067,10 @@ function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 			end
 		end
 	end
+	-- The gas swings round as fast as the push it makes (FartConfig.PUSH_RESPONSE_TIME).
+	local gasBlend = if FartConfig.PUSH_RESPONSE_TIME > 0
+		then 1 - math.exp(-deltaTime / FartConfig.PUSH_RESPONSE_TIME)
+		else 1
 	for player, stream in self.Streams do
 		if not player.Parent then
 			self:StopStream(player)
@@ -3993,6 +4079,16 @@ function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
 		end
 		local rampTime = FartPhysics.UpdateRampTime(self.RampTimes[player] or 0, true, deltaTime)
 		self.RampTimes[player] = rampTime
+
+		local targetAngle = GetGasAngle(stream.Direction)
+		if stream.GasAngle ~= targetAngle then
+			stream.GasAngle += (targetAngle - stream.GasAngle) * gasBlend
+			if math.abs(targetAngle - stream.GasAngle) < 1e-3 then
+				stream.GasAngle = targetAngle
+			end
+			stream.Butt.CFrame = FartConfig.BUTT_OFFSET * CFrame.Angles(0, stream.GasAngle, 0)
+		end
+
 		local progress = FartPhysics.GetRampProgress(rampTime)
 		local emitter = stream.Emitter
 		local template = self.FartCloudTemplate
@@ -4042,22 +4138,19 @@ end
 -- Starts `player`'s fart effects (a steady gas cloud and a looping sound), or points
 -- them the new way if they're switching direction.
 function FartServiceClient.StartStream(self: FartServiceClient, player: Player, direction: string)
+	local existingStream = self.Streams[player]
+	if existingStream then
+		-- Switching: the same fart keeps going (same sound, same strength) and its gas
+		-- swings round to the new direction (see Update).
+		existingStream.Direction = direction
+		return
+	end
 	local butt, emitter = self:GetButt(player)
 	if not butt then
 		return
 	end
-	-- Gas comes out behind the rider, angled to the side on a Left or Right fart.
-	local gasAngle = if direction == "Left"
-		then -FartConfig.GAS_ANGLE
-		elseif direction == "Right" then FartConfig.GAS_ANGLE
-		else 0
+	local gasAngle = GetGasAngle(direction)
 	butt.CFrame = FartConfig.BUTT_OFFSET * CFrame.Angles(0, gasAngle, 0)
-	local existingStream = self.Streams[player]
-	if existingStream then
-		-- Switching: the same fart keeps going (same sound, same strength), just aimed anew.
-		existingStream.Direction = direction
-		return
-	end
 	if emitter then
 		emitter.Enabled = true
 	end
@@ -4076,6 +4169,8 @@ function FartServiceClient.StartStream(self: FartServiceClient, player: Player, 
 
 	self.Streams[player] = {
 		Direction = direction,
+		Butt = butt,
+		GasAngle = gasAngle,
 		Emitter = emitter,
 		Sound = sound,
 		BasePitch = basePitch,

@@ -13,6 +13,10 @@
 -- the rider. "Left" turns the boat left, the same way from every seat, plus a small
 -- sideways push. So with seats spread around the ring, everyone farting Straight
 -- cancels out, and everyone farting Left spins the boat on the spot.
+--
+-- What a fart does is worked out in the rider's own terms (GetOutput): forward push,
+-- sideways push and turn. FartService eases each rider's output toward that, then
+-- GetPush turns it into a push on the boat.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -78,32 +82,37 @@ function FartPhysics.GetRampProgress(rampTime: number): number
 	return math.clamp(rampTime / FartPhysics.MAX_RAMP_TIME, 0, 1)
 end
 
--- How fast a fart from `seatCFrame` speeds the boat up (studs/s²) and turns it (rad/s²)
--- after `rampTime` seconds of build-up. A positive turn is a LEFT turn (counter-clockwise
--- seen from above). This is the raw fart; the boat's size scales what it does
--- (BoatConfig.HANDLING).
-function FartPhysics.GetThrust(
-	boatPosition: Vector3,
-	seatCFrame: CFrame,
-	direction: Direction,
-	rampTime: number
-): (Vector3, number)
-	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame)
-	local right = facing:Cross(Vector3.yAxis) -- the rider's right hand
+-- What a fart in `direction` (nil when not farting) does after `rampTime` seconds of
+-- build-up, in the rider's own terms:
+--   forward   studs/s² pushing the boat away from the rider
+--   side      studs/s² pushing the boat toward the rider's right
+--   turn      rad/s² turning the boat; positive is a LEFT turn (counter-clockwise seen
+--             from above)
+-- This is the raw fart; the boat's size scales what it does (BoatConfig.HANDLING).
+function FartPhysics.GetOutput(direction: Direction?, rampTime: number): (number, number, number)
+	if not direction then
+		return 0, 0, 0
+	end
 	local straightAcceleration = FartPhysics.GetStraightAcceleration(rampTime)
-
 	if direction == "Straight" then
 		-- Gas goes out behind the rider, so the boat moves away from them.
-		return facing * straightAcceleration, 0
+		return straightAcceleration, 0, 0
 	end
 	local sidePush = straightAcceleration * FartConfig.SIDE_PUSH_FRACTION
 	local turnAcceleration = FartPhysics.GetTurnAcceleration(rampTime)
 	if direction == "Left" then
 		-- Like an outboard motor: shove our side right so the far side swings left.
-		return right * sidePush, turnAcceleration
-	else
-		return -right * sidePush, -turnAcceleration
+		return 0, sidePush, turnAcceleration
 	end
+	return 0, -sidePush, -turnAcceleration
+end
+
+-- A rider's `forward` and `side` push (see GetOutput) from `seatCFrame`, as a push on
+-- the boat in world space (studs/s²).
+function FartPhysics.GetPush(boatPosition: Vector3, seatCFrame: CFrame, forward: number, side: number): Vector3
+	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame)
+	local right = facing:Cross(Vector3.yAxis) -- the rider's right hand
+	return facing * forward + right * side
 end
 
 return FartPhysics

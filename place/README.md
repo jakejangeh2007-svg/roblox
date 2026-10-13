@@ -209,6 +209,11 @@ pressed last wins, and **switching direction keeps the strength you've built up*
 Letting go stops, but the built-up strength fades out instead of resetting (3 times as
 fast as it built up), so a quick re-press picks up close to where you left off.
 
+Farts never snap: a fart swells in when you start, trails off when you let go, and when
+you switch (say from `W` to `A`) the push blends out as the turn eases in over about a
+second, and the gas cloud swings round to match. The timings are `PUSH_RESPONSE_TIME` and
+`TURN_RESPONSE_TIME` in `FartConfig`; lower them for snappier controls.
+
 **Gas** drains at a flat 10 per second while you fart, however long you've been going, so a full tank
 (100) lasts 10 seconds. It refills at 15 per second while you're not farting. When it runs
 out you stop; let go and press again once there's gas. All of these numbers are in `FartConfig`.
@@ -245,12 +250,12 @@ velocity in one go, so nothing fights over it and there are no hard speed caps:
 
 | Boat | Speed after 1 s / 2 s of one rider pushing | Turn speed after 1 s / 3 s of one rider turning |
 | ---- | ---- | ---- |
-| 1 seat | 18 / 28 studs/s | 96 / 150 °/s |
-| 2 seats | 17 / 27 | 68 / 114 |
-| 3 seats | 16 / 26 | 52 / 89 |
-| 4 seats | 16 / 25 | 42 / 74 (4 riders turning together: 136 / 194) |
-| 5 seats | 15 / 24 | 35 / 62 |
-| 6 seats | 14 / 23 | 28 / 51 (3 together: 74 / 113; all 6: 127 / 177) |
+| 1 seat | 15 / 26 studs/s | 72 / 148 °/s |
+| 2 seats | 14 / 25 | 50 / 112 |
+| 3 seats | 14 / 24 | 38 / 87 |
+| 4 seats | 13 / 24 | 31 / 73 (4 riders turning together: 106 / 192) |
+| 5 seats | 13 / 23 | 26 / 61 |
+| 6 seats | 12 / 22 | 21 / 50 (3 together: 57 / 112; all 6: 102 / 175) |
 
 A boat stops turning about 2 seconds after everyone lets go. To make a size nimbler or
 heavier, change its `PushScale`, `TurnScale` and `TopTurnSpeed` in `BoatConfig.HANDLING`.

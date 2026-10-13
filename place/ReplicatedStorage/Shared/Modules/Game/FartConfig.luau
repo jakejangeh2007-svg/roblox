@@ -12,7 +12,7 @@ local FartConfig = {
 	STRAIGHT_ACCELERATION = 18, -- when a fart starts
 	STRAIGHT_ACCELERATION_GAIN = 12, -- added for every second you keep farting
 	MAX_STRAIGHT_ACCELERATION = 45, -- reached after 2.25 seconds of farting
-	SIDE_PUSH_FRACTION = 0.45, -- a Left/Right fart also pushes sideways at this fraction of the above
+	SIDE_PUSH_FRACTION = 0.3, -- a Left/Right fart also pushes sideways at this fraction of the above
 
 	-- Turning, in rad/s² (1 rad is about 57 degrees)
 	TURN_ACCELERATION = 1.6, -- when a Left/Right fart starts
@@ -20,6 +20,13 @@ local FartConfig = {
 	MAX_TURN_ACCELERATION = 4, -- reached after 2 seconds of farting
 
 	RAMP_DECAY = 3, -- after you let go, built-up strength fades this many times faster than it built up
+
+	-- Smoothness. A fart doesn't snap on, off or around: what it does eases toward where
+	-- it's aimed, getting most of the way there (63%) in this many seconds. So starting
+	-- swells in, letting go trails off, and switching from Straight to Left blends the
+	-- push out as the turn builds in.
+	PUSH_RESPONSE_TIME = 0.2,
+	TURN_RESPONSE_TIME = 0.35, -- a little slower, so turns ease in instead of jerking the boat around
 
 	-- Gas meter (each player's is in their "Gas" attribute)
 	GAS_MAX = 100,
