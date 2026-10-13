@@ -12,7 +12,9 @@
 
 local ServerScriptService = game:GetService("ServerScriptService")
 
-local START_FIRST: { string } = {}
+-- BoatService before CheckpointService (which listens to its CrewMemberLeft signal),
+-- and CheckpointService before DockService (which reads its docks from the map).
+local START_FIRST: { string } = { "BoatService", "CheckpointService" }
 local START_MANUALLY: { string } = {}
 
 local servicesFolder = ServerScriptService.Services
