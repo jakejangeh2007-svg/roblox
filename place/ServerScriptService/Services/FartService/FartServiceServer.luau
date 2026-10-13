@@ -33,7 +33,7 @@ local MIN_OUTPUT = 0.01 -- a fart that has eased below this (studs/s²) has fini
 -- It eases toward what their fart is aimed to do.
 type Output = {
 	Forward: number,
-	Left: number,
+	Right: number,
 }
 
 -- How far something easing with `responseTime` (see FartConfig) moves toward its
@@ -180,7 +180,7 @@ function FartServiceServer.GetFartForces(self: FartServiceServer, boat: Boat.Boa
 		if output and seat then
 			table.insert(forces, {
 				Position = seat.Position,
-				Force = FartPhysics.GetForce(boatPosition, seat.CFrame, output.Forward, output.Left),
+				Force = FartPhysics.GetForce(boatPosition, seat.CFrame, output.Forward, output.Right),
 			})
 		end
 	end
@@ -201,13 +201,13 @@ function FartServiceServer.UpdateOutput(
 		if not direction then
 			return
 		end
-		output = { Forward = 0, Left = 0 }
+		output = { Forward = 0, Right = 0 }
 		self.Outputs[player] = output
 	end
-	local forward, left = FartPhysics.GetOutput(direction, rampTime)
+	local forward, right = FartPhysics.GetOutput(direction, rampTime)
 	output.Forward += (forward - output.Forward) * blend
-	output.Left += (left - output.Left) * blend
-	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Left) < MIN_OUTPUT
+	output.Right += (right - output.Right) * blend
+	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Right) < MIN_OUTPUT
 	if not direction and hasFinished then
 		self.Outputs[player] = nil
 	end

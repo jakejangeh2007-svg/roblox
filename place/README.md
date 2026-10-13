@@ -198,20 +198,19 @@ Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`
 
 | Fart | Keyboard | Controller | What it does |
 | ---- | -------- | ---------- | ------------ |
-| Straight | `W`, `↑`, `Space` | `RT` | pushes the boat the way you face |
-| Left | `A`, `←`, `Q` | `LB` | pushes the boat to your left |
-| Right | `D`, `→`, `E` | `RB` | pushes the boat to your right |
+| Straight | `W`, `↑`, `Space` | `RT` | farts out behind you: pushes the boat the way you face |
+| Left | `A`, `←`, `Q` | `LB` | farts out to your left: spins the boat left |
+| Right | `D`, `→`, `E` | `RB` | farts out to your right: spins the boat right |
 
-Every fart is a **push at your seat**, like a jet, and the boat moves the way real
-physics says (see *How boats move*). You sit at the edge of the boat facing its middle,
-so Straight pushes through the middle and just moves the boat. Left and Right push
-across the edge, so they move the boat sideways **and spin it**: pushing your side left
-swings the far side right, like pushing the back of a boat. To steer on your own, tap
-Left or Right to swing round, then push Straight. With a crew, riders on the sides can
-push the same way so the boat goes straight without spinning.
+Every fart is a **jet at your seat**: the gas goes one way and pushes the boat the other,
+and the boat moves the way real physics says (see *How boats move*). You sit at the edge
+of the boat facing its middle, so Straight pushes through the middle and just moves the
+boat. Left farts out your left side, pushing your side of the boat right, so the boat
+**spins left** (counter-clockwise) and drifts a little right; Right is the mirror image.
+To steer on your own, tap Left or Right to swing round, then push Straight.
 
-**Hold a key to keep farting.** A fart starts at 18 studs/s² and builds up by 12 every
-second you keep going, up to 45 (on a boat weighing `FartConfig.REFERENCE_MASS`; heavier
+**Hold a key to keep farting.** A fart starts at 12 studs/s² and builds up by 8 every
+second you keep going, up to 30 (on a boat weighing `FartConfig.REFERENCE_MASS`; heavier
 boats speed up slower). If you hold two keys, the one you pressed last wins, and
 **switching direction keeps the strength you've built up**. Letting go stops, but the
 built-up strength fades out instead of resetting (3 times as fast as it built up), so a
@@ -223,7 +222,7 @@ trails off and swings round to a new direction over about a fifth of a second
 (100) lasts 10 seconds. It refills at 15 per second while you're not farting. When it runs
 out you stop; let go and press again once there's gas. All of these numbers are in `FartConfig`.
 
-Everyone farting Straight cancels out; everyone farting Left spins the boat on the spot.
+Everyone farting Straight cancels out; everyone farting Left spins the boat left on the spot.
 
 **Seat Cam:** on the river the camera sits behind your seat, so Straight always pushes
 up your screen. It bobs gently with the boat and shakes on hard bumps and splashes.
@@ -244,7 +243,7 @@ no hard speed caps:
 - **Water drag** pulls its speed toward the water's own speed. It's gentle at low speed,
   so a boat glides on for a few seconds after the crew stops, and grows with speed, so a
   boat levels off smoothly at its top speed: one rider at full strength cruises a boat of
-  `REFERENCE_MASS` at about 30 studs/s (`WaterConfig.TOP_SPEED`). The same drag acting
+  `REFERENCE_MASS` at about 24 studs/s (`WaterConfig.TOP_SPEED`). The same drag acting
   round the rim slows its spinning, times `WaterConfig.SPIN_DRAG_SCALE` (raise it for less
   spin from Left and Right).
 - **Currents** carry it along, and **rapids** shove and twist it around at random.
@@ -261,12 +260,12 @@ With the test kit's boats and one rider:
 
 | Boat | Weight (boat + rider) | Holding Straight: speed after 1 s / 3 s | Holding Left: spin after 1 s / 2 s | Tapping Left for 0.3 s: turns |
 | ---- | ---- | ---- | ---- | ---- |
-| 1 seat | 74 + 14 | 14 / 29 studs/s | 72 / 100 °/s | 20° |
-| 2 seats | 97 + 14 | 11 / 25 | 49 / 69 | 14° |
-| 3 seats | 121 + 14 | 9 / 22 | 35 / 50 | 10° |
-| 4 seats | 146 + 14 | 8 / 20 | 27 / 38 | 7° |
-| 5 seats | 173 + 14 | 7 / 18 | 21 / 30 | 6° |
-| 6 seats | 200 + 14 | 6 / 16 | 17 / 24 | 4° |
+| 1 seat | 74 + 14 | 10 / 23 studs/s | 43 / 61 °/s | 11° |
+| 2 seats | 97 + 14 | 8 / 20 | 29 / 41 | 7° |
+| 3 seats | 121 + 14 | 6 / 17 | 21 / 30 | 5° |
+| 4 seats | 146 + 14 | 5 / 15 | 16 / 22 | 4° |
+| 5 seats | 173 + 14 | 5 / 13 | 12 / 18 | 3° |
+| 6 seats | 200 + 14 | 4 / 12 | 10 / 14 | 2° |
 
 To make a boat nimbler or heavier, change its parts (their size and Material set how
 much they weigh). Fart strength is in `FartConfig`; water feel (drag, spin drag, bobbing,

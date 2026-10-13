@@ -2,19 +2,20 @@
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.FartConfig
 
 local FartConfig = {
-	-- A fart is a push on the boat, applied where the rider sits: Straight pushes it the way
-	-- the rider faces, Left to their left and Right to their right. The boat moves the way
-	-- real physics says (the Hull class): a push through its middle just moves it, and a
-	-- push off to one side also spins it.
+	-- A fart is a jet at the rider's seat: the gas goes one way and pushes the boat the
+	-- other. Straight farts behind the rider, pushing the boat the way they face. Left
+	-- farts out to the rider's left, pushing their side of the boat right, so the boat
+	-- spins left (counter-clockwise); Right is the mirror image. The boat moves the way
+	-- real physics says (the Hull class).
 
 	-- Strength. Holding a fart key pushes with a strength that builds up the longer you
 	-- keep farting, up to a maximum. Switching direction keeps it built up, and after you
 	-- let go it fades instead of resetting, so a quick re-press picks up close to where you
 	-- left off. Strengths are in studs/s²: how much speed a fart adds every second to a
 	-- boat weighing REFERENCE_MASS. Heavier boats speed up slower, lighter ones faster.
-	PUSH_ACCELERATION = 18, -- when a fart starts
-	PUSH_ACCELERATION_GAIN = 12, -- added for every second you keep farting
-	MAX_PUSH_ACCELERATION = 45, -- reached after 2.25 seconds of farting
+	PUSH_ACCELERATION = 12, -- when a fart starts
+	PUSH_ACCELERATION_GAIN = 8, -- added for every second you keep farting
+	MAX_PUSH_ACCELERATION = 30, -- reached after 2.25 seconds of farting
 	REFERENCE_MASS = 89, -- the test kit's one-seat boat with its rider aboard
 	RAMP_DECAY = 3, -- after you let go, built-up strength fades this many times faster than it built up
 	PUSH_RESPONSE_TIME = 0.2, -- a fart eases in, out and round to a new direction, most of the way in this many seconds
@@ -29,7 +30,7 @@ local FartConfig = {
 
 	-- Effects. They grow with the fart's strength, from when it starts to full acceleration.
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
-	GAS_ANGLE = math.rad(90), -- how far round from straight back the gas comes out on a Left/Right fart
+	GAS_ANGLE = math.rad(90), -- how far round from straight back the gas comes out on a Left/Right fart (90 = straight out the side)
 	MIN_PARTICLE_RATE = 20, -- particles per second when a fart starts...
 	MAX_PARTICLE_RATE = 60, -- ...and at full acceleration
 	MAX_PARTICLE_SPEED_MULTIPLIER = 2.5, -- the cloud's Speed is multiplied by up to this at full acceleration

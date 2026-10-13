@@ -2418,7 +2418,7 @@ local MIN_OUTPUT = 0.01 -- a fart that has eased below this (studs/s²) has fini
 -- It eases toward what their fart is aimed to do.
 type Output = {
 	Forward: number,
-	Left: number,
+	Right: number,
 }
 
 -- How far something easing with `responseTime` (see FartConfig) moves toward its
@@ -2565,7 +2565,7 @@ function FartServiceServer.GetFartForces(self: FartServiceServer, boat: Boat.Boa
 		if output and seat then
 			table.insert(forces, {
 				Position = seat.Position,
-				Force = FartPhysics.GetForce(boatPosition, seat.CFrame, output.Forward, output.Left),
+				Force = FartPhysics.GetForce(boatPosition, seat.CFrame, output.Forward, output.Right),
 			})
 		end
 	end
@@ -2586,13 +2586,13 @@ function FartServiceServer.UpdateOutput(
 		if not direction then
 			return
 		end
-		output = { Forward = 0, Left = 0 }
+		output = { Forward = 0, Right = 0 }
 		self.Outputs[player] = output
 	end
-	local forward, left = FartPhysics.GetOutput(direction, rampTime)
+	local forward, right = FartPhysics.GetOutput(direction, rampTime)
 	output.Forward += (forward - output.Forward) * blend
-	output.Left += (left - output.Left) * blend
-	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Left) < MIN_OUTPUT
+	output.Right += (right - output.Right) * blend
+	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Right) < MIN_OUTPUT
 	if not direction and hasFinished then
 		self.Outputs[player] = nil
 	end
@@ -3044,19 +3044,20 @@ return DockConfig
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.FartConfig
 
 local FartConfig = {
-	-- A fart is a push on the boat, applied where the rider sits: Straight pushes it the way
-	-- the rider faces, Left to their left and Right to their right. The boat moves the way
-	-- real physics says (the Hull class): a push through its middle just moves it, and a
-	-- push off to one side also spins it.
+	-- A fart is a jet at the rider's seat: the gas goes one way and pushes the boat the
+	-- other. Straight farts behind the rider, pushing the boat the way they face. Left
+	-- farts out to the rider's left, pushing their side of the boat right, so the boat
+	-- spins left (counter-clockwise); Right is the mirror image. The boat moves the way
+	-- real physics says (the Hull class).
 
 	-- Strength. Holding a fart key pushes with a strength that builds up the longer you
 	-- keep farting, up to a maximum. Switching direction keeps it built up, and after you
 	-- let go it fades instead of resetting, so a quick re-press picks up close to where you
 	-- left off. Strengths are in studs/s²: how much speed a fart adds every second to a
 	-- boat weighing REFERENCE_MASS. Heavier boats speed up slower, lighter ones faster.
-	PUSH_ACCELERATION = 18, -- when a fart starts
-	PUSH_ACCELERATION_GAIN = 12, -- added for every second you keep farting
-	MAX_PUSH_ACCELERATION = 45, -- reached after 2.25 seconds of farting
+	PUSH_ACCELERATION = 12, -- when a fart starts
+	PUSH_ACCELERATION_GAIN = 8, -- added for every second you keep farting
+	MAX_PUSH_ACCELERATION = 30, -- reached after 2.25 seconds of farting
 	REFERENCE_MASS = 89, -- the test kit's one-seat boat with its rider aboard
 	RAMP_DECAY = 3, -- after you let go, built-up strength fades this many times faster than it built up
 	PUSH_RESPONSE_TIME = 0.2, -- a fart eases in, out and round to a new direction, most of the way in this many seconds
@@ -3071,7 +3072,7 @@ local FartConfig = {
 
 	-- Effects. They grow with the fart's strength, from when it starts to full acceleration.
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
-	GAS_ANGLE = math.rad(90), -- how far round from straight back the gas comes out on a Left/Right fart
+	GAS_ANGLE = math.rad(90), -- how far round from straight back the gas comes out on a Left/Right fart (90 = straight out the side)
 	MIN_PARTICLE_RATE = 20, -- particles per second when a fart starts...
 	MAX_PARTICLE_RATE = 60, -- ...and at full acceleration
 	MAX_PARTICLE_SPEED_MULTIPLIER = 2.5, -- the cloud's Speed is multiplied by up to this at full acceleration
@@ -3119,10 +3120,10 @@ local WaterConfig = {
 	-- drag that grows with speed, so a boat levels off smoothly at its top speed instead
 	-- of hitting a limit.
 	GLIDE_DRAG = 0.5, -- per second
-	TOP_SPEED = 30, -- studs/s one rider pushing at full strength levels a boat of FartConfig.REFERENCE_MASS off at
+	TOP_SPEED = 24, -- studs/s one rider pushing at full strength levels a boat of FartConfig.REFERENCE_MASS off at
 	-- Spinning is slowed by the same water drag acting round the boat's rim, times this
 	-- (the hull and the riders' legs churn the water as it spins). Higher = less spin.
-	SPIN_DRAG_SCALE = 8,
+	SPIN_DRAG_SCALE = 10,
 	AIR_DRAG = 0.15, -- out of the water, drag is this fraction of the water's
 
 	-- Floating. The water holds a boat up at the surface like a soft spring, so it bobs on
@@ -3691,15 +3692,17 @@ return DockServiceShared
 -- is its "ramp time": it rises while the player farts, in any direction, and falls
 -- RAMP_DECAY times as fast once they stop.
 --
--- Direction: a fart is a push on the boat at the rider's seat, like a jet. Riders face
--- the middle of the boat. "Straight" pushes the boat the way the rider faces, "Left" to
--- their left and "Right" to their right. Where it pushes matters (the Hull class does
--- the physics): Straight pushes through the middle of the boat, so it only moves it;
--- Left and Right push across the edge, so they move it and spin it too. Everyone on a
--- ring farting Straight cancels out, and everyone farting Left spins it on the spot.
+-- Direction: a fart is a jet at the rider's seat. The gas goes one way and pushes the
+-- boat the opposite way. Riders face the middle of the boat. "Straight" farts behind the
+-- rider, pushing the boat the way they face, through its middle, so it only moves it.
+-- "Left" farts out to the rider's left, pushing their side of the boat to the right;
+-- since they sit at the edge, that spins the boat left (counter-clockwise seen from
+-- above) and nudges it right. "Right" is the mirror image. The Hull class does the
+-- physics. Everyone on a ring farting Straight cancels out, and everyone farting Left
+-- spins it left on the spot.
 --
 -- What a fart does is worked out in the rider's own terms (GetOutput): forward and
--- leftward push. FartService eases each rider's output toward that, then GetForce turns
+-- rightward push. FartService eases each rider's output toward that, then GetForce turns
 -- it into a force on the boat.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -3751,27 +3754,28 @@ end
 -- What a fart in `direction` (nil when not farting) pushes after `rampTime` seconds of
 -- build-up, in the rider's own terms (studs/s² on a boat of FartConfig.REFERENCE_MASS):
 --   forward   the way the rider faces
---   left      to the rider's left (negative is to their right)
+--   right     to the rider's right (negative is to their left)
 function FartPhysics.GetOutput(direction: Direction?, rampTime: number): (number, number)
 	if not direction then
 		return 0, 0
 	end
-	-- The gas goes out the opposite way, behind or beside the rider.
 	local pushAcceleration = FartPhysics.GetPushAcceleration(rampTime)
 	if direction == "Straight" then
+		-- Gas out behind the rider pushes the boat forward.
 		return pushAcceleration, 0
 	elseif direction == "Left" then
+		-- Gas out to the rider's left pushes the boat to their right.
 		return 0, pushAcceleration
 	end
 	return 0, -pushAcceleration
 end
 
--- A rider's `forward` and `left` push (see GetOutput) from `seatCFrame`, as a force on
+-- A rider's `forward` and `right` push (see GetOutput) from `seatCFrame`, as a force on
 -- the boat in world space (Roblox force units).
-function FartPhysics.GetForce(boatPosition: Vector3, seatCFrame: CFrame, forward: number, left: number): Vector3
+function FartPhysics.GetForce(boatPosition: Vector3, seatCFrame: CFrame, forward: number, right: number): Vector3
 	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame)
-	local leftward = Vector3.yAxis:Cross(facing) -- the rider's left hand
-	return (facing * forward + leftward * left) * FartConfig.REFERENCE_MASS
+	local rightward = facing:Cross(Vector3.yAxis) -- the rider's right hand
+	return (facing * forward + rightward * right) * FartConfig.REFERENCE_MASS
 end
 
 return FartPhysics
@@ -3868,14 +3872,14 @@ local function IsRiding(): boolean
 	return boatModel ~= nil and boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) == "Launched"
 end
 
--- Which way the gas comes out, turned from straight behind the rider: the opposite way
--- to the push. A Left fart pushes the boat left, so its gas goes out to the right (a
--- positive turn of the butt attachment points its back toward the rider's right).
+-- Which way the gas comes out, turned from straight behind the rider: a Left fart goes
+-- out to the rider's left (a negative turn of the butt attachment points its back toward
+-- their left), a Right fart to their right.
 local function GetGasAngle(direction: string): number
 	if direction == "Left" then
-		return FartConfig.GAS_ANGLE
-	elseif direction == "Right" then
 		return -FartConfig.GAS_ANGLE
+	elseif direction == "Right" then
+		return FartConfig.GAS_ANGLE
 	end
 	return 0
 end
