@@ -46,6 +46,14 @@ local BoatConfig = {
 	CLEANUP_INTERVAL = 1, -- seconds between checks for removed boats to forget
 	WIPE_DELAY = 1.5, -- seconds a boat that fell off the river hangs frozen before its crew respawns
 
+	-- Turning. A boat turns around whoever is turning it (the middle of the riders farting
+	-- Left/Right), so a lone rider's boat swings round them like a steered boat instead of
+	-- flinging them round its middle. When nobody turns it any more, it goes back to
+	-- turning around its own middle.
+	TURN_PIVOT_RESPONSE_TIME = 0.4, -- seconds for where it turns around to move most of the way (63%)
+	KEEL_GRIP = 0.8, -- how much a boat's motion swings round with it as it turns: 1 carves
+	-- like it's on rails, 0 slides on the old way like it's on ice
+
 	-- Tilting. A boat on the river rocks with the waves and leans away from the way it's
 	-- speeding up or turning (its far side lifts when it surges forward, and it heels over
 	-- in a turn or when it hits something), then rights itself.

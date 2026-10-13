@@ -32,7 +32,6 @@ local MIN_OUTPUT = 0.01 -- a fart that has eased below this (studs/s² or rad/s�
 -- It eases toward what their fart is aimed to do.
 type Output = {
 	Forward: number,
-	Side: number,
 	Turn: number,
 }
 
@@ -168,23 +167,31 @@ end
 
 -- How hard `boat`'s crew is farting right now, all added up: the push in studs/s² and
 -- the turn in rad/s² (positive turns left). This is the raw push from the farts; the
--- boat's size decides how much it moves (see the Hull class).
-function FartServiceServer.GetThrust(self: FartServiceServer, boat: Boat.Boat): (Vector3, number)
+-- boat's size decides how much it moves (see the Hull class). Also where the boat
+-- turns around: the middle of the riders who are turning it, each counted by how hard
+-- they're turning (nil when nobody is).
+function FartServiceServer.GetThrust(self: FartServiceServer, boat: Boat.Boat): (Vector3, number, Vector3?)
 	local totalPush = Vector3.zero
 	local totalTurn = 0
 	if not boat:IsFloating() then
-		return totalPush, totalTurn
+		return totalPush, totalTurn, nil
 	end
 	local boatPosition = boat:GetPosition()
+	local pivotSum = Vector3.zero
+	local pivotWeight = 0
 	for _, player in boat.Crew do
 		local output = self.Outputs[player]
 		local seat = if output then boat:GetSeatOf(player) else nil
 		if output and seat then
-			totalPush += FartPhysics.GetPush(boatPosition, seat.CFrame, output.Forward, output.Side)
+			totalPush += FartPhysics.GetPush(boatPosition, seat.CFrame, output.Forward)
 			totalTurn += output.Turn
+			local weight = math.abs(output.Turn)
+			pivotSum += seat.Position * weight
+			pivotWeight += weight
 		end
 	end
-	return totalPush, totalTurn
+	local turnPivot = if pivotWeight > MIN_OUTPUT then pivotSum / pivotWeight else nil
+	return totalPush, totalTurn, turnPivot
 end
 
 -- Eases `player`'s fart output toward what a fart in `direction` (nil when they're not
@@ -202,16 +209,13 @@ function FartServiceServer.UpdateOutput(
 		if not direction then
 			return
 		end
-		output = { Forward = 0, Side = 0, Turn = 0 }
+		output = { Forward = 0, Turn = 0 }
 		self.Outputs[player] = output
 	end
-	local forward, side, turn = FartPhysics.GetOutput(direction, rampTime)
+	local forward, turn = FartPhysics.GetOutput(direction, rampTime)
 	output.Forward += (forward - output.Forward) * pushBlend
-	output.Side += (side - output.Side) * pushBlend
 	output.Turn += (turn - output.Turn) * turnBlend
-	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT
-		and math.abs(output.Side) < MIN_OUTPUT
-		and math.abs(output.Turn) < MIN_OUTPUT
+	local hasFinished = math.abs(output.Forward) < MIN_OUTPUT and math.abs(output.Turn) < MIN_OUTPUT
 	if not direction and hasFinished then
 		self.Outputs[player] = nil
 	end

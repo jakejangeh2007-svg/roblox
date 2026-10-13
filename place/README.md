@@ -233,6 +233,11 @@ which WaterService steps every frame on the server. It works out the boat's whol
 velocity in one go, so nothing fights over it and there are no hard speed caps:
 
 - **Farts** push and turn it, scaled by its size's **handling** (`BoatConfig.HANDLING`).
+- It **turns around whoever is turning it**, so a lone rider's boat swings round them like
+  a steered boat, and its motion **carves round with the turn** (`BoatConfig.KEEL_GRIP`)
+  instead of sliding on the old way. Holding `W` then pressing `A` curves you left and
+  keeps you moving forward. When nobody turns it any more, it goes back to turning around
+  its middle.
 - **Water drag** pulls its speed toward the water's own speed. It's gentle at low speed,
   so a boat glides on for a few seconds after the crew stops, and grows with speed, so a
   boat levels off smoothly at its top speed: one rider at full strength cruises at about

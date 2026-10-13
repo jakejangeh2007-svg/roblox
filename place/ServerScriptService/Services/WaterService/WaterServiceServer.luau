@@ -151,8 +151,8 @@ function WaterServiceServer.Update(self: WaterServiceServer, deltaTime: number)
 			BoatServiceServer:WipeBoat(boat)
 			continue
 		end
-		local thrust, turn = FartServiceServer:GetThrust(boat)
-		hull:Step(water, thrust, turn, stepTime)
+		local thrust, turn, turnPivot = FartServiceServer:GetThrust(boat)
+		hull:Step(water, thrust, turn, turnPivot, stepTime)
 	end
 end
 
