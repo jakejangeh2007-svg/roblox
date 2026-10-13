@@ -17,6 +17,30 @@ whenever the code changes. Ctrl+Z undoes it.
 one script; its first comment line says which instance. `X.server.luau` is a Script,
 `X.client.luau` a LocalScript, anything else a ModuleScript.
 
+## Test kit (temporary)
+
+To playtest before the real map, boats and menus exist:
+
+1. Run `Install.luau` first (the Server script needs its test kit hook).
+2. Copy all of [`TestKit/InstallTestKit.luau`](TestKit/InstallTestKit.luau), paste it into the
+   Command Bar and press Enter. It adds one ModuleScript: `ServerScriptService.TestKit`.
+3. Press **Play**. Every playtest now builds a grey-box test world at runtime (it's gone
+   when you stop): a lobby and every checkpoint with docks, ponds joined by rivers
+   without walls, currents, rocks, the finish, boat templates `Boat1`–`Boat6`, a fart
+   cloud and a placeholder sound. Your own `Workspace.Map` is set aside for the playtest,
+   and your own boat templates and effects are used if you've made them.
+4. In the test world:
+   - **E** at a dock's pier spawns a boat with that dock's number of seats (dock 1 = 1 seat).
+   - Walk into a seat. The boat leaves after the 30 second timer, or press **F** next to
+     it to start early (party leader only, sitting in the boat).
+   - Fart with **A / W / D** (or the arrow keys). Fall off a river to test wiping.
+   - **E** at the yellow posts on each platform teleports there, once unlocked.
+   - Anything that didn't work is explained in Output, starting with `[TestKit]`.
+5. Use **Test → Clients and Servers** with 2+ players to test together.
+
+**When you're done testing, delete `ServerScriptService.TestKit`.** Nothing else changes.
+The test kit is the only code here that builds parts and prompts at runtime.
+
 ## Hierarchy
 
 ```

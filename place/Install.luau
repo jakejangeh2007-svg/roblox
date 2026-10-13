@@ -141,6 +141,14 @@ local function StartServices()
 	end
 end
 
+-- TEST ONLY: if a TestKit ModuleScript is here, it builds a grey-box test world before
+-- the services start. Deleting the TestKit module turns this off.
+local testKit = ServerScriptService:FindFirstChild("TestKit")
+if testKit and testKit:IsA("ModuleScript") then
+	local TestKit = require(testKit) :: any
+	TestKit.Build()
+end
+
 StartServices()
 
 -- Services listed in START_MANUALLY start here, in order. For example:
