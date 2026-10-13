@@ -91,7 +91,8 @@ To playtest before the real map, boats and menus exist:
 2. Press **Play**. Every playtest now builds a grey-box test world at runtime (it's gone
    when you stop): a lobby and every checkpoint with docks, ponds joined by rivers
    without walls, currents, rocks, the finish, boat templates `Boat1`–`Boat6`, a fart
-   cloud and a placeholder sound. Your own `Workspace.Map` is set aside for the playtest,
+   cloud, a placeholder sound and a gas meter at the bottom of the screen. Your own
+   `Workspace.Map` is set aside for the playtest,
    and your own boat templates and effects are used if you've made them.
 3. In the test world:
    - **E** at a dock's pier spawns a boat with that dock's number of seats (dock 1 = 1 seat).
@@ -201,11 +202,13 @@ Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`
 | Straight | `W`, `↑`, `Space` | `RT` | pushes the boat away from you |
 | Right | `D`, `→`, `E` | `RB` | turns the boat right |
 
-**Hold a key to keep farting.** The push starts at 1× and grows to 2.5× over 3 seconds of
-nonstop farting. Letting go stops, and the next fart starts at 1× again. If you hold two
-keys, the one you pressed last wins.
+**Hold a key to keep farting.** A fart speeds the boat up at a set acceleration
+(18 studs/s² to start) that grows by a set amount every second you keep going (+12 per
+second), up to 45. Turning works the same way. Farting can't push a boat past a top speed
+of 30 studs/s or a top turn speed of about 140° a second. Letting go stops, and the next
+fart starts from the beginning again. If you hold two keys, the one you pressed last wins.
 
-**Gas** drains at a flat 10 per second while you fart, whatever the power, so a full tank
+**Gas** drains at a flat 10 per second while you fart, however long you've been going, so a full tank
 (100) lasts 10 seconds. It refills at 15 per second while you're not farting. When it runs
 out you stop; let go and press again once there's gas. All of these numbers are in `FartConfig`.
 
@@ -302,7 +305,7 @@ The client halves have everything the menus need:
 | Teleport | `CheckpointServiceClient:RequestTeleport(id)` → `(success, message)`; the lobby's id is `CheckpointConfig.LOBBY_ID` |
 | List changed | `CheckpointServiceClient.UnlockedCheckpointsChanged` |
 | "Checkpoint reached" / "You win" | `CheckpointServiceClient.CheckpointReached`, `CheckpointServiceClient.GameCompleted` |
-| Gas meter | the player's `Gas` attribute, 0 to `FartConfig.GAS_MAX` |
+| Gas meter | done: `UI.HUD.GasMeter` fills `StarterGui.HUD.GasMeter.Fill` (a Frame whose width shows the gas left). Build that by hand when you make the real HUD; the test kit makes a stand-in until then |
 | Touch fart buttons | call `FartServiceClient:PressFart(direction)` on press and `ReleaseFart(direction)` on release (`"Left"`, `"Straight"`, `"Right"`) |
 | Farting on and off (e.g. button glow) | `FartServiceClient.FartStarted` (direction) and `FartStopped` |
 | RIP screen | `BoatServiceClient.BoatWiped` |

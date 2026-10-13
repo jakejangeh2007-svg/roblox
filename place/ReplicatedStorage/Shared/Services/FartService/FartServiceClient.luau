@@ -2,8 +2,8 @@
 -- ModuleScript: ReplicatedStorage.Shared.Services.FartService.FartServiceClient
 --
 -- The client half of FartService: turns key and controller presses into farting, and
--- plays everyone's fart effects. Hold a key to keep farting; its power grows the
--- longer you hold it (FartPhysics.GetPower), and letting go stops. If you hold two
+-- plays everyone's fart effects. Hold a key to keep farting; its push grows the
+-- longer you hold it (FartPhysics.GetThrust), and letting go stops. If you hold two
 -- keys, the one you pressed last wins. Your own fart starts the moment you press, so
 -- it feels instant; the server still decides whether the boat moves.
 --
@@ -16,7 +16,7 @@
 --
 -- Asset contract:
 --   ReplicatedStorage.Assets.VFX.FartCloud      ParticleEmitter: the gas cloud. While farting, its
---                                               Rate and Speed are set from fart power.
+--                                               Rate and Speed grow with the fart.
 --   ReplicatedStorage.Assets.Sounds.Farts       Folder of Sounds; each fart loops one at random
 
 local ContextActionService = game:GetService("ContextActionService")
@@ -48,7 +48,7 @@ local localPlayer = Players.LocalPlayer
 -- One player's fart that's happening right now, and its effects.
 type Stream = {
 	Direction: string,
-	StartedAt: number, -- os.clock() when it started, for its power
+	StartedAt: number, -- os.clock() when it started, for how much it has grown
 	Emitter: ParticleEmitter?,
 	Sound: Sound?,
 	BasePitch: number,
@@ -243,7 +243,7 @@ function FartServiceClient.SetLocalDirection(self: FartServiceClient, direction:
 	end
 end
 
--- Every frame: grow each fart's effects with its power, and stop the local fart if
+-- Every frame: grow each fart's effects as the fart grows, and stop the local fart if
 -- the player ran out of gas or isn't riding any more.
 function FartServiceClient.Update(self: FartServiceClient)
 	if self.LocalDirection and (GetLocalGas() <= 0 or not IsRiding()) then
@@ -252,26 +252,25 @@ function FartServiceClient.Update(self: FartServiceClient)
 	end
 
 	local now = os.clock()
-	local powerRange = FartConfig.MAX_POWER - FartConfig.MIN_POWER
 	for player, stream in self.Streams do
 		if not player.Parent then
 			self:StopStream(player)
 			continue
 		end
-		local power = FartPhysics.GetPower(now - stream.StartedAt)
-		local powerProgress = if powerRange > 0 then (power - FartConfig.MIN_POWER) / powerRange else 1
+		local progress = FartPhysics.GetRampProgress(now - stream.StartedAt)
 		local emitter = stream.Emitter
 		local template = self.FartCloudTemplate
 		if emitter and template then
-			emitter.Rate = FartConfig.STREAM_PARTICLE_RATE * power
-			emitter.Speed = NumberRange.new(template.Speed.Min * power, template.Speed.Max * power)
+			local speedMultiplier = 1 + (FartConfig.MAX_PARTICLE_SPEED_MULTIPLIER - 1) * progress
+			emitter.Rate = FartConfig.MIN_PARTICLE_RATE
+				+ (FartConfig.MAX_PARTICLE_RATE - FartConfig.MIN_PARTICLE_RATE) * progress
+			emitter.Speed = NumberRange.new(template.Speed.Min * speedMultiplier, template.Speed.Max * speedMultiplier)
 		end
 		local sound = stream.Sound
 		if sound then
-			sound.PlaybackSpeed = stream.BasePitch
-				* (1 + (power - FartConfig.MIN_POWER) * FartConfig.PITCH_RISE_PER_POWER)
+			sound.PlaybackSpeed = stream.BasePitch * (1 + FartConfig.PITCH_RISE * progress)
 			sound.Volume = FartConfig.STREAM_VOLUME
-				+ (FartConfig.MAX_STREAM_VOLUME - FartConfig.STREAM_VOLUME) * powerProgress
+				+ (FartConfig.MAX_STREAM_VOLUME - FartConfig.STREAM_VOLUME) * progress
 		end
 	end
 end

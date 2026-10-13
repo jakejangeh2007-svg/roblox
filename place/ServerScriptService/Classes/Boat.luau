@@ -406,6 +406,25 @@ function Boat.AddVelocity(self: Boat, push: Vector3, spin: number)
 	primaryPart.AssemblyAngularVelocity += Vector3.yAxis * spin
 end
 
+-- Caps the boat's speed across the water and its turn speed. FartService calls this
+-- after pushing, so farting can't go past them (currents and falling aren't capped).
+function Boat.LimitSpeed(self: Boat, maxSpeed: number, maxSpinSpeed: number)
+	local primaryPart = self.Model.PrimaryPart
+	if not primaryPart or not self:IsFloating() then
+		return
+	end
+	local velocity = primaryPart.AssemblyLinearVelocity
+	local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+	if flatVelocity.Magnitude > maxSpeed then
+		local cappedVelocity = flatVelocity.Unit * maxSpeed
+		primaryPart.AssemblyLinearVelocity = Vector3.new(cappedVelocity.X, velocity.Y, cappedVelocity.Z)
+	end
+	local spin = primaryPart.AssemblyAngularVelocity
+	if math.abs(spin.Y) > maxSpinSpeed then
+		primaryPart.AssemblyAngularVelocity = Vector3.new(spin.X, math.sign(spin.Y) * maxSpinSpeed, spin.Z)
+	end
+end
+
 -- Holds the boat still in mid-air (after falling off the river) until it's removed.
 function Boat.Freeze(self: Boat)
 	self.Frozen = true

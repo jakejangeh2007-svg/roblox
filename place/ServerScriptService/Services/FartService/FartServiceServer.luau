@@ -3,16 +3,18 @@
 --
 -- Runs every player's farting. A client asks to start farting in a direction (or to
 -- stop); this checks they're riding a boat on the river and have gas, then pushes
--- their boat every frame until they stop, run out of gas or leave the boat. Power
--- grows the longer they keep farting (FartPhysics.GetPower). Gas drains at a flat
--- rate while farting and refills while not. Other players are told when someone
--- starts or stops, so they can show it.
+-- their boat every frame until they stop, run out of gas or leave the boat. The push
+-- grows the longer they keep farting (FartPhysics.GetThrust), and farting can't push a
+-- boat past FartConfig.MAX_SPEED or MAX_SPIN_SPEED. Gas drains at a flat rate while
+-- farting and refills while not. Other players are told when someone starts or stops,
+-- so they can show it.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
+local Boat = require(ServerScriptService.Classes.Boat)
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
@@ -24,7 +26,7 @@ local SERVICE_NAME = FartServiceShared.SERVICE_NAME
 
 type Stream = {
 	Direction: FartPhysics.Direction,
-	StartedAt: number, -- os.clock() when this fart started, for its power
+	StartedAt: number, -- os.clock() when this fart started, for how much it has grown
 }
 
 local FartServiceServer = {}
@@ -128,6 +130,7 @@ end
 
 function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 	local now = os.clock()
+	local pushedBoats: { [Boat.Boat]: boolean } = {}
 	for player, stream in self.Streams do
 		local boat = BoatServiceServer:GetLaunchedBoatOf(player)
 		local seat = if boat then boat:GetSeatOf(player) else nil
@@ -137,13 +140,17 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 			continue
 		end
 
-		local power = FartPhysics.GetPower(now - stream.StartedAt)
-		local thrust, spin = FartPhysics.GetThrust(boat:GetPosition(), seat.CFrame, stream.Direction, power)
+		local thrust, spin =
+			FartPhysics.GetThrust(boat:GetPosition(), seat.CFrame, stream.Direction, now - stream.StartedAt)
 		local seatCount = #boat.Seats
 		thrust *= BoatConfig.PUSH_SCALES[seatCount] or 1
 		spin *= BoatConfig.SPIN_SCALES[seatCount] or 1
 		boat:AddVelocity(thrust * deltaTime, spin * deltaTime)
+		pushedBoats[boat] = true
 		self:SetGas(player, math.max(0, gas - FartConfig.GAS_DRAIN * deltaTime))
+	end
+	for boat in pushedBoats do
+		boat:LimitSpeed(FartConfig.MAX_SPEED, FartConfig.MAX_SPIN_SPEED)
 	end
 
 	for player, gas in self.Gas do

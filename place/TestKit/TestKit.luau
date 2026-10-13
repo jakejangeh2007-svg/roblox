@@ -11,6 +11,8 @@
 --   - Ponds joined by rivers without walls (Current and Rapids), a few rocks and the finish.
 --   - Round boat templates Boat1-Boat6, a fart cloud and a placeholder fart sound, but only
 --     where you haven't made your own yet.
+--   - A stand-in gas meter at the bottom middle of the screen (StarterGui.HUD, with the names
+--     the UI.HUD.GasMeter module looks for), unless you've built your own HUD.
 -- If Workspace.Map already exists, it's moved to ServerStorage for this playtest only.
 --
 -- Because there's no UI yet, the test world uses ProximityPrompts instead:
@@ -22,6 +24,7 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local ServerStorage = game:GetService("ServerStorage")
+local StarterGui = game:GetService("StarterGui")
 
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
@@ -29,6 +32,7 @@ local CheckpointConfig = require(ReplicatedStorage.Shared.Modules.Game.Checkpoin
 local CheckpointServiceServer = require(ServerScriptService.Services.CheckpointService.CheckpointServiceServer)
 local DockServiceServer = require(ServerScriptService.Services.DockService.DockServiceServer)
 local DockServiceShared = require(ReplicatedStorage.Shared.Services.DockService.DockServiceShared)
+local GasMeter = require(ReplicatedStorage.UI.HUD.GasMeter)
 
 local WATER_Y = 100 -- height of the water surface; high up, so boats that fall off fall far
 local POND_LENGTH = 140
@@ -413,9 +417,56 @@ local function BuildAssets()
 	GetOrMakeFolder(workspace, "Boats")
 end
 
+-- A plain gas meter, bottom middle, sized with Scale only.
+local function BuildGasMeter()
+	if StarterGui:FindFirstChild(GasMeter.HUD_NAME) then
+		return -- your own HUD wins
+	end
+	local hud = Instance.new("ScreenGui")
+	hud.Name = GasMeter.HUD_NAME
+	hud.ResetOnSpawn = false
+
+	local meter = Instance.new("Frame")
+	meter.Name = GasMeter.GAS_METER_NAME
+	meter.AnchorPoint = Vector2.new(0.5, 1)
+	meter.Position = UDim2.fromScale(0.5, 0.96)
+	meter.Size = UDim2.fromScale(0.3, 0.035)
+	meter.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+	meter.BorderSizePixel = 0
+	meter.Parent = hud
+
+	local fill = Instance.new("Frame")
+	fill.Name = GasMeter.FILL_NAME
+	fill.Size = UDim2.fromScale(1, 1)
+	fill.BackgroundColor3 = Color3.fromRGB(150, 210, 60)
+	fill.BorderSizePixel = 0
+	fill.Parent = meter
+
+	for _, frame in { meter, fill } do
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0.5, 0)
+		corner.Parent = frame
+	end
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.FredokaOne
+	label.Text = "GAS"
+	label.TextScaled = true
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0.4
+	label.ZIndex = 2
+	label.Parent = meter
+
+	hud.Parent = StarterGui
+end
+
 function TestKit.Build()
 	BuildAssets()
 	BuildMap()
+	BuildGasMeter()
 	print(
 		"[TestKit] Test world built. Walk to a dock and press E to spawn a boat, sit in it, then wait for the timer or press F to start. Fart with A / W / D."
 	)

@@ -684,6 +684,25 @@ function Boat.AddVelocity(self: Boat, push: Vector3, spin: number)
 	primaryPart.AssemblyAngularVelocity += Vector3.yAxis * spin
 end
 
+-- Caps the boat's speed across the water and its turn speed. FartService calls this
+-- after pushing, so farting can't go past them (currents and falling aren't capped).
+function Boat.LimitSpeed(self: Boat, maxSpeed: number, maxSpinSpeed: number)
+	local primaryPart = self.Model.PrimaryPart
+	if not primaryPart or not self:IsFloating() then
+		return
+	end
+	local velocity = primaryPart.AssemblyLinearVelocity
+	local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+	if flatVelocity.Magnitude > maxSpeed then
+		local cappedVelocity = flatVelocity.Unit * maxSpeed
+		primaryPart.AssemblyLinearVelocity = Vector3.new(cappedVelocity.X, velocity.Y, cappedVelocity.Z)
+	end
+	local spin = primaryPart.AssemblyAngularVelocity
+	if math.abs(spin.Y) > maxSpinSpeed then
+		primaryPart.AssemblyAngularVelocity = Vector3.new(spin.X, math.sign(spin.Y) * maxSpinSpeed, spin.Z)
+	end
+end
+
 -- Holds the boat still in mid-air (after falling off the river) until it's removed.
 function Boat.Freeze(self: Boat)
 	self.Frozen = true
@@ -979,6 +998,72 @@ StartServices()
 -- The UI starts last, once every client service is ready.
 local UI = require(ReplicatedStorage.UI)
 UI.Init(UI)
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "UI", "HUD" },
+		Name = "GasMeter",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.UI.HUD.GasMeter
+--
+-- Fills the gas meter from the local player's Gas attribute (see FartService). It only
+-- updates the fill's width; the meter itself is built by hand in Studio.
+--
+-- UI contract (built by hand in StarterGui, sized with Scale only):
+--   HUD        ScreenGui
+--     GasMeter   Frame   the meter's background
+--       Fill       Frame   the part that shrinks as gas runs out. Its width (Size X Scale)
+--                          is set to the gas left: 1 when full, 0 when empty.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
+local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
+
+local GasMeter = {
+	HUD_NAME = "HUD",
+	GAS_METER_NAME = "GasMeter",
+	FILL_NAME = "Fill",
+}
+
+type GasMeterMembers = {}
+
+export type GasMeter = typeof(GasMeter) & GasMeterMembers
+
+-- The Fill frame in the local player's HUD, if it's there.
+local function FindFill(): GuiObject?
+	local playerGui = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	local hud = if playerGui then playerGui:FindFirstChild(GasMeter.HUD_NAME) else nil
+	local gasMeter = if hud then hud:FindFirstChild(GasMeter.GAS_METER_NAME) else nil
+	local fill = if gasMeter then gasMeter:FindFirstChild(GasMeter.FILL_NAME) else nil
+	return if fill and fill:IsA("GuiObject") then fill else nil
+end
+
+function GasMeter.Init(self: GasMeter)
+	local localPlayer = Players.LocalPlayer
+
+	local function Refresh()
+		local fill = FindFill()
+		if not fill then
+			return
+		end
+		local gas = localPlayer:GetAttribute(FartServiceShared.GAS_ATTRIBUTE)
+		local fraction = if typeof(gas) == "number" then math.clamp(gas / FartConfig.GAS_MAX, 0, 1) else 0
+		fill.Size = UDim2.fromScale(fraction, fill.Size.Y.Scale)
+	end
+
+	localPlayer:GetAttributeChangedSignal(FartServiceShared.GAS_ATTRIBUTE):Connect(Refresh)
+	-- The HUD is copied into PlayerGui when the character spawns, so refresh when it arrives.
+	task.spawn(function()
+		localPlayer:WaitForChild("PlayerGui").ChildAdded:Connect(Refresh)
+		Refresh()
+	end)
+end
+
+return GasMeter :: GasMeter
 ]==],
 	},
 	{
@@ -2000,16 +2085,18 @@ return DockServiceServer :: DockServiceServer
 --
 -- Runs every player's farting. A client asks to start farting in a direction (or to
 -- stop); this checks they're riding a boat on the river and have gas, then pushes
--- their boat every frame until they stop, run out of gas or leave the boat. Power
--- grows the longer they keep farting (FartPhysics.GetPower). Gas drains at a flat
--- rate while farting and refills while not. Other players are told when someone
--- starts or stops, so they can show it.
+-- their boat every frame until they stop, run out of gas or leave the boat. The push
+-- grows the longer they keep farting (FartPhysics.GetThrust), and farting can't push a
+-- boat past FartConfig.MAX_SPEED or MAX_SPIN_SPEED. Gas drains at a flat rate while
+-- farting and refills while not. Other players are told when someone starts or stops,
+-- so they can show it.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerScriptService = game:GetService("ServerScriptService")
 
+local Boat = require(ServerScriptService.Classes.Boat)
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
@@ -2021,7 +2108,7 @@ local SERVICE_NAME = FartServiceShared.SERVICE_NAME
 
 type Stream = {
 	Direction: FartPhysics.Direction,
-	StartedAt: number, -- os.clock() when this fart started, for its power
+	StartedAt: number, -- os.clock() when this fart started, for how much it has grown
 }
 
 local FartServiceServer = {}
@@ -2125,6 +2212,7 @@ end
 
 function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 	local now = os.clock()
+	local pushedBoats: { [Boat.Boat]: boolean } = {}
 	for player, stream in self.Streams do
 		local boat = BoatServiceServer:GetLaunchedBoatOf(player)
 		local seat = if boat then boat:GetSeatOf(player) else nil
@@ -2134,13 +2222,17 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 			continue
 		end
 
-		local power = FartPhysics.GetPower(now - stream.StartedAt)
-		local thrust, spin = FartPhysics.GetThrust(boat:GetPosition(), seat.CFrame, stream.Direction, power)
+		local thrust, spin =
+			FartPhysics.GetThrust(boat:GetPosition(), seat.CFrame, stream.Direction, now - stream.StartedAt)
 		local seatCount = #boat.Seats
 		thrust *= BoatConfig.PUSH_SCALES[seatCount] or 1
 		spin *= BoatConfig.SPIN_SCALES[seatCount] or 1
 		boat:AddVelocity(thrust * deltaTime, spin * deltaTime)
+		pushedBoats[boat] = true
 		self:SetGas(player, math.max(0, gas - FartConfig.GAS_DRAIN * deltaTime))
+	end
+	for boat in pushedBoats do
+		boat:LimitSpeed(FartConfig.MAX_SPEED, FartConfig.MAX_SPIN_SPEED)
 	end
 
 	for player, gas in self.Gas do
@@ -2509,32 +2601,42 @@ return DockConfig
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.FartConfig
 
 local FartConfig = {
-	-- Push. Holding a fart key farts nonstop. Power starts at MIN_POWER and grows to
-	-- MAX_POWER over POWER_RAMP_TIME seconds of farting; letting go resets it.
-	THRUST = 8, -- studs/s² a Straight fart speeds the boat up by, at power 1
-	SIDE_THRUST = 0.45, -- sideways push of a Left/Right fart, as a fraction of THRUST
-	SPIN_THRUST = 0.7, -- rad/s² a Left/Right fart turns the boat by, at power 1
-	MIN_POWER = 1,
-	MAX_POWER = 2.5,
-	POWER_RAMP_TIME = 3, -- seconds of nonstop farting to reach MAX_POWER
+	-- Pushing. Holding a fart key speeds the boat up at a set acceleration, which grows
+	-- by a set amount every second you keep farting, up to a maximum. Letting go resets it.
+	-- Accelerations are in studs/s²: how much speed a fart adds every second.
+	STRAIGHT_ACCELERATION = 18, -- when a fart starts
+	STRAIGHT_ACCELERATION_GAIN = 12, -- added for every second you keep farting
+	MAX_STRAIGHT_ACCELERATION = 45, -- reached after 2.25 seconds of farting
+	SIDE_PUSH_FRACTION = 0.45, -- a Left/Right fart also pushes sideways at this fraction of the above
+
+	-- Turning, in rad/s² (1 rad is about 57 degrees)
+	SPIN_ACCELERATION = 1.6, -- when a Left/Right fart starts
+	SPIN_ACCELERATION_GAIN = 1.2, -- added for every second you keep farting
+	MAX_SPIN_ACCELERATION = 4, -- reached after 2 seconds of farting
+
+	-- Farting can't push a boat faster than these
+	MAX_SPEED = 30, -- studs/s
+	MAX_SPIN_SPEED = 2.5, -- rad/s (about 140 degrees a second)
 
 	-- Gas meter (each player's is in their "Gas" attribute)
 	GAS_MAX = 100,
-	GAS_DRAIN = 10, -- per second while farting, the same at any power: a full tank lasts 10 seconds
+	GAS_DRAIN = 10, -- per second while farting, the same however long you've farted: a full tank lasts 10 seconds
 	GAS_REGEN = 15, -- per second while not farting
 	MIN_GAS_TO_START = 5, -- below this, pressing a fart key just gives a sad little puff
 	REQUEST_COOLDOWN = 0.1, -- seconds the server waits between accepting start requests from one player
 
-	-- Effects
+	-- Effects. They grow with the fart, from its start to when it reaches full acceleration.
 	BUTT_OFFSET = CFrame.new(0, -1, 0.6), -- where gas comes out, relative to the HumanoidRootPart
 	GAS_ANGLE = math.rad(45), -- how far left or right of straight back the gas comes out on a Left/Right fart
-	STREAM_PARTICLE_RATE = 25, -- particles per second while farting, multiplied by power
-	DUD_PARTICLES = 3, -- the puff when there isn't enough gas
-	STREAM_VOLUME = 0.5, -- sound volume at MIN_POWER...
-	MAX_STREAM_VOLUME = 1, -- ...rising to this at MAX_POWER
+	MIN_PARTICLE_RATE = 20, -- particles per second when a fart starts...
+	MAX_PARTICLE_RATE = 60, -- ...and at full acceleration
+	MAX_PARTICLE_SPEED_MULTIPLIER = 2.5, -- the cloud's Speed is multiplied by up to this at full acceleration
+	STREAM_VOLUME = 0.5, -- sound volume when a fart starts...
+	MAX_STREAM_VOLUME = 1, -- ...and at full acceleration
 	MIN_PITCH = 0.85, -- every fart picks a random starting pitch between these
 	MAX_PITCH = 1.15,
-	PITCH_RISE_PER_POWER = 0.15, -- the pitch rises by this much for each point of power above MIN_POWER
+	PITCH_RISE = 0.25, -- the pitch rises by this fraction by full acceleration
+	DUD_PARTICLES = 3, -- the puff when there isn't enough gas
 	DUD_VOLUME = 0.25,
 	DUD_PITCH = 1.6, -- multiplies the pitch of duds (squeakier)
 	DUD_SOUND_LIFETIME = 3, -- seconds before a dud sound is cleaned up
@@ -3063,6 +3165,9 @@ return DockServiceShared
 -- The rules for what farting does. Pure math, shared by the server (which moves the
 -- boat) and the client (which plays effects that match).
 --
+-- A fart speeds the boat up at a set acceleration that grows by a set amount every
+-- second it keeps going, up to a maximum (all in FartConfig).
+--
 -- Riders face the middle of the boat. "Straight" pushes the boat away from the
 -- rider. "Left" turns the boat left, the same way from every seat, plus a small
 -- sideways push. So with seats spread around the ring, everyone farting Straight
@@ -3081,33 +3186,60 @@ function FartPhysics.IsDirection(value: unknown): boolean
 	return value == "Left" or value == "Straight" or value == "Right"
 end
 
--- A fart's power after `fartingTime` seconds of nonstop farting: MIN_POWER at the
--- start, growing evenly to MAX_POWER after POWER_RAMP_TIME.
-function FartPhysics.GetPower(fartingTime: number): number
-	local progress = math.clamp(fartingTime / FartConfig.POWER_RAMP_TIME, 0, 1)
-	return FartConfig.MIN_POWER + (FartConfig.MAX_POWER - FartConfig.MIN_POWER) * progress
+-- Studs/s² of push after `fartingTime` seconds of nonstop farting.
+function FartPhysics.GetStraightAcceleration(fartingTime: number): number
+	return math.min(
+		FartConfig.MAX_STRAIGHT_ACCELERATION,
+		FartConfig.STRAIGHT_ACCELERATION + FartConfig.STRAIGHT_ACCELERATION_GAIN * fartingTime
+	)
 end
 
--- How fast a fart from `seatCFrame` speeds the boat up (studs/s²) and turns it
--- (rad/s²) at `power`. A positive turn is a LEFT turn (counter-clockwise seen from above).
--- Multiply both by the frame's time to get the change for that frame.
+-- Rad/s² of turn after `fartingTime` seconds of nonstop farting.
+function FartPhysics.GetSpinAcceleration(fartingTime: number): number
+	return math.min(
+		FartConfig.MAX_SPIN_ACCELERATION,
+		FartConfig.SPIN_ACCELERATION + FartConfig.SPIN_ACCELERATION_GAIN * fartingTime
+	)
+end
+
+-- How far a fart has grown: 0 when it starts, 1 once it's at full acceleration.
+-- Used to grow the effects.
+function FartPhysics.GetRampProgress(fartingTime: number): number
+	local range = FartConfig.MAX_STRAIGHT_ACCELERATION - FartConfig.STRAIGHT_ACCELERATION
+	if range <= 0 then
+		return 1
+	end
+	return math.clamp(
+		(FartPhysics.GetStraightAcceleration(fartingTime) - FartConfig.STRAIGHT_ACCELERATION) / range,
+		0,
+		1
+	)
+end
+
+-- How fast a fart from `seatCFrame` speeds the boat up (studs/s²) and turns it (rad/s²)
+-- after `fartingTime` seconds. A positive turn is a LEFT turn (counter-clockwise seen
+-- from above). Multiply both by the frame's time to get the change for that frame.
 function FartPhysics.GetThrust(
 	boatPosition: Vector3,
 	seatCFrame: CFrame,
 	direction: Direction,
-	power: number
+	fartingTime: number
 ): (Vector3, number)
 	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seatCFrame)
 	local right = facing:Cross(Vector3.yAxis) -- the rider's right hand
+	local straightAcceleration = FartPhysics.GetStraightAcceleration(fartingTime)
 
 	if direction == "Straight" then
 		-- Gas goes out behind the rider, so the boat moves away from them.
-		return facing * FartConfig.THRUST * power, 0
-	elseif direction == "Left" then
+		return facing * straightAcceleration, 0
+	end
+	local sidePush = straightAcceleration * FartConfig.SIDE_PUSH_FRACTION
+	local spinAcceleration = FartPhysics.GetSpinAcceleration(fartingTime)
+	if direction == "Left" then
 		-- Like an outboard motor: shove our side right so the far side swings left.
-		return right * FartConfig.THRUST * FartConfig.SIDE_THRUST * power, FartConfig.SPIN_THRUST * power
+		return right * sidePush, spinAcceleration
 	else
-		return -right * FartConfig.THRUST * FartConfig.SIDE_THRUST * power, -FartConfig.SPIN_THRUST * power
+		return -right * sidePush, -spinAcceleration
 	end
 end
 
@@ -3123,8 +3255,8 @@ return FartPhysics
 -- ModuleScript: ReplicatedStorage.Shared.Services.FartService.FartServiceClient
 --
 -- The client half of FartService: turns key and controller presses into farting, and
--- plays everyone's fart effects. Hold a key to keep farting; its power grows the
--- longer you hold it (FartPhysics.GetPower), and letting go stops. If you hold two
+-- plays everyone's fart effects. Hold a key to keep farting; its push grows the
+-- longer you hold it (FartPhysics.GetThrust), and letting go stops. If you hold two
 -- keys, the one you pressed last wins. Your own fart starts the moment you press, so
 -- it feels instant; the server still decides whether the boat moves.
 --
@@ -3137,7 +3269,7 @@ return FartPhysics
 --
 -- Asset contract:
 --   ReplicatedStorage.Assets.VFX.FartCloud      ParticleEmitter: the gas cloud. While farting, its
---                                               Rate and Speed are set from fart power.
+--                                               Rate and Speed grow with the fart.
 --   ReplicatedStorage.Assets.Sounds.Farts       Folder of Sounds; each fart loops one at random
 
 local ContextActionService = game:GetService("ContextActionService")
@@ -3169,7 +3301,7 @@ local localPlayer = Players.LocalPlayer
 -- One player's fart that's happening right now, and its effects.
 type Stream = {
 	Direction: string,
-	StartedAt: number, -- os.clock() when it started, for its power
+	StartedAt: number, -- os.clock() when it started, for how much it has grown
 	Emitter: ParticleEmitter?,
 	Sound: Sound?,
 	BasePitch: number,
@@ -3364,7 +3496,7 @@ function FartServiceClient.SetLocalDirection(self: FartServiceClient, direction:
 	end
 end
 
--- Every frame: grow each fart's effects with its power, and stop the local fart if
+-- Every frame: grow each fart's effects as the fart grows, and stop the local fart if
 -- the player ran out of gas or isn't riding any more.
 function FartServiceClient.Update(self: FartServiceClient)
 	if self.LocalDirection and (GetLocalGas() <= 0 or not IsRiding()) then
@@ -3373,26 +3505,25 @@ function FartServiceClient.Update(self: FartServiceClient)
 	end
 
 	local now = os.clock()
-	local powerRange = FartConfig.MAX_POWER - FartConfig.MIN_POWER
 	for player, stream in self.Streams do
 		if not player.Parent then
 			self:StopStream(player)
 			continue
 		end
-		local power = FartPhysics.GetPower(now - stream.StartedAt)
-		local powerProgress = if powerRange > 0 then (power - FartConfig.MIN_POWER) / powerRange else 1
+		local progress = FartPhysics.GetRampProgress(now - stream.StartedAt)
 		local emitter = stream.Emitter
 		local template = self.FartCloudTemplate
 		if emitter and template then
-			emitter.Rate = FartConfig.STREAM_PARTICLE_RATE * power
-			emitter.Speed = NumberRange.new(template.Speed.Min * power, template.Speed.Max * power)
+			local speedMultiplier = 1 + (FartConfig.MAX_PARTICLE_SPEED_MULTIPLIER - 1) * progress
+			emitter.Rate = FartConfig.MIN_PARTICLE_RATE
+				+ (FartConfig.MAX_PARTICLE_RATE - FartConfig.MIN_PARTICLE_RATE) * progress
+			emitter.Speed = NumberRange.new(template.Speed.Min * speedMultiplier, template.Speed.Max * speedMultiplier)
 		end
 		local sound = stream.Sound
 		if sound then
-			sound.PlaybackSpeed = stream.BasePitch
-				* (1 + (power - FartConfig.MIN_POWER) * FartConfig.PITCH_RISE_PER_POWER)
+			sound.PlaybackSpeed = stream.BasePitch * (1 + FartConfig.PITCH_RISE * progress)
 			sound.Volume = FartConfig.STREAM_VOLUME
-				+ (FartConfig.MAX_STREAM_VOLUME - FartConfig.STREAM_VOLUME) * powerProgress
+				+ (FartConfig.MAX_STREAM_VOLUME - FartConfig.STREAM_VOLUME) * progress
 		end
 	end
 end
