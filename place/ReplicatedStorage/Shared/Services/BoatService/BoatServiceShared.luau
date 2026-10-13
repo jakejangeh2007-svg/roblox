@@ -14,6 +14,7 @@ local BoatServiceShared = {
 	BOATS_FOLDER_NAME = "Boats", -- Workspace.Boats holds every spawned boat
 	TEMPLATES_FOLDER_NAME = "Boats", -- ReplicatedStorage.Assets.Boats holds the boat templates
 	COLLISION_GROUP = "Boats", -- boats pass through each other
+	RIDER_COLLISION_GROUP = "Riders", -- riders on the river don't bump into anything; only their boat does
 
 	-- Attributes on each spawned boat model, for clients and UI
 	STATE_ATTRIBUTE = "State", -- a BoatState

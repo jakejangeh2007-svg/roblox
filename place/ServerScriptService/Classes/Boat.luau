@@ -8,14 +8,18 @@
 --   - LAUNCH_DELAY after every seat is taken (cancelled if someone gets up)
 --   - LAUNCH_DELAY after the leader starts the run early
 -- If nobody is aboard when it's time to leave, it's removed instead.
--- On the river the server owns its physics: WaterService keeps it afloat and
--- FartService pushes it.
+-- On the river it moves under physics that the server runs: its Hull (the Hull class)
+-- is stepped by WaterService every frame. While it's out there its riders don't bump
+-- into anything and weigh nothing, so only the hull touches the world and every boat of
+-- a size handles the same however its crew is spread around it.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
 --   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
 --                 water should come up to, with its top face pointing up. It can be invisible.
 --   Welds         every other part, Seats included, welded to the PrimaryPart with
 --                 WeldConstraints (directly or through other welded parts).
+--   Physics       every part gets BoatConfig's slippery, slightly bouncy HULL_ settings,
+--                 keeping its own density.
 --   Seats         one Seat per player. The number of Seats must match the size the
 --                 template is listed under in BoatConfig.TEMPLATE_NAMES. Put them around
 --                 the edge facing the middle. A one-seat boat can have its seat in the
@@ -26,13 +30,21 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
 
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local Hull = require(ServerScriptService.Classes.Hull)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
 local Boat = {}
 Boat.__index = Boat
+
+-- What a rider's body part was like before they launched, to put back when they leave.
+type RiderPartSettings = {
+	CollisionGroup: string,
+	Massless: boolean,
+}
 
 type BoatMembers = {
 	Model: Model,
@@ -41,6 +53,8 @@ type BoatMembers = {
 	State: BoatServiceShared.BoatState,
 	Frozen: boolean, -- held still in mid-air after falling off the river, until it's removed
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
+	Hull: Hull.Hull?, -- how it moves on the river; made when it launches
+	RiderParts: { [Player]: { [BasePart]: RiderPartSettings } }, -- each rider's body parts, changed for the ride
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
 	JoinDeadline: number, -- server time the join timer runs out
@@ -154,6 +168,8 @@ function Boat.new(
 			State = "Docked",
 			Frozen = false,
 			Crew = {},
+			Hull = nil,
+			RiderParts = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
 			JoinDeadline = workspace:GetServerTimeNow() + BoatConfig.JOIN_TIME,
@@ -172,6 +188,13 @@ function Boat.new(
 		if descendant:IsA("BasePart") then
 			descendant.Anchored = descendant == primaryPart
 			descendant.CollisionGroup = BoatServiceShared.COLLISION_GROUP
+			descendant.CustomPhysicalProperties = PhysicalProperties.new(
+				descendant.CurrentPhysicalProperties.Density,
+				BoatConfig.HULL_FRICTION,
+				BoatConfig.HULL_ELASTICITY,
+				BoatConfig.HULL_FRICTION_WEIGHT,
+				BoatConfig.HULL_ELASTICITY_WEIGHT
+			)
 		end
 	end
 	self:MoveTo(dockCFrame)
@@ -351,77 +374,45 @@ function Boat.Launch(self: Boat)
 	self:SetState("Launched")
 	self.Model:SetAttribute(BoatServiceShared.DEPARTURE_TIME_ATTRIBUTE, nil)
 	self:MoveTo(self.LaunchCFrame)
-	self:StartFloating()
-end
-
--- Hands the boat over to physics: unanchors it, keeps it upright (it can still spin
--- freely) and makes the server simulate it.
-function Boat.StartFloating(self: Boat)
-	local primaryPart = self.Model.PrimaryPart
-	if not primaryPart then
-		return
+	for _, player in self.Crew do
+		self:PrepareRider(player)
 	end
-
-	local uprightAttachment = Instance.new("Attachment")
-	uprightAttachment.Name = "UprightAttachment"
-	-- The attachment's primary axis (its X axis) points along the boat's up direction.
-	uprightAttachment.CFrame = CFrame.fromMatrix(Vector3.zero, Vector3.yAxis, Vector3.xAxis)
-	uprightAttachment.Parent = primaryPart
-
-	local upright = Instance.new("AlignOrientation")
-	upright.Name = "Upright"
-	upright.Mode = Enum.OrientationAlignmentMode.OneAttachment
-	upright.AlignType = Enum.AlignType.PrimaryAxisParallel
-	upright.PrimaryAxis = Vector3.yAxis
-	upright.Attachment0 = uprightAttachment
-	upright.MaxTorque = math.huge
-	upright.Responsiveness = BoatConfig.UPRIGHT_RESPONSIVENESS
-	upright.Parent = primaryPart
-
-	primaryPart.Anchored = false
-	self:ClaimNetworkOwnership()
-	primaryPart.AssemblyLinearVelocity = Vector3.zero
-	primaryPart.AssemblyAngularVelocity = Vector3.zero
-end
-
--- Makes sure the server simulates the boat. Seated players can otherwise end up owning
--- it, so BoatService calls this again every CLEANUP_INTERVAL.
-function Boat.ClaimNetworkOwnership(self: Boat)
 	local primaryPart = self.Model.PrimaryPart
-	if not primaryPart or not primaryPart:CanSetNetworkOwnership() then
-		return
-	end
-	if primaryPart:GetNetworkOwnershipAuto() or primaryPart:GetNetworkOwner() ~= nil then
-		primaryPart:SetNetworkOwner(nil)
+	if primaryPart then
+		self.Hull = Hull.new(primaryPart, #self.Seats)
 	end
 end
 
--- Adds to the boat's speed (studs/s) and turn speed (rad/s, positive turns left).
-function Boat.AddVelocity(self: Boat, push: Vector3, spin: number)
-	local primaryPart = self.Model.PrimaryPart
-	if not primaryPart or not self:IsFloating() then
+-- For the ride, `player`'s body doesn't bump into anything (only the hull does) and
+-- weighs nothing, so the boat turns around its own middle wherever they sit.
+function Boat.PrepareRider(self: Boat, player: Player)
+	local character = player.Character
+	if not character or self.RiderParts[player] then
 		return
 	end
-	primaryPart.AssemblyLinearVelocity += push
-	primaryPart.AssemblyAngularVelocity += Vector3.yAxis * spin
+	local riderParts: { [BasePart]: RiderPartSettings } = {}
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			riderParts[descendant] = { CollisionGroup = descendant.CollisionGroup, Massless = descendant.Massless }
+			descendant.CollisionGroup = BoatServiceShared.RIDER_COLLISION_GROUP
+			descendant.Massless = true
+		end
+	end
+	self.RiderParts[player] = riderParts
 end
 
--- Caps the boat's speed across the water and its turn speed. FartService calls this
--- after pushing, so farting can't go past them (currents and falling aren't capped).
-function Boat.LimitSpeed(self: Boat, maxSpeed: number, maxSpinSpeed: number)
-	local primaryPart = self.Model.PrimaryPart
-	if not primaryPart or not self:IsFloating() then
+-- Puts back what PrepareRider changed on `player`'s body, if it's still around.
+function Boat.ReleaseRider(self: Boat, player: Player)
+	local riderParts = self.RiderParts[player]
+	if not riderParts then
 		return
 	end
-	local velocity = primaryPart.AssemblyLinearVelocity
-	local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
-	if flatVelocity.Magnitude > maxSpeed then
-		local cappedVelocity = flatVelocity.Unit * maxSpeed
-		primaryPart.AssemblyLinearVelocity = Vector3.new(cappedVelocity.X, velocity.Y, cappedVelocity.Z)
-	end
-	local spin = primaryPart.AssemblyAngularVelocity
-	if math.abs(spin.Y) > maxSpinSpeed then
-		primaryPart.AssemblyAngularVelocity = Vector3.new(spin.X, math.sign(spin.Y) * maxSpinSpeed, spin.Z)
+	self.RiderParts[player] = nil
+	for part, settings in riderParts do
+		if part.Parent then
+			part.CollisionGroup = settings.CollisionGroup
+			part.Massless = settings.Massless
+		end
 	end
 end
 
@@ -441,6 +432,7 @@ function Boat.RemoveMissingCrew(self: Boat)
 		local player = self.Crew[index]
 		if not table.find(seatedPlayers, player) then
 			table.remove(self.Crew, index)
+			self:ReleaseRider(player)
 			self.CrewMemberLeft:Fire(player)
 		end
 	end
@@ -460,6 +452,9 @@ function Boat.Destroy(self: Boat)
 	end
 	for _, seat in self.Seats do
 		EjectFromSeat(seat)
+	end
+	for player in self.RiderParts do
+		self:ReleaseRider(player)
 	end
 	if wasLaunched then
 		for _, player in self.Crew do

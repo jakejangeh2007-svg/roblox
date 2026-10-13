@@ -56,12 +56,18 @@ function BoatServiceServer.Init(self: BoatServiceServer)
 		return self:HandleStartRequest(player)
 	end
 
-	-- Boats pass through each other.
-	local collisionGroup = BoatServiceShared.COLLISION_GROUP
-	if not PhysicsService:IsCollisionGroupRegistered(collisionGroup) then
-		PhysicsService:RegisterCollisionGroup(collisionGroup)
+	-- Boats pass through each other, and riders on the river pass through everything.
+	local boatGroup = BoatServiceShared.COLLISION_GROUP
+	local riderGroup = BoatServiceShared.RIDER_COLLISION_GROUP
+	for _, collisionGroup in { boatGroup, riderGroup } do
+		if not PhysicsService:IsCollisionGroupRegistered(collisionGroup) then
+			PhysicsService:RegisterCollisionGroup(collisionGroup)
+		end
 	end
-	PhysicsService:CollisionGroupSetCollidable(collisionGroup, collisionGroup, false)
+	PhysicsService:CollisionGroupSetCollidable(boatGroup, boatGroup, false)
+	for _, otherGroup in { "Default", boatGroup, riderGroup } do
+		PhysicsService:CollisionGroupSetCollidable(riderGroup, otherGroup, false)
+	end
 
 	local boatsFolder = workspace:FindFirstChild(BoatServiceShared.BOATS_FOLDER_NAME)
 	if not boatsFolder then
@@ -261,15 +267,11 @@ function BoatServiceServer.EjectPlayer(self: BoatServiceServer, player: Player)
 	end
 end
 
--- Forgets boats that were destroyed, and makes sure the server still simulates every
--- boat on the river.
+-- Forgets boats that were destroyed.
 function BoatServiceServer.CleanUp(self: BoatServiceServer)
 	for index = #self.Boats, 1, -1 do
-		local boat = self.Boats[index]
-		if boat.State == "Destroyed" then
+		if self.Boats[index].State == "Destroyed" then
 			table.remove(self.Boats, index)
-		elseif boat:IsFloating() then
-			boat:ClaimNetworkOwnership()
 		end
 	end
 end

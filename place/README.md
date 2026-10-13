@@ -145,7 +145,7 @@ ServerScriptService
     DockService           DockServiceServer
     FartService           FartServiceServer
     WaterService          WaterServiceServer
-  Classes                 Boat, Dock, Location
+  Classes                 Boat, Dock, Hull, Location
 
 StarterPlayer.StarterPlayerScripts
   Client                  startup script
@@ -180,8 +180,8 @@ Workspace
    - If the leader **leaves the game**, someone aboard becomes leader. If nobody is
      aboard, the boat is removed.
 5. On the river, players **fart to steer** (controls below). The server checks every
-   fart, spends gas and pushes the boat. **WaterService** keeps boats on the water
-   surface, slows them down and pushes them along currents. A boat that **falls off**
+   fart and spends gas. Every frame, **WaterService** moves each boat with its crew's
+   farts and the water under it (see *How boats move*). A boat that **falls off**
    the river freezes for `WIPE_DELAY`, then it's removed and its crew goes back to
    their checkpoint to spawn a new boat.
 6. When a boat on the river enters a checkpoint's **Zone**, that checkpoint and every
@@ -203,20 +203,62 @@ Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`
 | Right | `D`, `→`, `E` | `RB` | turns the boat right |
 
 **Hold a key to keep farting.** A fart speeds the boat up at a set acceleration
-(18 studs/s² to start) that grows by a set amount every second you keep going (+12 per
-second), up to 45. Turning works the same way. Farting can't push a boat past a top speed
-of 30 studs/s or a top turn speed of about 140° a second. Letting go stops, and the next
-fart starts from the beginning again. If you hold two keys, the one you pressed last wins.
+(18 studs/s² to start) that builds up by a set amount every second you keep going (+12
+per second), up to 45. Turning builds up the same way. If you hold two keys, the one you
+pressed last wins, and **switching direction keeps the strength you've built up**.
+Letting go stops, but the built-up strength fades out instead of resetting (3 times as
+fast as it built up), so a quick re-press picks up close to where you left off.
 
 **Gas** drains at a flat 10 per second while you fart, however long you've been going, so a full tank
 (100) lasts 10 seconds. It refills at 15 per second while you're not farting. When it runs
 out you stop; let go and press again once there's gas. All of these numbers are in `FartConfig`.
 
 Everyone farting Straight cancels out; everyone farting Left spins the boat on the spot.
+Riders' turns add up, so a big boat turns quickly only when its crew turns together.
 
 **Seat Cam:** on the river the camera sits behind your seat, so Straight always pushes
-up your screen. `V` (or `Y` on a controller) switches to the normal camera.
+up your screen. It bobs gently with the boat and shakes on hard bumps and splashes.
+`V` (or `Y` on a controller) switches to the normal camera.
 Touch devices need on-screen buttons, which are UI, so they come with the menus.
+
+## How boats move
+
+One thing moves a boat on the river: its **Hull** (`ServerScriptService.Classes.Hull`),
+which WaterService steps every frame on the server. It works out the boat's whole
+velocity in one go, so nothing fights over it and there are no hard speed caps:
+
+- **Farts** push and turn it, scaled by its size's **handling** (`BoatConfig.HANDLING`).
+- **Water drag** pulls its speed toward the water's own speed. It's gentle at low speed,
+  so a boat glides on for a few seconds after the crew stops, and grows with speed, so a
+  boat levels off smoothly at its top speed: one rider at full strength cruises at about
+  30 studs/s (`WaterConfig.TOP_SPEED`). Two riders pushing the same way go faster.
+  Turning works the same way, with each size's own top turn speed.
+- **Currents** carry it along, and **rapids** shove and twist it around at random.
+- **Buoyancy** holds it at the surface like a soft spring: it bobs on gentle **waves**,
+  and a boat that drops in plunges, then settles in about 2 seconds without bouncing
+  back out. Off the water, only gravity, a little air drag and the farts act on it.
+- It **rocks** with the waves and **leans** away from the way it's speeding up, turning or
+  bumping into things, then rights itself.
+- Riders don't bump into anything and weigh nothing while they ride, so only the hull
+  touches the world, and the boat turns around its middle wherever the crew sits.
+  The hull is slippery and a little bouncy, so it glances off rocks and banks.
+
+| Boat | Speed after 1 s / 2 s of one rider pushing | Turn speed after 1 s / 3 s of one rider turning |
+| ---- | ---- | ---- |
+| 1 seat | 18 / 28 studs/s | 96 / 150 °/s |
+| 2 seats | 17 / 27 | 68 / 114 |
+| 3 seats | 16 / 26 | 52 / 89 |
+| 4 seats | 16 / 25 | 42 / 74 (4 riders turning together: 136 / 194) |
+| 5 seats | 15 / 24 | 35 / 62 |
+| 6 seats | 14 / 23 | 28 / 51 (3 together: 74 / 113; all 6: 127 / 177) |
+
+A boat stops turning about 2 seconds after everyone lets go. To make a size nimbler or
+heavier, change its `PushScale`, `TurnScale` and `TopTurnSpeed` in `BoatConfig.HANDLING`.
+Water feel (drag, bobbing, waves, rapids) is in `WaterConfig`; leaning and the hull's
+bounce are in `BoatConfig`.
+
+The server runs boat physics, so in a live game there's a small delay (your ping)
+between pressing a key and seeing the boat react. Your own fart effects start instantly.
 
 ## Building the map
 
@@ -244,9 +286,10 @@ Workspace
         Docks (Folder)           same as the lobby's
       Checkpoint2 ...
     Finish             Part      a boat whose middle is inside this has beaten the game
-    Water (Folder)               every water surface part on the river, any names
-      ...              Parts     the TOP face is the water surface
-      Rapids           Part      named after an entry in WaterConfig.CURRENT_SPEEDS: flows toward its front face
+    Water (Folder)               every water surface part on the river
+      ...              Parts     the TOP face is the water surface; any other name is calm water
+      Current          Part      named after an entry in WaterConfig.WATER_TYPES: flows toward its front face
+      Rapids           Part      the same, faster, choppier and rough
 ```
 
 - Make `Spawn`, `Launch`, `Zone`, `BoatSpawn` and `Finish` **Anchored**, **CanCollide off**
@@ -254,9 +297,12 @@ Workspace
 - Make `Zone` and `Finish` big enough to cover the whole river, so a boat can't miss them.
 - Make water parts **Anchored** and **CanCollide off**. Boats float wherever there's a water
   part underneath and fall where there isn't, so rivers without walls can be fallen off.
-- To make water flow, name the part after an entry in `WaterConfig.CURRENT_SPEEDS`
+- To make water flow, name the part after an entry in `WaterConfig.WATER_TYPES`
   (`Current` or `Rapids` to start with) and turn it so its front face points downstream.
-  Add more names and speeds there.
+  Each type sets its flow speed, how big its waves are and how rough it is. Add more
+  types there.
+- Don't stack water parts within 8 studs of each other vertically (one surface above
+  another): boats look for the water from 8 studs above them to 8 below.
 - Put each `Launch` part at water level, over a water part.
 - The checkpoints and their order live in `CheckpointConfig.CHECKPOINTS`. The three
   there now are placeholders: edit the list to match the map.
@@ -275,6 +321,9 @@ Put one Model per size in **`ReplicatedStorage.Assets.Boats`**, named as in
   around the edge, facing the middle. A one-seat boat can have its seat in the middle,
   facing forward.
 - No scripts inside.
+- Every part's friction and bounciness is set by the code (`BoatConfig.HULL_...`); its
+  density (from its Material) is kept. Make the hull the parts that should touch rocks
+  and banks; riders never touch anything.
 
 Output warns at startup about any template that's missing or doesn't follow these rules.
 
@@ -282,10 +331,11 @@ Output warns at startup about any template that's missing or doesn't follow thes
 
 - **`ReplicatedStorage.Assets.VFX.FartCloud`:** a ParticleEmitter for the gas cloud. Set
   its Texture, Color, Size and so on however you like. While someone farts, its Rate
-  (`FartConfig.STREAM_PARTICLE_RATE`) and Speed are multiplied by their power.
+  (`FartConfig.MIN_PARTICLE_RATE` to `MAX_PARTICLE_RATE`) and Speed grow with the
+  fart's strength.
 - **`ReplicatedStorage.Assets.Sounds.Farts`:** a Folder of fart Sounds from the Creator
-  Store. Each fart loops a random one, and its pitch and volume rise with power.
-  Sounds that loop smoothly work best.
+  Store. Each fart loops a random one, and its pitch and volume rise with its strength.
+  Switching direction keeps the same sound going. Sounds that loop smoothly work best.
 
 Without them farts still work, just invisible or silent, and Output warns once.
 
@@ -305,7 +355,7 @@ The client halves have everything the menus need:
 | Teleport | `CheckpointServiceClient:RequestTeleport(id)` → `(success, message)`; the lobby's id is `CheckpointConfig.LOBBY_ID` |
 | List changed | `CheckpointServiceClient.UnlockedCheckpointsChanged` |
 | "Checkpoint reached" / "You win" | `CheckpointServiceClient.CheckpointReached`, `CheckpointServiceClient.GameCompleted` |
-| Gas meter | done: `UI.HUD.GasMeter` fills `StarterGui.HUD.GasMeter.Fill` (a Frame whose width shows the gas left). Build that by hand when you make the real HUD; the test kit makes a stand-in until then |
+| Gas meter | done: `UI.HUD.GasMeter` smoothly fills `StarterGui.HUD.GasMeter.Fill` (a Frame whose width shows the gas left). Build that by hand when you make the real HUD; the test kit makes a stand-in until then |
 | Touch fart buttons | call `FartServiceClient:PressFart(direction)` on press and `ReleaseFart(direction)` on release (`"Left"`, `"Straight"`, `"Right"`) |
 | Farting on and off (e.g. button glow) | `FartServiceClient.FartStarted` (direction) and `FartStopped` |
 | RIP screen | `BoatServiceClient.BoatWiped` |

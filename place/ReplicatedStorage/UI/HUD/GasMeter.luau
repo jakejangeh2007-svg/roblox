@@ -1,8 +1,9 @@
 --!strict
 -- ModuleScript: ReplicatedStorage.UI.HUD.GasMeter
 --
--- Fills the gas meter from the local player's Gas attribute (see FartService). It only
--- updates the fill's width; the meter itself is built by hand in Studio.
+-- Fills the gas meter from the local player's Gas attribute (see FartService). The
+-- fill glides to each new value instead of jumping. It only changes the fill's width;
+-- the meter itself is built by hand in Studio.
 --
 -- UI contract (built by hand in StarterGui, sized with Scale only):
 --   HUD        ScreenGui
@@ -12,6 +13,7 @@
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
@@ -20,9 +22,12 @@ local GasMeter = {
 	HUD_NAME = "HUD",
 	GAS_METER_NAME = "GasMeter",
 	FILL_NAME = "Fill",
+	FILL_SMOOTHING = 12, -- how quickly the fill catches up to the gas left (higher = snappier)
 }
 
-type GasMeterMembers = {}
+type GasMeterMembers = {
+	ShownFraction: number?, -- how full the meter is showing right now
+}
 
 export type GasMeter = typeof(GasMeter) & GasMeterMembers
 
@@ -35,25 +40,34 @@ local function FindFill(): GuiObject?
 	return if fill and fill:IsA("GuiObject") then fill else nil
 end
 
+local function GetGasFraction(): number
+	local gas = Players.LocalPlayer:GetAttribute(FartServiceShared.GAS_ATTRIBUTE)
+	return if typeof(gas) == "number" then math.clamp(gas / FartConfig.GAS_MAX, 0, 1) else 0
+end
+
 function GasMeter.Init(self: GasMeter)
-	local localPlayer = Players.LocalPlayer
-
-	local function Refresh()
-		local fill = FindFill()
-		if not fill then
-			return
-		end
-		local gas = localPlayer:GetAttribute(FartServiceShared.GAS_ATTRIBUTE)
-		local fraction = if typeof(gas) == "number" then math.clamp(gas / FartConfig.GAS_MAX, 0, 1) else 0
-		fill.Size = UDim2.fromScale(fraction, fill.Size.Y.Scale)
-	end
-
-	localPlayer:GetAttributeChangedSignal(FartServiceShared.GAS_ATTRIBUTE):Connect(Refresh)
-	-- The HUD is copied into PlayerGui when the character spawns, so refresh when it arrives.
-	task.spawn(function()
-		localPlayer:WaitForChild("PlayerGui").ChildAdded:Connect(Refresh)
-		Refresh()
+	self.ShownFraction = nil
+	RunService.RenderStepped:Connect(function(deltaTime)
+		self:Update(deltaTime)
 	end)
+end
+
+function GasMeter.Update(self: GasMeter, deltaTime: number)
+	local fill = FindFill()
+	if not fill then
+		self.ShownFraction = nil
+		return
+	end
+	local targetFraction = GetGasFraction()
+	local shownFraction = self.ShownFraction or targetFraction
+	shownFraction += (targetFraction - shownFraction) * (1 - math.exp(-GasMeter.FILL_SMOOTHING * deltaTime))
+	if math.abs(targetFraction - shownFraction) < 0.001 then
+		shownFraction = targetFraction
+	end
+	self.ShownFraction = shownFraction
+	if fill.Size.X.Scale ~= shownFraction then
+		fill.Size = UDim2.fromScale(shownFraction, fill.Size.Y.Scale)
+	end
 end
 
 return GasMeter :: GasMeter

@@ -1,6 +1,12 @@
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Modules.Game.BoatConfig
 
+export type Handling = {
+	PushScale: number,
+	TurnScale: number,
+	TopTurnSpeed: number,
+}
+
 local BoatConfig = {
 	MIN_SEATS = 1,
 	MAX_SEATS = 6,
@@ -16,33 +22,45 @@ local BoatConfig = {
 		[6] = "Boat6",
 	} :: { [number]: string },
 
-	-- Multiplies every fart push and turn, by boat size. Bigger boats are heavier to steer.
-	PUSH_SCALES = {
-		[1] = 1.2,
-		[2] = 1.1,
-		[3] = 1.05,
-		[4] = 1,
-		[5] = 0.9,
-		[6] = 0.8,
-	} :: { [number]: number },
-	SPIN_SCALES = {
-		[1] = 1.5,
-		[2] = 1.2,
-		[3] = 1.1,
-		[4] = 1,
-		[5] = 0.85,
-		[6] = 0.7,
-	} :: { [number]: number },
+	-- How each boat size handles (ServerScriptService.Classes.Hull). Small boats are nimble,
+	-- so one rider can steer them alone. Big boats are heavy: one rider turns them slowly,
+	-- and the crew has to fart together to turn them quickly (every rider's turn adds up).
+	--   PushScale      multiplies how hard farts (and rough water) push the boat along
+	--   TurnScale      multiplies how hard farts (and rough water) turn it
+	--   TopTurnSpeed   how fast it turns (rad/s) with ONE rider turning at full strength.
+	--                  More riders turning together go past it.
+	HANDLING = {
+		[1] = { PushScale = 1.1, TurnScale = 1.5, TopTurnSpeed = math.rad(150) },
+		[2] = { PushScale = 1.05, TurnScale = 1, TopTurnSpeed = math.rad(115) },
+		[3] = { PushScale = 1, TurnScale = 0.75, TopTurnSpeed = math.rad(90) },
+		[4] = { PushScale = 0.95, TurnScale = 0.6, TopTurnSpeed = math.rad(75) },
+		[5] = { PushScale = 0.9, TurnScale = 0.5, TopTurnSpeed = math.rad(63) },
+		[6] = { PushScale = 0.85, TurnScale = 0.4, TopTurnSpeed = math.rad(52) },
+	} :: { [number]: Handling },
 
 	-- Joining
 	JOIN_TIME = 30, -- seconds players have to get in after the party leader spawns a boat
 	LAUNCH_DELAY = 3, -- countdown (seconds) once every seat is taken or the leader starts the run early
 	JOIN_DISTANCE = 40, -- how close (studs) a player must be to a boat to ask to join it
 	REQUEST_COOLDOWN = 1, -- seconds a player has to wait between join or start requests
-	CLEANUP_INTERVAL = 1, -- seconds between checks for boats to remove (also re-claims boat physics for the server)
+	CLEANUP_INTERVAL = 1, -- seconds between checks for removed boats to forget
 	WIPE_DELAY = 1.5, -- seconds a boat that fell off the river hangs frozen before its crew respawns
 
-	UPRIGHT_RESPONSIVENESS = 25, -- how quickly a tipped boat rights itself
+	-- Tilting. A boat on the river rocks with the waves and leans away from the way it's
+	-- speeding up or turning (its far side lifts when it surges forward, and it heels over
+	-- in a turn or when it hits something), then rights itself.
+	UPRIGHT_RESPONSIVENESS = 12, -- how quickly it tilts to follow the waves and its lean (higher = stiffer)
+	LEAN_PER_ACCELERATION = 0.0035, -- radians of lean per stud/s² of speeding up, slowing down or turning
+	LEAN_SMOOTHING = 6, -- how quickly the lean follows changes (higher = snappier, lower = smoother)
+	MAX_TILT = math.rad(12), -- it never tilts further than this from level (waves and lean together)
+
+	-- Every part of a spawned boat gets these, keeping its own density: a slippery,
+	-- slightly bouncy hull that glances off rocks and banks instead of sticking to them.
+	HULL_FRICTION = 0.05,
+	HULL_ELASTICITY = 0.3,
+	HULL_FRICTION_WEIGHT = 50, -- how much the hull's friction wins over what it touches
+	HULL_ELASTICITY_WEIGHT = 50, -- how much the hull's bounciness wins over what it touches
+
 	CENTER_SEAT_RADIUS = 1, -- a seat closer than this (studs) to the middle of the boat counts as a middle seat
 }
 
