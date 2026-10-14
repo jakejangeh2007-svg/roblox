@@ -5,7 +5,7 @@
 -- launching them into the river and removing them. Boats are Boat objects
 -- (ServerScriptService.Classes.Boat). DockService asks it for new boats,
 -- CheckpointService and WaterService ask it which boats are on the river, and
--- FartService asks which boat a player is riding.
+-- FartService and RiderService ask which boat a player is riding.
 --
 -- Joining: the player who spawns a boat is its party leader. Anyone can get in by
 -- sitting in a free seat, or by asking to join (RequestJoinBoat). The boat leaves when
@@ -284,6 +284,19 @@ function BoatServiceServer.GetLaunchedBoatOf(self: BoatServiceServer, player: Pl
 		end
 	end
 	return nil
+end
+
+-- The boat and seat `player` is hanging on at, docked or on the river, if any.
+function BoatServiceServer.GetRiddenSeat(self: BoatServiceServer, player: Player): (Boat.Boat?, Seat?)
+	for _, boat in self.Boats do
+		if boat.State ~= "Destroyed" then
+			local seat = boat:GetSeatOf(player)
+			if seat then
+				return boat, seat
+			end
+		end
+	end
+	return nil, nil
 end
 
 -- A boat fell off the river: freeze it, tell its crew, then remove it. Removing it

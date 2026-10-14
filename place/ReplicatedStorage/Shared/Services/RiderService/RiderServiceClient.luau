@@ -1,23 +1,43 @@
 --!strict
 -- ModuleScript: ReplicatedStorage.Shared.Services.RiderService.RiderServiceClient
 --
--- Poses every player riding a boat, on this player's screen. Riders hang on to the
--- outside of their boat (the server puts them there; see the Boat class), and this gives
--- them the pose to match: arms reaching over the side, legs kicking in the water, and
--- their whole body twisted round to aim their butt the way they're farting
--- (FartServiceClient:GetAimAngle). It overrides their animation every frame, so it
--- needs no animation assets, and works for R15 and R6 characters. All the angles are in
--- RiderConfig.
+-- The client half of RiderService. Riders hang on to the outside of their boat (the
+-- server puts them there; see the Boat class).
+--
+-- Sliding: hold a slide key to slide round the edge of your boat, within your own
+-- stretch of it. The server does the moving (RiderServiceServer); this asks it to.
+--   Slide left    A, Left arrow, Q, or LB
+--   Slide right   D, Right arrow, E, or RB
+-- If you hold both, the one you pressed last wins. On-screen buttons for touch devices
+-- (UI, to be built) call PressSlide and ReleaseSlide.
+--
+-- Posing: every player hanging on to a boat is posed on this player's screen: arms
+-- reaching over the side (going hand over hand while they slide) and legs kicking in
+-- the water. It overrides their animation every frame, so it needs no animation assets,
+-- and works for R15 and R6 characters. All the angles are in RiderConfig.
 
+local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
-local FartServiceClient = require(ReplicatedStorage.Shared.Services.FartService.FartServiceClient)
+local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
+local RiderServiceShared = require(ReplicatedStorage.Shared.Services.RiderService.RiderServiceShared)
 
--- The joints a rider is posed by, by what they do (Root turns the whole body).
+export type Side = "Left" | "Right"
+
+local SLIDE_ACTIONS: { [string]: Side } = {
+	SlideLeft = "Left",
+	SlideRight = "Right",
+}
+local SIDE_DIRECTIONS: { [Side]: number } = {
+	Left = -1,
+	Right = 1,
+}
+
+-- The joints a rider is posed by, by what they do.
 type Rig = { [string]: Motor6D }
 
 -- Where each joint is, as { the part it's in, its name }.
@@ -40,13 +60,36 @@ local R6_JOINTS: { [string]: { string } } = {
 	LeftHip = { "Torso", "Left Hip" },
 }
 
+-- What a rider's pose remembers between frames.
+type Rider = {
+	Rig: Rig,
+	LastAngle: number?, -- where they were round their boat last frame (radians)
+	ShimmyPhase: number, -- how far through a hand-over-hand they are (radians)
+}
+
+local localPlayer = Players.LocalPlayer
+
 local RiderServiceClient = {}
 
 type RiderServiceClientMembers = {
-	Rigs: { [Model]: Rig }, -- each rider's joints, found the first time they're posed
+	HeldSlides: { { Input: string, Side: Side } }, -- slide keys and buttons held down, in the order pressed
+	SlideDirection: number, -- what the server was last asked: -1 left, 1 right, 0 not sliding
+	RequestSlideRemote: RemoteEvent?, -- set once the server has created it
+	Riders: { [Model]: Rider }, -- each rider's pose state, by character
 }
 
 export type RiderServiceClient = typeof(RiderServiceClient) & RiderServiceClientMembers
+
+-- The seat `character` is hanging on at, if it's a boat's.
+local function GetBoatSeat(character: Model?): (Humanoid?, BasePart?, Model?)
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	local seat = if humanoid then humanoid.SeatPart else nil
+	local boatModel = if seat then BoatServiceShared.GetBoatModelFromPart(seat) else nil
+	if not humanoid or not seat or not boatModel then
+		return nil, nil, nil
+	end
+	return humanoid, seat, boatModel
+end
 
 -- `character`'s joints for posing.
 local function FindRig(character: Model, humanoid: Humanoid): Rig
@@ -74,41 +117,161 @@ local function PoseJoint(joint: Motor6D?, rotation: CFrame)
 end
 
 function RiderServiceClient.Init(self: RiderServiceClient)
-	self.Rigs = setmetatable({}, { __mode = "k" }) :: any
+	self.HeldSlides = {}
+	self.SlideDirection = 0
+	self.RequestSlideRemote = nil
+	self.Riders = setmetatable({}, { __mode = "k" }) :: any
+
+	local function OnSlideAction(actionName: string, inputState: Enum.UserInputState, input: InputObject)
+		local side: Side? = SLIDE_ACTIONS[actionName]
+		if not side then
+			return Enum.ContextActionResult.Pass
+		end
+		local inputName = input.KeyCode.Name
+		if inputState == Enum.UserInputState.Begin then
+			local _, seat = GetBoatSeat(localPlayer.Character)
+			if not seat then
+				-- Not hanging on to a boat: let the keys do their normal job (like walking).
+				return Enum.ContextActionResult.Pass
+			end
+			self:PressSlide(side, inputName)
+			return Enum.ContextActionResult.Sink
+		end
+		-- Letting go: only take it if the press was a slide, so walking keys still let go normally.
+		for _, held in self.HeldSlides do
+			if held.Input == inputName then
+				self:ReleaseSlide(side, inputName)
+				return Enum.ContextActionResult.Sink
+			end
+		end
+		return Enum.ContextActionResult.Pass
+	end
+	ContextActionService:BindAction(
+		"SlideLeft",
+		OnSlideAction,
+		false,
+		Enum.KeyCode.A,
+		Enum.KeyCode.Left,
+		Enum.KeyCode.Q,
+		Enum.KeyCode.ButtonL1
+	)
+	ContextActionService:BindAction(
+		"SlideRight",
+		OnSlideAction,
+		false,
+		Enum.KeyCode.D,
+		Enum.KeyCode.Right,
+		Enum.KeyCode.E,
+		Enum.KeyCode.ButtonR1
+	)
 
 	-- After animations are applied each frame, so the pose wins over the sitting animation.
-	RunService.PreSimulation:Connect(function()
-		self:Update()
+	RunService.PreSimulation:Connect(function(deltaTime)
+		self:Update(deltaTime)
+	end)
+
+	-- The remote is waited for in a separate thread so Init never yields.
+	task.spawn(function()
+		self.RequestSlideRemote =
+			Remotes.WaitForEvent(RiderServiceShared.SERVICE_NAME, RiderServiceShared.REQUEST_SLIDE)
 	end)
 end
 
-function RiderServiceClient.Update(self: RiderServiceClient)
+-- A slide key (or on-screen button, which can leave out `inputName`) went down.
+function RiderServiceClient.PressSlide(self: RiderServiceClient, side: Side, inputName: string?)
+	local input = inputName or `Button{side}`
+	self:ReleaseSlide(side, input)
+	table.insert(self.HeldSlides, { Input = input, Side = side })
+	self:UpdateSlideDirection()
+end
+
+-- A slide key (or on-screen button) was let go.
+function RiderServiceClient.ReleaseSlide(self: RiderServiceClient, side: Side, inputName: string?)
+	local input = inputName or `Button{side}`
+	for index = #self.HeldSlides, 1, -1 do
+		if self.HeldSlides[index].Input == input then
+			table.remove(self.HeldSlides, index)
+		end
+	end
+	self:UpdateSlideDirection()
+end
+
+-- Tells the server which way to slide (the last slide key pressed that's still held),
+-- if that changed.
+function RiderServiceClient.UpdateSlideDirection(self: RiderServiceClient)
+	local lastHeld = self.HeldSlides[#self.HeldSlides]
+	local direction = if lastHeld then SIDE_DIRECTIONS[lastHeld.Side] else 0
+	local remote = self.RequestSlideRemote
+	if direction == self.SlideDirection or not remote then
+		return
+	end
+	self.SlideDirection = direction
+	remote:FireServer(direction)
+end
+
+function RiderServiceClient.Update(self: RiderServiceClient, deltaTime: number)
+	-- Got off the boat while sliding: stop.
+	if #self.HeldSlides > 0 then
+		local _, seat = GetBoatSeat(localPlayer.Character)
+		if not seat then
+			table.clear(self.HeldSlides)
+			self:UpdateSlideDirection()
+		end
+	end
+
 	local time = os.clock()
 	for _, player in Players:GetPlayers() do
 		local character = player.Character
-		local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
-		local seat = if humanoid then humanoid.SeatPart else nil
-		if character and humanoid and seat and BoatServiceShared.GetBoatModelFromPart(seat) then
-			-- Found again if the character was rebuilt (its joints replaced)
-			local cachedRig = self.Rigs[character]
-			local cachedRoot = if cachedRig then cachedRig.Root else nil
-			local isStale = cachedRoot ~= nil and cachedRoot.Parent == nil
-			local rig: Rig = if cachedRig and not isStale then cachedRig else FindRig(character, humanoid)
-			self.Rigs[character] = rig
-			self:PoseRider(player, rig, time)
+		local humanoid, _, boatModel = GetBoatSeat(character)
+		if character and humanoid and boatModel then
+			self:PoseRider(player, character, humanoid, boatModel, time)
 		end
 	end
 end
 
 -- Poses one rider hanging on to their boat.
-function RiderServiceClient.PoseRider(self: RiderServiceClient, player: Player, rig: Rig, time: number)
-	-- Twisted round to aim their butt
-	PoseJoint(rig.Root, CFrame.Angles(0, FartServiceClient:GetAimAngle(player), 0))
+function RiderServiceClient.PoseRider(
+	self: RiderServiceClient,
+	player: Player,
+	character: Model,
+	humanoid: Humanoid,
+	boatModel: Model,
+	time: number
+)
+	-- Their joints, found again if the character was rebuilt
+	local existingRider = self.Riders[character]
+	local existingRoot = if existingRider then existingRider.Rig.Root else nil
+	local isStale = existingRoot ~= nil and existingRoot.Parent == nil
+	local rider: Rider = if existingRider and not isStale
+		then existingRider
+		else { Rig = FindRig(character, humanoid), LastAngle = nil, ShimmyPhase = 0 }
+	self.Riders[character] = rider
+	local rig = rider.Rig
 
-	-- Arms reaching forward over the side of the boat
-	local armReach = CFrame.Angles(RiderConfig.ARM_REACH, 0, 0)
-	PoseJoint(rig.RightShoulder, armReach)
-	PoseJoint(rig.LeftShoulder, armReach)
+	-- How far they slid round the boat since last frame moves their hands along.
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	local primaryPart = boatModel.PrimaryPart
+	if rootPart and rootPart:IsA("BasePart") and primaryPart then
+		local offset = primaryPart.CFrame:PointToObjectSpace(rootPart.Position)
+		local angle = math.atan2(offset.X, offset.Z)
+		local lastAngle = rider.LastAngle
+		if lastAngle then
+			local turned = (angle - lastAngle + math.pi) % (2 * math.pi) - math.pi
+			local distance = turned * Vector3.new(offset.X, 0, offset.Z).Magnitude
+			if RiderConfig.SHIMMY_STRIDE > 0 then
+				rider.ShimmyPhase += distance / RiderConfig.SHIMMY_STRIDE * 2 * math.pi
+			end
+		end
+		rider.LastAngle = angle
+	end
+
+	-- Upright, facing the boat (undoing the sitting animation)
+	PoseJoint(rig.Root, CFrame.identity)
+
+	-- Arms reaching forward over the side of the boat, hand over hand as they slide
+	local shimmy = math.sin(rider.ShimmyPhase) * RiderConfig.SHIMMY_ANGLE
+	PoseJoint(rig.RightShoulder, CFrame.Angles(RiderConfig.ARM_REACH + shimmy, 0, 0))
+	PoseJoint(rig.LeftShoulder, CFrame.Angles(RiderConfig.ARM_REACH - shimmy, 0, 0))
 	local elbowBend = CFrame.Angles(RiderConfig.ELBOW_BEND, 0, 0)
 	PoseJoint(rig.RightElbow, elbowBend)
 	PoseJoint(rig.LeftElbow, elbowBend)

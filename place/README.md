@@ -98,7 +98,8 @@ To playtest before the real map, boats and menus exist:
    - **E** at a dock's pier spawns a boat with that dock's number of seats (dock 1 = 1 seat).
    - Walk into a seat. The boat leaves after the 30 second timer, or press **F** next to
      it to start early (party leader only, sitting in the boat).
-   - Fart with **A / W / D** (or the arrow keys). Fall off a river to test wiping.
+   - Fart with **W**, slide round the edge with **A / D** (or the arrow keys). Fall off a
+     river to test wiping.
    - **E** at the yellow posts on each platform teleports there, once unlocked.
    - Anything that didn't work is explained in Output, starting with `[TestKit]`.
 4. Use **Test → Clients and Servers** with 2+ players to test together.
@@ -119,7 +120,7 @@ ReplicatedStorage
       CheckpointService   CheckpointServiceClient, CheckpointServiceShared
       DockService         DockServiceClient, DockServiceShared
       FartService         FartServiceClient, FartServiceShared, FartPhysics
-      RiderService        RiderServiceClient
+      RiderService        RiderServiceClient, RiderServiceShared
     Classes
     Modules
       Core                Remotes
@@ -145,6 +146,7 @@ ServerScriptService
     DataService           DataServiceServer
     DockService           DockServiceServer
     FartService           FartServiceServer
+    RiderService          RiderServiceServer
     WaterService          WaterServiceServer
   Classes                 Boat, Dock, Hull, Location
 
@@ -180,7 +182,7 @@ Workspace
      seats go). Each player leads at most one waiting boat.
    - If the leader **leaves the game**, someone aboard becomes leader. If nobody is
      aboard, the boat is removed.
-5. On the river, players **fart to steer** (controls below). The server checks every
+5. On the river, players **fart and slide round the edge to steer** (controls below). The server checks every
    fart and spends gas. Every frame, **WaterService** moves each boat with its crew's
    farts and the water under it (see *How boats move*). A boat that **falls off**
    the river freezes for `WIPE_DELAY`, then it's removed and its crew goes back to
@@ -195,40 +197,51 @@ Workspace
 
 Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`.
 
-## Fart controls
+## Controls
 
-| Fart | Keyboard | Controller | What it does |
-| ---- | -------- | ---------- | ------------ |
-| Straight | `W`, `↑`, `Space` | `RT` | butt aimed straight out behind you: pushes the boat the way you face |
-| Left | `A`, `←`, `Q` | `LB` | twist to aim your butt out to your left: spins the boat left |
-| Right | `D`, `→`, `E` | `RB` | twist to aim your butt out to your right: spins the boat right |
+| Action | Keyboard | Controller | What it does |
+| ------ | -------- | ---------- | ------------ |
+| Fart | `W`, `↑`, `Space` | `RT` | farts straight out behind you: pushes the boat the way you face |
+| Slide left | `A`, `←`, `Q` | `LB` | slides you left round the edge of the boat |
+| Slide right | `D`, `→`, `E` | `RB` | slides you right round the edge of the boat |
 
 Riders **hang on to the outside of the raft**, arms over the side and legs kicking in the
-water, facing its middle. To fart you **aim your butt off the raft**: straight out behind
-you for Straight, or twisted round to your left or right. Every fart is a **jet from your
-butt**: the gas goes one way and pushes the boat the other, and the boat moves the way
-real physics says (see *How boats move*). Straight pushes through the middle and just
-moves the boat. Left farts out to your left, pushing your side of the boat right, so the
-boat **spins left** (counter-clockwise) and drifts a little right; Right is the mirror
-image. To steer on your own, tap Left or Right to swing round, then push Straight.
+water, facing its middle, and **fart straight off it**. A fart pushes the boat from where
+you are toward its middle, so it moves the boat without spinning it. **To steer, slide
+round the edge** to push from a different side: to go left, slide right round the boat
+until you're on its right-hand side, then fart. The physics is real (see *How boats move*).
 
-**Hold a key to keep farting.** A fart starts at 12 studs/s² and builds up by 8 every
-second you keep going, up to 30 (on a boat weighing `FartConfig.REFERENCE_MASS`; heavier
-boats speed up slower). If you hold two keys, the one you pressed last wins, and
-**switching direction keeps the strength you've built up**. Letting go stops, but the
-built-up strength fades out instead of resetting (3 times as fast as it built up), so a
-quick re-press picks up close to where you left off. Farts never snap: a push swells in,
-trails off and swings round to a new direction over about a fifth of a second
-(`PUSH_RESPONSE_TIME`), and the gas cloud swings round with it.
+**Everyone gets their own stretch of the edge**, with blockers between them. The rim is
+shared out evenly between the seats: from your seat, halfway to the next seat each way.
+On a one-seat boat you can slide all the way round and push any way you like; on a
+six-seat boat you only get a sixth of it, so the crew has to work together to go
+anywhere. You slide at 6 studs/s (`RiderConfig.SLIDE_SPEED`), easing in and out.
+
+| Boat | Your stretch of the edge (test kit boats) |
+| ---- | ---- |
+| 1 seat | all the way round (33 studs) |
+| 2 seats | 157°, about 17 studs |
+| 3 seats | 100°, about 12 studs |
+| 4 seats | 72°, about 10 studs |
+| 5 seats | 56°, about 9 studs |
+| 6 seats | 45°, about 8 studs |
+
+**Hold the fart key to keep farting.** A fart starts at 12 studs/s² and builds up by 8
+every second you keep going, up to 30 (on a boat weighing `FartConfig.REFERENCE_MASS`;
+heavier boats speed up slower). Letting go stops, but the built-up strength fades out
+instead of resetting (3 times as fast as it built up), so a quick re-press picks up close
+to where you left off. A fart's push swells in and trails off over about a fifth of a
+second (`PUSH_RESPONSE_TIME`). You can slide while you fart.
 
 **Gas** drains at a flat 10 per second while you fart, however long you've been going, so a full tank
 (100) lasts 10 seconds. It refills at 15 per second while you're not farting. When it runs
 out you stop; let go and press again once there's gas. All of these numbers are in `FartConfig`.
 
-Everyone farting Straight cancels out; everyone farting Left spins the boat left on the spot.
+Riders on opposite sides farting at once cancel out.
 
-**Seat Cam:** on the river the camera sits behind your seat, so Straight always pushes
-up your screen. It bobs gently with the boat and shakes on hard bumps and splashes.
+**Seat Cam:** on the river the camera sits behind you and follows you as you slide, so
+farting always pushes the boat up your screen. It bobs gently with the boat and shakes on
+hard bumps and splashes.
 `V` (or `Y` on a controller) switches to the normal camera.
 Touch devices need on-screen buttons, which are UI, so they come with the menus.
 
@@ -239,16 +252,18 @@ which WaterService steps every frame on the server. It treats the boat as a real
 body and works out its whole motion in one go, so nothing fights over it and there are
 no hard speed caps:
 
-- **Farts** are forces at the riders' seats. Together they speed the boat up by
-  force ÷ mass and spin it by torque ÷ moment of inertia. The mass and the moment of
-  inertia come from the boat's actual parts plus its riders, so **big, heavy boats are
-  slower to get going and much slower to spin**, and a boat is lighter once a rider leaves.
+- **Farts** are forces from where the riders hang on, toward the middle of the boat.
+  Together they speed the boat up by force ÷ mass and spin it by torque ÷ moment of
+  inertia (pushes toward the middle hardly spin it; bumps and rapids do). The mass and
+  the moment of inertia come from the boat's actual parts plus its riders, so **big,
+  heavy boats are slower to get going and to spin**, and a boat is lighter once a rider
+  leaves.
 - **Water drag** pulls its speed toward the water's own speed. It's gentle at low speed,
   so a boat glides on for a few seconds after the crew stops, and grows with speed, so a
   boat levels off smoothly at its top speed: one rider at full strength cruises a boat of
   `REFERENCE_MASS` at about 24 studs/s (`WaterConfig.TOP_SPEED`). The same drag acting
   round the rim slows its spinning, times `WaterConfig.SPIN_DRAG_SCALE` (raise it for less
-  spin from Left and Right).
+  spin from bumps and rapids).
 - **Currents** carry it along, and **rapids** shove and twist it around at random.
 - **Buoyancy** holds it at the surface like a soft spring: it bobs on gentle **waves**,
   and a boat that drops in plunges, then settles in about 2 seconds without bouncing
@@ -259,16 +274,16 @@ no hard speed caps:
   only the hull touches the world. The hull is slippery and a little bouncy, so it
   glances off rocks and banks.
 
-With the test kit's boats and one rider:
+With the test kit's boats and one rider farting:
 
-| Boat | Weight (boat + rider) | Holding Straight: speed after 1 s / 3 s | Holding Left: spin after 1 s / 2 s | Tapping Left for 0.3 s: turns |
-| ---- | ---- | ---- | ---- | ---- |
-| 1 seat | 74 + 14 | 10 / 23 studs/s | 43 / 61 °/s | 11° |
-| 2 seats | 97 + 14 | 8 / 20 | 29 / 41 | 7° |
-| 3 seats | 121 + 14 | 6 / 17 | 21 / 30 | 5° |
-| 4 seats | 146 + 14 | 5 / 15 | 16 / 22 | 4° |
-| 5 seats | 173 + 14 | 5 / 13 | 12 / 18 | 3° |
-| 6 seats | 200 + 14 | 4 / 12 | 10 / 14 | 2° |
+| Boat | Weight (boat + rider) | Speed after 1 s / 3 s |
+| ---- | ---- | ---- |
+| 1 seat | 74 + 14 | 10 / 23 studs/s |
+| 2 seats | 97 + 14 | 8 / 20 |
+| 3 seats | 121 + 14 | 6 / 17 |
+| 4 seats | 146 + 14 | 5 / 15 |
+| 5 seats | 173 + 14 | 5 / 13 |
+| 6 seats | 200 + 14 | 4 / 12 |
 
 To make a boat nimbler or heavier, change its parts (their size and Material set how
 much they weigh). Fart strength is in `FartConfig`; water feel (drag, spin drag, bobbing,
@@ -335,10 +350,14 @@ Put one Model per size in **`ReplicatedStorage.Assets.Boats`**, named as in
 - Weld every other part, Seats included, to it with **WeldConstraints** (directly or through
   other welded parts). Anchoring doesn't matter: the code sets it.
 - Put in exactly as many **Seat** objects as the size (`Boat3` has 3 Seats). A seat is
-  where a rider **holds on**: put them on the rim, spaced around the edge, facing the
-  middle. Riders don't sit on them; they hang outside them, at `RiderConfig.HANG_OFFSET`
+  where a rider **holds on**: put them on the rim, spread evenly around the edge, facing
+  the middle. Riders don't sit on them; they hang outside them, at `RiderConfig.HANG_OFFSET`
   from the seat (a little below and outward). Change that offset if riders end up too
   high, too low, or inside the hull.
+- Each rider slides round a circle about the PrimaryPart, from their seat halfway to the
+  next seat each way, so make the boat round. Add **blockers** between the stretches if you
+  like (any parts welded on, like the test kit's dark fins); the code stops riders there
+  either way.
 - No scripts inside.
 - Every part's friction and bounciness is set by the code (`BoatConfig.HULL_...`); its
   density (from its Material) is kept. What the parts weigh, and how far out they sit,
@@ -359,12 +378,12 @@ Output warns at startup about any template that's missing or doesn't follow thes
 
 Without them farts still work, just invisible or silent, and Output warns once.
 
-The gas comes out of each rider's butt (`FartConfig.BUTT_OFFSET`, set its emitter's
-EmissionDirection to Back) and points wherever they've twisted to aim it.
+The gas comes out of each rider's butt (`FartConfig.BUTT_OFFSET`; set the emitter's
+EmissionDirection to Back), straight out behind them, off the raft.
 
-**Rider pose:** RiderService poses every rider in code (arms over the side, legs kicking,
-twisting to aim), so it needs no animation assets and works for R15 and R6. Its angles are
-in `RiderConfig`.
+**Rider pose:** RiderService poses every rider in code (arms over the side, going hand
+over hand as they slide, legs kicking), so it needs no animation assets and works for R15
+and R6. Its angles are in `RiderConfig`.
 
 ## For the UI (to be built by hand)
 
@@ -383,8 +402,9 @@ The client halves have everything the menus need:
 | List changed | `CheckpointServiceClient.UnlockedCheckpointsChanged` |
 | "Checkpoint reached" / "You win" | `CheckpointServiceClient.CheckpointReached`, `CheckpointServiceClient.GameCompleted` |
 | Gas meter | done: `UI.HUD.GasMeter` smoothly fills `StarterGui.HUD.GasMeter.Fill` (a Frame whose width shows the gas left). Build that by hand when you make the real HUD; the test kit makes a stand-in until then |
-| Touch fart buttons | call `FartServiceClient:PressFart(direction)` on press and `ReleaseFart(direction)` on release (`"Left"`, `"Straight"`, `"Right"`) |
-| Farting on and off (e.g. button glow) | `FartServiceClient.FartStarted` (direction) and `FartStopped` |
+| Touch fart button | call `FartServiceClient:PressFart()` on press and `FartServiceClient:ReleaseFart()` on release |
+| Touch slide buttons | call `RiderServiceClient:PressSlide("Left")` (or `"Right"`) on press and `RiderServiceClient:ReleaseSlide("Left")` (or `"Right"`) on release |
+| Farting on and off (e.g. button glow) | `FartServiceClient.FartStarted` and `FartStopped` |
 | RIP screen | `BoatServiceClient.BoatWiped` |
 
 ## Saving

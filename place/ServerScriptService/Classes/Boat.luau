@@ -11,9 +11,11 @@
 -- On the river it moves under physics that the server runs: its Hull (the Hull class)
 -- is stepped by WaterService every frame.
 -- Riders don't sit in the boat: they hang on to the outside of it at their seat
--- (RiderConfig.HANG_OFFSET), with their legs in the water. They weigh what they weigh,
--- but while they're on a boat they don't bump into anything, so only the hull touches
--- the world. RiderService poses them on every player's screen.
+-- (RiderConfig.HANG_OFFSET), with their legs in the water. They can slide round the edge
+-- within their own stretch of it: the rim is shared out between the seats, each rider
+-- getting from their seat halfway to the next seat each way (a lone seat gets the whole
+-- way round). RiderService moves them. They weigh what they weigh, but while they're on
+-- a boat they don't bump into anything, so only the hull touches the world.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
 --   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
@@ -24,8 +26,9 @@
 --                 keeping its own density.
 --   Seats         one Seat per player: where they hold on. The number of Seats must match
 --                 the size the template is listed under in BoatConfig.TEMPLATE_NAMES. Put
---                 them on the rim, around the edge, facing the middle; each rider hangs
---                 outside their seat at RiderConfig.HANG_OFFSET.
+--                 them on the rim, spread evenly round the edge, facing the middle; each
+--                 rider hangs outside their seat at RiderConfig.HANG_OFFSET and slides round
+--                 a circle about the PrimaryPart from there.
 --
 -- States: Docked -> Launched -> Destroyed. The model's State, LeaderUserId and
 -- DepartureTime attributes (see BoatServiceShared) mirror this for clients.
@@ -43,6 +46,15 @@ local Signal = require(ReplicatedStorage.Packages.Signal)
 local Boat = {}
 Boat.__index = Boat
 
+-- Where a rider hangs on from one seat, and how far round the edge they can slide.
+type RiderSpot = {
+	SeatCFrame: CFrame, -- the seat, in the PrimaryPart's space
+	HangCFrame: CFrame, -- the rider's HumanoidRootPart right at the seat, in the PrimaryPart's space
+	Radius: number, -- how far that is from the PrimaryPart, flat (studs)
+	MinAngle: number?, -- how far they can slide to their left (radians, negative)...
+	MaxAngle: number?, -- ...and to their right. Both nil: all the way round.
+}
+
 type BoatMembers = {
 	Model: Model,
 	Leader: Player, -- the party leader: who spawned it, or who took over after they left
@@ -52,6 +64,8 @@ type BoatMembers = {
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	Hull: Hull.Hull?, -- how it moves on the river; made when it launches
 	SeatRiders: { [Seat]: Player }, -- who is hanging on at each seat right now
+	RiderSpots: { [Seat]: RiderSpot },
+	RiderSlides: { [Seat]: number }, -- how far round the edge each seat's rider has slid (radians)
 	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
@@ -81,13 +95,46 @@ local function EjectFromSeat(seat: Seat)
 	end
 end
 
--- Moves whoever is in `seat` to hang on outside it, instead of sitting on it.
-local function HangFromSeat(seat: Seat)
-	local seatWeld = seat:FindFirstChild("SeatWeld")
-	if seatWeld and seatWeld:IsA("Weld") then
-		seatWeld.C0 = RiderConfig.HANG_OFFSET
-		seatWeld.C1 = CFrame.identity
+-- Where riders hang on from each of `seats`, and the stretch of the edge each can slide
+-- along: from their seat halfway to the next seat each way, less RIDER_SPACING so
+-- neighbours never overlap. A lone seat's rider can go all the way round.
+local function GetRiderSpots(primaryPart: BasePart, seats: { Seat }): { [Seat]: RiderSpot }
+	local spots: { [Seat]: RiderSpot } = {}
+	local angles: { [Seat]: number } = {}
+	for _, seat in seats do
+		local seatCFrame = primaryPart.CFrame:ToObjectSpace(seat.CFrame)
+		local hangCFrame = seatCFrame * RiderConfig.HANG_OFFSET
+		local flatPosition = Vector3.new(hangCFrame.X, 0, hangCFrame.Z)
+		spots[seat] = {
+			SeatCFrame = seatCFrame,
+			HangCFrame = hangCFrame,
+			Radius = flatPosition.Magnitude,
+			MinAngle = nil,
+			MaxAngle = nil,
+		}
+		-- Measured the same way CFrame.Angles(0, angle, 0) turns things: from +Z toward +X.
+		angles[seat] = math.atan2(hangCFrame.X, hangCFrame.Z)
 	end
+	if #seats < 2 then
+		return spots
+	end
+
+	local seatsInOrder = table.clone(seats)
+	table.sort(seatsInOrder, function(first, second)
+		return angles[first] < angles[second]
+	end)
+	local fullTurn = 2 * math.pi
+	for index, seat in seatsInOrder do
+		local previousSeat = seatsInOrder[(index - 2) % #seatsInOrder + 1]
+		local nextSeat = seatsInOrder[index % #seatsInOrder + 1]
+		local gapBefore = (angles[seat] - angles[previousSeat]) % fullTurn
+		local gapAfter = (angles[nextSeat] - angles[seat]) % fullTurn
+		local spot = spots[seat]
+		local spacing = if spot.Radius > 0 then RiderConfig.RIDER_SPACING / 2 / spot.Radius else 0
+		spot.MinAngle = -math.max(0, gapBefore / 2 - spacing)
+		spot.MaxAngle = math.max(0, gapAfter / 2 - spacing)
+	end
+	return spots
 end
 
 local function GetPlayerInSeat(seat: Seat): Player?
@@ -177,6 +224,8 @@ function Boat.new(
 			Crew = {},
 			Hull = nil,
 			SeatRiders = {},
+			RiderSpots = {},
+			RiderSlides = {},
 			RiderParts = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
@@ -205,6 +254,9 @@ function Boat.new(
 			)
 		end
 	end
+	if primaryPart then
+		self.RiderSpots = GetRiderSpots(primaryPart, self.Seats)
+	end
 	self:MoveTo(dockCFrame)
 
 	for _, seat in self.Seats do
@@ -220,7 +272,9 @@ function Boat.new(
 			self.Connections,
 			seat.ChildAdded:Connect(function(child)
 				if child.Name == "SeatWeld" then
-					task.defer(HangFromSeat, seat)
+					task.defer(function()
+						self:SetRiderSlide(seat, 0)
+					end)
 				end
 			end)
 		)
@@ -309,7 +363,7 @@ function Boat.OnSeatChanged(self: Boat, seat: Seat)
 	if rider then
 		self.SeatRiders[seat] = rider
 		self:PrepareRider(rider)
-		HangFromSeat(seat)
+		self:SetRiderSlide(seat, 0)
 	end
 
 	if isLaunched then
@@ -409,6 +463,44 @@ function Boat.Launch(self: Boat)
 	if primaryPart then
 		self.Hull = Hull.new(primaryPart)
 	end
+end
+
+-- Moves whoever hangs on at `seat` `angle` radians round the edge from it (positive is
+-- to the rider's right, as they face the middle), within GetSlideRange.
+function Boat.SetRiderSlide(self: Boat, seat: Seat, angle: number)
+	local spot = self.RiderSpots[seat]
+	local seatWeld = seat:FindFirstChild("SeatWeld")
+	if not spot then
+		return
+	end
+	self.RiderSlides[seat] = angle
+	if not seatWeld or not seatWeld:IsA("Weld") then
+		return
+	end
+	-- Roblox welds the rider to sit on the seat; instead, hang them at their spot.
+	seatWeld.C0 = spot.SeatCFrame:Inverse() * CFrame.Angles(0, angle, 0) * spot.HangCFrame
+	seatWeld.C1 = CFrame.identity
+end
+
+-- How far round the edge from `seat` its rider has slid (radians, positive is to their right).
+function Boat.GetRiderSlide(self: Boat, seat: Seat): number
+	return self.RiderSlides[seat] or 0
+end
+
+-- How far round the edge the rider at `seat` can slide: to their left (negative) and
+-- right (positive), in radians. Nil for both if they can go all the way round.
+function Boat.GetSlideRange(self: Boat, seat: Seat): (number?, number?)
+	local spot = self.RiderSpots[seat]
+	if not spot then
+		return 0, 0
+	end
+	return spot.MinAngle, spot.MaxAngle
+end
+
+-- How far from the middle of the boat the rider at `seat` hangs (studs).
+function Boat.GetRiderRadius(self: Boat, seat: Seat): number
+	local spot = self.RiderSpots[seat]
+	return if spot then spot.Radius else 0
 end
 
 -- While `player` hangs on, their body doesn't bump into anything; only the hull does.

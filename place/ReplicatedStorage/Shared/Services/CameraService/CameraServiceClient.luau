@@ -2,9 +2,9 @@
 -- ModuleScript: ReplicatedStorage.Shared.Services.CameraService.CameraServiceClient
 --
 -- Seat Cam: while the local player rides a boat on the river, the camera sits behind
--- their own seat and looks across the boat. That way Straight always pushes the boat
--- up the screen and Left always turns the view left. Press V (or Y on a controller)
--- to switch to the normal Roblox camera and back.
+-- them and looks across the boat, following them as they slide round its edge. That way
+-- farting always pushes the boat up the screen, and sliding left swings the view round
+-- to the left. Press V (or Y on a controller) to switch to the normal Roblox camera and back.
 --
 -- The camera rides at the height of the boat's middle, so it bobs gently with the
 -- waves but doesn't swing up and down as the boat rocks. A hard bump or a big splash
@@ -33,8 +33,9 @@ type CameraServiceClientMembers = {
 
 export type CameraServiceClient = typeof(CameraServiceClient) & CameraServiceClientMembers
 
--- The boat model and seat the local player is riding on the river, if any.
-local function GetRiddenSeat(): (Model?, BasePart?)
+-- The boat model the local player is riding on the river, if any, and the part to
+-- follow: their HumanoidRootPart, which slides round the edge with them (or their seat).
+local function GetRiddenBoat(): (Model?, BasePart?)
 	local character = localPlayer.Character
 	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
 	local seat = if humanoid then humanoid.SeatPart else nil
@@ -42,7 +43,8 @@ local function GetRiddenSeat(): (Model?, BasePart?)
 	if not seat or not boatModel or boatModel:GetAttribute(BoatServiceShared.STATE_ATTRIBUTE) ~= "Launched" then
 		return nil, nil
 	end
-	return boatModel, seat
+	local rootPart = humanoid and humanoid.RootPart
+	return boatModel, rootPart or seat
 end
 
 function CameraServiceClient.Init(self: CameraServiceClient)
@@ -89,8 +91,8 @@ end
 
 function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number)
 	local camera = workspace.CurrentCamera
-	local boatModel, seat = GetRiddenSeat()
-	if not self.SeatCamEnabled or not boatModel or not seat then
+	local boatModel, riderPart = GetRiddenBoat()
+	if not self.SeatCamEnabled or not boatModel or not riderPart then
 		if camera.CameraType == Enum.CameraType.Scriptable then
 			camera.CameraType = Enum.CameraType.Custom
 		end
@@ -102,9 +104,9 @@ function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number
 	self:ShakeOnImpact(boatModel)
 
 	local boatPosition = boatModel:GetPivot().Position
-	local facing = BoatServiceShared.GetRiderFacing(boatPosition, seat.CFrame)
-	local seatPosition = Vector3.new(seat.Position.X, boatPosition.Y, seat.Position.Z)
-	local eye = seatPosition - facing * CameraConfig.SEAT_CAM_BACK + Vector3.yAxis * CameraConfig.SEAT_CAM_UP
+	local facing = BoatServiceShared.GetRiderFacing(boatPosition, riderPart.CFrame)
+	local riderPosition = Vector3.new(riderPart.Position.X, boatPosition.Y, riderPart.Position.Z)
+	local eye = riderPosition - facing * CameraConfig.SEAT_CAM_BACK + Vector3.yAxis * CameraConfig.SEAT_CAM_UP
 	local goal = CFrame.lookAt(eye, boatPosition + facing * CameraConfig.SEAT_CAM_LOOK_AHEAD)
 
 	local smoothing = 1 - math.exp(-CameraConfig.SEAT_CAM_SMOOTHING * deltaTime)

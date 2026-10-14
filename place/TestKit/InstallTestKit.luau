@@ -341,7 +341,7 @@ local function WeldToRoot(root: BasePart, part: BasePart)
 end
 
 -- A round inflatable boat: a ring of tube with a seat on its outer edge for each rider
--- to hang on to, facing the middle.
+-- to hang on to, facing the middle, and blockers between their stretches of the edge.
 local function BuildBoatTemplate(seatCount: number): Model
 	local model = Instance.new("Model")
 	model.Name = BoatConfig.TEMPLATE_NAMES[seatCount]
@@ -396,6 +396,25 @@ local function BuildBoatTemplate(seatCount: number): Model
 		seat.TopSurface = Enum.SurfaceType.Smooth
 		seat.Parent = model
 		WeldToRoot(root, seat)
+	end
+
+	-- Blockers between the riders' stretches of the edge (riders slide up to them, not
+	-- through them; the Boat class sets where each stretch ends)
+	if seatCount >= 2 then
+		for blockerNumber = 1, seatCount do
+			local angle = (blockerNumber - 0.5) / seatCount * 2 * math.pi
+			local radius = ringRadius + tubeRadius
+			local position = Vector3.new(math.cos(angle) * radius, 0.8, math.sin(angle) * radius)
+			local blocker = MakePart(
+				model,
+				"Blocker",
+				Vector3.new(0.4, 2.4, 1.6),
+				CFrame.lookAt(position, Vector3.new(0, 0.8, 0)),
+				color:Lerp(Color3.new(0, 0, 0), 0.5)
+			)
+			blocker.CanCollide = false
+			WeldToRoot(root, blocker)
+		end
 	end
 	return model
 end
@@ -491,7 +510,7 @@ function TestKit.Build()
 	BuildMap()
 	BuildGasMeter()
 	print(
-		"[TestKit] Test world built. Walk to a dock and press E to spawn a boat, sit in it, then wait for the timer or press F to start. Fart with A / W / D."
+		"[TestKit] Test world built. Walk to a dock and press E to spawn a boat, sit in it, then wait for the timer or press F to start. Slide round the edge with A / D, fart with W."
 	)
 end
 
