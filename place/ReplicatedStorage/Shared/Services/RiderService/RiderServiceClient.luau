@@ -5,11 +5,14 @@
 -- server puts them there; see the Boat class).
 --
 -- Sliding: hold a slide key to slide round the edge of your boat, within your own
--- stretch of it. The server does the moving (RiderServiceServer); this asks it to.
---   Slide left    A, Left arrow, Q, or LB
---   Slide right   D, Right arrow, E, or RB
+-- stretch of it.
+--   Slide left    A, Left arrow, Q, LB, or the left stick pushed left
+--   Slide right   D, Right arrow, E, RB, or the left stick pushed right
 -- If you hold both, the one you pressed last wins. On-screen buttons for touch devices
 -- (UI, to be built) call PressSlide and ReleaseSlide.
+-- The server decides where everyone is (RiderServiceServer), but your own slide shows
+-- straight away: this runs the same rules (RiderSpots) and settles onto the server's
+-- answer once you stop. Other riders glide smoothly to where the server has them.
 --
 -- Posing: every player hanging on to a boat is posed on this player's screen: arms
 -- reaching over the side (going hand over hand while they slide) and legs kicking in
@@ -25,6 +28,7 @@ local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
 local RiderServiceShared = require(ReplicatedStorage.Shared.Services.RiderService.RiderServiceShared)
+local RiderSpots = require(ReplicatedStorage.Shared.Services.RiderService.RiderSpots)
 
 export type Side = "Left" | "Right"
 
@@ -36,6 +40,8 @@ local SIDE_DIRECTIONS: { [Side]: number } = {
 	Left = -1,
 	Right = 1,
 }
+local STICK_INPUT = "Thumbstick1" -- what the left stick counts as among the held slide inputs
+local MIN_SLIDE_SPEED = 0.01 -- a slide that has eased below this (studs/s) has stopped
 
 -- The joints a rider is posed by, by what they do.
 type Rig = { [string]: Motor6D }
@@ -60,6 +66,12 @@ local R6_JOINTS: { [string]: { string } } = {
 	LeftHip = { "Torso", "Left Hip" },
 }
 
+-- Where a seat's rider is shown, and who that is (so a new rider starts fresh).
+type ShownAngle = {
+	Rider: Player,
+	Angle: number, -- radians round from the seat
+}
+
 -- What a rider's pose remembers between frames.
 type Rider = {
 	Rig: Rig,
@@ -76,6 +88,11 @@ type RiderServiceClientMembers = {
 	SlideDirection: number, -- what the server was last asked: -1 left, 1 right, 0 not sliding
 	RequestSlideRemote: RemoteEvent?, -- set once the server has created it
 	Riders: { [Model]: Rider }, -- each rider's pose state, by character
+	BoatSpots: { [Model]: { [BasePart]: RiderSpots.RiderSpot } }, -- each boat's rider spots, worked out once
+	ShownAngles: { [BasePart]: ShownAngle }, -- how far round from each seat its rider is shown
+	LocalSeat: BasePart?, -- the seat the local player's own slide is being worked out from
+	LocalAngle: number, -- where the local player is shown, ahead of the server
+	LocalSpeed: number,
 }
 
 export type RiderServiceClient = typeof(RiderServiceClient) & RiderServiceClientMembers
@@ -121,6 +138,11 @@ function RiderServiceClient.Init(self: RiderServiceClient)
 	self.SlideDirection = 0
 	self.RequestSlideRemote = nil
 	self.Riders = setmetatable({}, { __mode = "k" }) :: any
+	self.BoatSpots = setmetatable({}, { __mode = "k" }) :: any
+	self.ShownAngles = setmetatable({}, { __mode = "k" }) :: any
+	self.LocalSeat = nil
+	self.LocalAngle = 0
+	self.LocalSpeed = 0
 
 	local function OnSlideAction(actionName: string, inputState: Enum.UserInputState, input: InputObject)
 		local side: Side? = SLIDE_ACTIONS[actionName]
@@ -164,6 +186,18 @@ function RiderServiceClient.Init(self: RiderServiceClient)
 		Enum.KeyCode.E,
 		Enum.KeyCode.ButtonR1
 	)
+	ContextActionService:BindAction("SlideStick", function(_actionName, _inputState, input: InputObject)
+		local _, seat = GetBoatSeat(localPlayer.Character)
+		local x = input.Position.X
+		local side: Side? = if not seat
+			then nil
+			elseif x <= -RiderConfig.STICK_DEADZONE then "Left"
+			elseif x >= RiderConfig.STICK_DEADZONE then "Right"
+			else nil
+		self:SetHeldSlide(STICK_INPUT, side)
+		-- Let the stick do its normal job too (it doesn't walk while hanging on).
+		return Enum.ContextActionResult.Pass
+	end, false, Enum.KeyCode.Thumbstick1)
 
 	-- After animations are applied each frame, so the pose wins over the sitting animation.
 	RunService.PreSimulation:Connect(function(deltaTime)
@@ -179,19 +213,27 @@ end
 
 -- A slide key (or on-screen button, which can leave out `inputName`) went down.
 function RiderServiceClient.PressSlide(self: RiderServiceClient, side: Side, inputName: string?)
-	local input = inputName or `Button{side}`
-	self:ReleaseSlide(side, input)
-	table.insert(self.HeldSlides, { Input = input, Side = side })
-	self:UpdateSlideDirection()
+	self:SetHeldSlide(inputName or `Button{side}`, side)
 end
 
 -- A slide key (or on-screen button) was let go.
 function RiderServiceClient.ReleaseSlide(self: RiderServiceClient, side: Side, inputName: string?)
-	local input = inputName or `Button{side}`
+	self:SetHeldSlide(inputName or `Button{side}`, nil)
+end
+
+-- Records that `input` is now holding a slide to `side`, or nothing (nil), and tells the
+-- server if that changes which way to slide.
+function RiderServiceClient.SetHeldSlide(self: RiderServiceClient, input: string, side: Side?)
 	for index = #self.HeldSlides, 1, -1 do
 		if self.HeldSlides[index].Input == input then
+			if self.HeldSlides[index].Side == side then
+				return -- already held that way
+			end
 			table.remove(self.HeldSlides, index)
 		end
+	end
+	if side then
+		table.insert(self.HeldSlides, { Input = input, Side = side })
 	end
 	self:UpdateSlideDirection()
 end
@@ -210,10 +252,11 @@ function RiderServiceClient.UpdateSlideDirection(self: RiderServiceClient)
 end
 
 function RiderServiceClient.Update(self: RiderServiceClient, deltaTime: number)
-	-- Got off the boat while sliding: stop.
-	if #self.HeldSlides > 0 then
-		local _, seat = GetBoatSeat(localPlayer.Character)
-		if not seat then
+	-- Got off the boat: stop sliding, and start fresh next time.
+	local _, localSeat = GetBoatSeat(localPlayer.Character)
+	if not localSeat then
+		self.LocalSeat = nil
+		if #self.HeldSlides > 0 then
 			table.clear(self.HeldSlides)
 			self:UpdateSlideDirection()
 		end
@@ -222,11 +265,101 @@ function RiderServiceClient.Update(self: RiderServiceClient, deltaTime: number)
 	local time = os.clock()
 	for _, player in Players:GetPlayers() do
 		local character = player.Character
-		local humanoid, _, boatModel = GetBoatSeat(character)
-		if character and humanoid and boatModel then
+		local humanoid, seat, boatModel = GetBoatSeat(character)
+		if character and humanoid and seat and boatModel then
+			self:PlaceRider(player, seat, boatModel, deltaTime)
 			self:PoseRider(player, character, humanoid, boatModel, time)
 		end
 	end
+end
+
+-- Where riders on `boatModel` hang on and can slide, worked out once per boat.
+function RiderServiceClient.GetSpot(self: RiderServiceClient, boatModel: Model, seat: BasePart): RiderSpots.RiderSpot?
+	local spots = self.BoatSpots[boatModel]
+	if spots and spots[seat] then
+		return spots[seat]
+	end
+	local primaryPart = boatModel.PrimaryPart
+	if not primaryPart then
+		return nil
+	end
+	local seats: { BasePart } = {}
+	for _, descendant in boatModel:GetDescendants() do
+		if descendant:IsA("Seat") then
+			table.insert(seats, descendant)
+		end
+	end
+	local newSpots = RiderSpots.GetSpots(primaryPart.CFrame, seats)
+	self.BoatSpots[boatModel] = newSpots
+	return newSpots[seat]
+end
+
+-- Hangs `player` where they should be shown round `seat`: the local player straight
+-- away (ahead of the server), everyone else gliding to where the server has them.
+function RiderServiceClient.PlaceRider(
+	self: RiderServiceClient,
+	player: Player,
+	seat: BasePart,
+	boatModel: Model,
+	deltaTime: number
+)
+	local spot = self:GetSpot(boatModel, seat)
+	if not spot then
+		return
+	end
+	local serverValue = seat:GetAttribute(RiderServiceShared.SLIDE_ANGLE_ATTRIBUTE)
+	local serverAngle = if typeof(serverValue) == "number" then serverValue else 0
+
+	local angle: number
+	if player == localPlayer then
+		angle = self:PredictLocalSlide(seat, spot, serverAngle, deltaTime)
+	else
+		local shown = self.ShownAngles[seat]
+		local current = if shown and shown.Rider == player then shown.Angle else serverAngle
+		local blend = if RiderConfig.OTHER_RIDER_SMOOTHING > 0
+			then 1 - math.exp(-deltaTime / RiderConfig.OTHER_RIDER_SMOOTHING)
+			else 1
+		angle = current + RiderSpots.GetAngleDifference(current, serverAngle) * blend
+	end
+	self.ShownAngles[seat] = { Rider = player, Angle = angle }
+
+	local seatWeld = seat:FindFirstChild("SeatWeld")
+	if seatWeld and seatWeld:IsA("Weld") then
+		seatWeld.C0 = RiderSpots.GetSeatWeldC0(spot, angle)
+		seatWeld.C1 = CFrame.identity
+	end
+end
+
+-- Moves the local player's own rider on by one frame with the same rules the server
+-- uses, so their slide shows straight away. Once they stop, it settles onto where the
+-- server has them; if it's ever far off (the server stopped them), it jumps there.
+function RiderServiceClient.PredictLocalSlide(
+	self: RiderServiceClient,
+	seat: BasePart,
+	spot: RiderSpots.RiderSpot,
+	serverAngle: number,
+	deltaTime: number
+): number
+	if self.LocalSeat ~= seat then
+		self.LocalSeat = seat
+		self.LocalAngle = serverAngle
+		self.LocalSpeed = 0
+	end
+	local angle, speed = RiderSpots.StepSlide(spot, self.LocalAngle, self.LocalSpeed, self.SlideDirection, deltaTime)
+
+	local offBy = RiderSpots.GetAngleDifference(angle, serverAngle)
+	if math.abs(offBy) * math.max(spot.Radius, 1) > RiderConfig.SLIDE_SNAP_DISTANCE then
+		angle = serverAngle
+		speed = 0
+	elseif self.SlideDirection == 0 and math.abs(speed) < MIN_SLIDE_SPEED then
+		local blend = if RiderConfig.SLIDE_CORRECTION_TIME > 0
+			then 1 - math.exp(-deltaTime / RiderConfig.SLIDE_CORRECTION_TIME)
+			else 1
+		angle += offBy * blend
+	end
+	self.LocalAngle = angle
+	self.LocalSpeed = speed
+	return angle
 end
 
 -- Poses one rider hanging on to their boat.

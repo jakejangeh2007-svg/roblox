@@ -3,9 +3,11 @@
 --
 -- Slides riders round the edge of their boat. A client asks to slide left or right, or
 -- to stop (RequestSlide); the server moves them at a set speed (RiderConfig.SLIDE_SPEED),
--- easing in and out, and never past the ends of their own stretch of the edge (see the
--- Boat class). Where a rider is, and so where their farts push from, is always the
--- server's call. Works the same at the dock and on the river.
+-- easing in and out, and never past the ends of their own stretch of the edge (the rules
+-- are in RiderSpots). Where a rider is, and so where their farts push from, is always the
+-- server's call; the sliding player's client shows their slide straight away with the
+-- same rules, then settles onto the server's answer. Works the same at the dock and on
+-- the river.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -14,11 +16,10 @@ local ServerScriptService = game:GetService("ServerScriptService")
 
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
-local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
 local RiderServiceShared = require(ReplicatedStorage.Shared.Services.RiderService.RiderServiceShared)
+local RiderSpots = require(ReplicatedStorage.Shared.Services.RiderService.RiderSpots)
 
 local MIN_SLIDE_SPEED = 0.01 -- a slide that has eased below this (studs/s) has stopped
-local MIN_TURN_RADIUS = 1 -- a rider this close to the middle (studs) turns on the spot as if this far out
 
 local RiderServiceServer = {}
 
@@ -68,32 +69,20 @@ function RiderServiceServer.Update(self: RiderServiceServer, deltaTime: number)
 		sliders[player] = true
 	end
 
-	local blend = if RiderConfig.SLIDE_RESPONSE_TIME > 0
-		then 1 - math.exp(-deltaTime / RiderConfig.SLIDE_RESPONSE_TIME)
-		else 1
 	for player in sliders do
 		local boat, seat = BoatServiceServer:GetRiddenSeat(player)
-		if not boat or not seat then
+		local spot = if boat and seat then boat:GetRiderSpot(seat) else nil
+		if not boat or not seat or not spot then
 			self:ForgetRider(player)
 			continue
 		end
-		local speed = self.SlideSpeeds[player] or 0
-		speed += ((self.SlideInputs[player] or 0) * RiderConfig.SLIDE_SPEED - speed) * blend
-		local radius = math.max(boat:GetRiderRadius(seat), MIN_TURN_RADIUS)
-		local angle = boat:GetRiderSlide(seat) + speed / radius * deltaTime
-
-		local minAngle, maxAngle = boat:GetSlideRange(seat)
-		if minAngle and maxAngle then
-			-- Stopped by the blockers at the ends of their stretch
-			if angle <= minAngle or angle >= maxAngle then
-				angle = math.clamp(angle, minAngle, maxAngle)
-				speed = 0
-			end
-		else
-			-- All the way round: keep the angle between -pi and pi.
-			angle = (angle + math.pi) % (2 * math.pi) - math.pi
-		end
-
+		local angle, speed = RiderSpots.StepSlide(
+			spot,
+			boat:GetRiderSlide(seat),
+			self.SlideSpeeds[player] or 0,
+			self.SlideInputs[player] or 0,
+			deltaTime
+		)
 		if self.SlideInputs[player] or math.abs(speed) >= MIN_SLIDE_SPEED then
 			self.SlideSpeeds[player] = speed
 		else

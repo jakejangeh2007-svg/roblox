@@ -8,6 +8,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 
 export type BoatState = "Docked" | "Launched" | "Destroyed"
+export type WipeReason = "Fell" | "Popped" -- fell off the river, or a hazard popped it
 
 local BoatServiceShared = {
 	SERVICE_NAME = "BoatService",
@@ -22,7 +23,7 @@ local BoatServiceShared = {
 	DEPARTURE_TIME_ATTRIBUTE = "DepartureTime", -- server time (workspace:GetServerTimeNow()) a docked boat leaves
 
 	-- Remotes
-	NOTIFY_BOAT_WIPED = "NotifyBoatWiped", -- RemoteEvent to each crew member when their boat falls off the river
+	NOTIFY_BOAT_WIPED = "NotifyBoatWiped", -- RemoteEvent to each crew member when their boat is out of the run (reason: WipeReason)
 	REQUEST_JOIN_BOAT = "RequestJoinBoat", -- RemoteFunction (boat: Model) -> (success: boolean, message: string?)
 	REQUEST_START_RUN = "RequestStartRun", -- RemoteFunction () -> (success: boolean, message: string?); party leader only
 }

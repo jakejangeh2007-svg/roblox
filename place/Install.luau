@@ -21,6 +21,7 @@ local FOLDERS: { { string } } = {
 	{ "ReplicatedStorage", "Assets", "Boats" },
 	{ "ReplicatedStorage", "Assets", "VFX" },
 	{ "ReplicatedStorage", "Assets", "Sounds", "Farts" },
+	{ "ReplicatedStorage", "Assets", "Obstacles" },
 	{ "ReplicatedStorage", "UI", "HUD" },
 	{ "ReplicatedStorage", "UI", "Menus" },
 	{ "ServerScriptService", "Services" },
@@ -28,6 +29,7 @@ local FOLDERS: { { string } } = {
 	{ "Workspace", "Map", "Lobby", "Docks" },
 	{ "Workspace", "Map", "Checkpoints" },
 	{ "Workspace", "Map", "Water" },
+	{ "Workspace", "Map", "Obstacles" },
 	{ "Workspace", "Boats" },
 }
 
@@ -318,20 +320,12 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
 local Hull = require(ServerScriptService.Classes.Hull)
-local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
+local RiderServiceShared = require(ReplicatedStorage.Shared.Services.RiderService.RiderServiceShared)
+local RiderSpots = require(ReplicatedStorage.Shared.Services.RiderService.RiderSpots)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
 local Boat = {}
 Boat.__index = Boat
-
--- Where a rider hangs on from one seat, and how far round the edge they can slide.
-type RiderSpot = {
-	SeatCFrame: CFrame, -- the seat, in the PrimaryPart's space
-	HangCFrame: CFrame, -- the rider's HumanoidRootPart right at the seat, in the PrimaryPart's space
-	Radius: number, -- how far that is from the PrimaryPart, flat (studs)
-	MinAngle: number?, -- how far they can slide to their left (radians, negative)...
-	MaxAngle: number?, -- ...and to their right. Both nil: all the way round.
-}
 
 type BoatMembers = {
 	Model: Model,
@@ -342,7 +336,7 @@ type BoatMembers = {
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	Hull: Hull.Hull?, -- how it moves on the river; made when it launches
 	SeatRiders: { [Seat]: Player }, -- who is hanging on at each seat right now
-	RiderSpots: { [Seat]: RiderSpot },
+	RiderSpots: { [BasePart]: RiderSpots.RiderSpot }, -- where each seat's rider hangs on and can slide
 	RiderSlides: { [Seat]: number }, -- how far round the edge each seat's rider has slid (radians)
 	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
 	LaunchCFrame: CFrame,
@@ -371,48 +365,6 @@ local function EjectFromSeat(seat: Seat)
 	if seatWeld then
 		seatWeld:Destroy()
 	end
-end
-
--- Where riders hang on from each of `seats`, and the stretch of the edge each can slide
--- along: from their seat halfway to the next seat each way, less RIDER_SPACING so
--- neighbours never overlap. A lone seat's rider can go all the way round.
-local function GetRiderSpots(primaryPart: BasePart, seats: { Seat }): { [Seat]: RiderSpot }
-	local spots: { [Seat]: RiderSpot } = {}
-	local angles: { [Seat]: number } = {}
-	for _, seat in seats do
-		local seatCFrame = primaryPart.CFrame:ToObjectSpace(seat.CFrame)
-		local hangCFrame = seatCFrame * RiderConfig.HANG_OFFSET
-		local flatPosition = Vector3.new(hangCFrame.X, 0, hangCFrame.Z)
-		spots[seat] = {
-			SeatCFrame = seatCFrame,
-			HangCFrame = hangCFrame,
-			Radius = flatPosition.Magnitude,
-			MinAngle = nil,
-			MaxAngle = nil,
-		}
-		-- Measured the same way CFrame.Angles(0, angle, 0) turns things: from +Z toward +X.
-		angles[seat] = math.atan2(hangCFrame.X, hangCFrame.Z)
-	end
-	if #seats < 2 then
-		return spots
-	end
-
-	local seatsInOrder = table.clone(seats)
-	table.sort(seatsInOrder, function(first, second)
-		return angles[first] < angles[second]
-	end)
-	local fullTurn = 2 * math.pi
-	for index, seat in seatsInOrder do
-		local previousSeat = seatsInOrder[(index - 2) % #seatsInOrder + 1]
-		local nextSeat = seatsInOrder[index % #seatsInOrder + 1]
-		local gapBefore = (angles[seat] - angles[previousSeat]) % fullTurn
-		local gapAfter = (angles[nextSeat] - angles[seat]) % fullTurn
-		local spot = spots[seat]
-		local spacing = if spot.Radius > 0 then RiderConfig.RIDER_SPACING / 2 / spot.Radius else 0
-		spot.MinAngle = -math.max(0, gapBefore / 2 - spacing)
-		spot.MaxAngle = math.max(0, gapAfter / 2 - spacing)
-	end
-	return spots
 end
 
 local function GetPlayerInSeat(seat: Seat): Player?
@@ -533,7 +485,11 @@ function Boat.new(
 		end
 	end
 	if primaryPart then
-		self.RiderSpots = GetRiderSpots(primaryPart, self.Seats)
+		local seatParts: { BasePart } = {}
+		for _, seat in self.Seats do
+			table.insert(seatParts, seat)
+		end
+		self.RiderSpots = RiderSpots.GetSpots(primaryPart.CFrame, seatParts)
 	end
 	self:MoveTo(dockCFrame)
 
@@ -743,21 +699,22 @@ function Boat.Launch(self: Boat)
 	end
 end
 
--- Moves whoever hangs on at `seat` `angle` radians round the edge from it (positive is
--- to the rider's right, as they face the middle), within GetSlideRange.
+-- Moves whoever hangs on at `seat` `angle` radians round the edge from it (see
+-- RiderSpots), and tells every client (the seat's SlideAngle attribute).
 function Boat.SetRiderSlide(self: Boat, seat: Seat, angle: number)
 	local spot = self.RiderSpots[seat]
-	local seatWeld = seat:FindFirstChild("SeatWeld")
 	if not spot then
 		return
 	end
 	self.RiderSlides[seat] = angle
-	if not seatWeld or not seatWeld:IsA("Weld") then
-		return
+	if seat:GetAttribute(RiderServiceShared.SLIDE_ANGLE_ATTRIBUTE) ~= angle then
+		seat:SetAttribute(RiderServiceShared.SLIDE_ANGLE_ATTRIBUTE, angle)
 	end
-	-- Roblox welds the rider to sit on the seat; instead, hang them at their spot.
-	seatWeld.C0 = spot.SeatCFrame:Inverse() * CFrame.Angles(0, angle, 0) * spot.HangCFrame
-	seatWeld.C1 = CFrame.identity
+	local seatWeld = seat:FindFirstChild("SeatWeld")
+	if seatWeld and seatWeld:IsA("Weld") then
+		seatWeld.C0 = RiderSpots.GetSeatWeldC0(spot, angle)
+		seatWeld.C1 = CFrame.identity
+	end
 end
 
 -- How far round the edge from `seat` its rider has slid (radians, positive is to their right).
@@ -765,20 +722,9 @@ function Boat.GetRiderSlide(self: Boat, seat: Seat): number
 	return self.RiderSlides[seat] or 0
 end
 
--- How far round the edge the rider at `seat` can slide: to their left (negative) and
--- right (positive), in radians. Nil for both if they can go all the way round.
-function Boat.GetSlideRange(self: Boat, seat: Seat): (number?, number?)
-	local spot = self.RiderSpots[seat]
-	if not spot then
-		return 0, 0
-	end
-	return spot.MinAngle, spot.MaxAngle
-end
-
--- How far from the middle of the boat the rider at `seat` hangs (studs).
-function Boat.GetRiderRadius(self: Boat, seat: Seat): number
-	local spot = self.RiderSpots[seat]
-	return if spot then spot.Radius else 0
+-- Where `seat`'s rider hangs on and how far they can slide, if it's one of this boat's seats.
+function Boat.GetRiderSpot(self: Boat, seat: Seat): RiderSpots.RiderSpot?
+	return self.RiderSpots[seat]
 end
 
 -- While `player` hangs on, their body doesn't bump into anything; only the hull does.
@@ -1495,6 +1441,553 @@ return GasMeter :: GasMeter
 ]==],
 	},
 	{
+		ParentPath = { "ServerScriptService", "Classes", "Obstacles" },
+		Name = "ObstacleRig",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Classes.Obstacles.ObstacleRig
+--
+-- Gets an obstacle Model ready to move, for the Spinner, Swinger, Slider and WindFan
+-- classes. It finds the obstacle's Base (the fixed part) and Moving (the part that
+-- moves, with everything welded to it), joins them with a physics constraint that the
+-- obstacle class drives, and hands the moving parts to physics. The server runs that
+-- physics, so obstacles shove boats properly and move smoothly for every player.
+--
+-- Spinners, Swingers and WindFans turn around the line through the middle of Base along
+-- its front face; Sliders slide along its front face. Their moving parts and Base are put
+-- in the Obstacles collision group, so they hit boats but pass through the map and each
+-- other. Any other parts in the Model are scenery and stay as they are.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local ObstacleServiceShared = require(ReplicatedStorage.Shared.Services.ObstacleService.ObstacleServiceShared)
+
+local AXIS_ATTACHMENT_NAME = "ObstacleAxis"
+
+local ObstacleRig = {}
+ObstacleRig.__index = ObstacleRig
+
+type ObstacleRigMembers = {
+	Model: Model,
+	Base: BasePart,
+	Moving: BasePart,
+	MovingParts: { BasePart }, -- Moving and everything welded to it
+	AxisCFrame: CFrame, -- through the middle of Base, its X axis along Base's front face
+}
+
+export type ObstacleRig = typeof(setmetatable({} :: ObstacleRigMembers, ObstacleRig))
+
+-- Every part in `model` welded to `start`, directly or through other welded parts,
+-- `start` included.
+local function GetWeldedParts(model: Model, start: BasePart): { [BasePart]: boolean }
+	local neighbors: { [BasePart]: { BasePart } } = {}
+	local function Link(first: BasePart, second: BasePart)
+		local list = neighbors[first] or {}
+		neighbors[first] = list
+		table.insert(list, second)
+	end
+	for _, descendant in model:GetDescendants() do
+		local part0: BasePart?, part1: BasePart? = nil, nil
+		if descendant:IsA("WeldConstraint") or descendant:IsA("JointInstance") then
+			part0, part1 = descendant.Part0, descendant.Part1
+		end
+		if part0 and part1 and part0:IsDescendantOf(model) and part1:IsDescendantOf(model) then
+			Link(part0, part1)
+			Link(part1, part0)
+		end
+	end
+
+	local reached: { [BasePart]: boolean } = { [start] = true }
+	local toVisit = { start }
+	while #toVisit > 0 do
+		local part = table.remove(toVisit) :: BasePart
+		local partNeighbors: { BasePart } = neighbors[part] or {}
+		for _, neighbor in partNeighbors do
+			if not reached[neighbor] then
+				reached[neighbor] = true
+				table.insert(toVisit, neighbor)
+			end
+		end
+	end
+	return reached
+end
+
+-- An attachment in `part` at `worldCFrame`.
+local function MakeAttachment(part: BasePart, worldCFrame: CFrame): Attachment
+	local attachment = Instance.new("Attachment")
+	attachment.Name = AXIS_ATTACHMENT_NAME
+	attachment.CFrame = part.CFrame:ToObjectSpace(worldCFrame)
+	attachment.Parent = part
+	return attachment
+end
+
+-- Gets `model` ready, or returns a description of what's wrong with it.
+function ObstacleRig.new(model: Model): (ObstacleRig?, string?)
+	local base = model:FindFirstChild(ObstacleServiceShared.BASE_NAME)
+	if not base or not base:IsA("BasePart") then
+		return nil, `has no part named {ObstacleServiceShared.BASE_NAME}`
+	end
+	local moving = model:FindFirstChild(ObstacleServiceShared.MOVING_NAME)
+	if not moving or not moving:IsA("BasePart") then
+		return nil, `has no part named {ObstacleServiceShared.MOVING_NAME}`
+	end
+	local weldedParts = GetWeldedParts(model, moving)
+	if weldedParts[base] then
+		return nil,
+			`has its {ObstacleServiceShared.MOVING_NAME} welded to its {ObstacleServiceShared.BASE_NAME}, so it can't move`
+	end
+
+	local movingParts = {}
+	for part in weldedParts do
+		part.CollisionGroup = ObstacleServiceShared.COLLISION_GROUP
+		table.insert(movingParts, part)
+	end
+	base.Anchored = true
+	base.CollisionGroup = ObstacleServiceShared.COLLISION_GROUP
+
+	local axisCFrame = CFrame.fromMatrix(base.Position, base.CFrame.LookVector, base.CFrame.UpVector)
+	return setmetatable(
+		{
+			Model = model,
+			Base = base,
+			Moving = moving,
+			MovingParts = movingParts,
+			AxisCFrame = axisCFrame,
+		} :: ObstacleRigMembers,
+		ObstacleRig
+	),
+		nil
+end
+
+-- A hinge that turns Moving around the axis. Its angle is 0 where Moving was built.
+function ObstacleRig.AddHinge(self: ObstacleRig): HingeConstraint
+	local hinge = Instance.new("HingeConstraint")
+	hinge.Attachment0 = MakeAttachment(self.Base, self.AxisCFrame)
+	hinge.Attachment1 = MakeAttachment(self.Moving, self.AxisCFrame)
+	hinge.LimitsEnabled = false
+	hinge.Parent = self.Base
+	return hinge
+end
+
+-- A slider that moves Moving along the axis. Its position is 0 where Moving was built.
+function ObstacleRig.AddPrismatic(self: ObstacleRig): PrismaticConstraint
+	local prismatic = Instance.new("PrismaticConstraint")
+	prismatic.Attachment0 = MakeAttachment(self.Base, self.AxisCFrame)
+	prismatic.Attachment1 = MakeAttachment(self.Moving, self.AxisCFrame)
+	prismatic.LimitsEnabled = false
+	prismatic.Parent = self.Base
+	return prismatic
+end
+
+-- Lets the moving parts move (call once the constraint is set up), with the server
+-- running their physics.
+function ObstacleRig.Release(self: ObstacleRig)
+	for _, part in self.MovingParts do
+		part.Anchored = false
+	end
+	local moving = self.Moving
+	if moving:IsDescendantOf(workspace) and moving:CanSetNetworkOwnership() then
+		moving:SetNetworkOwner(nil)
+	end
+end
+
+return ObstacleRig
+]==],
+	},
+	{
+		ParentPath = { "ServerScriptService", "Classes", "Obstacles" },
+		Name = "Slider",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Classes.Obstacles.Slider
+--
+-- An obstacle that slides back and forth along a line, like a gate that opens and closes
+-- or a patrolling spike ball. Its Moving part (and everything welded to it) slides along
+-- its Base's front face: it waits where it was built, slides Distance studs, waits,
+-- slides back, and so on, with nothing able to stop it. See ObstacleRig for the parts it
+-- needs.
+--
+-- Settings (attributes on the Model, defaults in ObstacleConfig.SLIDER):
+--   Distance     studs it slides toward Base's front face (negative slides the other way)
+--   MoveTime     seconds to slide from one end to the other
+--   HoldTime     seconds it waits at each end
+--   StartDelay   seconds to shift its cycle by
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Attributes = require(ReplicatedStorage.Shared.Modules.Core.Attributes)
+local Cycle = require(ReplicatedStorage.Shared.Modules.Math.Cycle)
+local ObstacleConfig = require(ReplicatedStorage.Shared.Modules.Game.ObstacleConfig)
+local ObstacleRig = require(ServerScriptService.Classes.Obstacles.ObstacleRig)
+
+local MIN_MOVE_TIME = 0.05
+
+local Slider = {}
+Slider.__index = Slider
+
+type SliderMembers = {
+	Model: Model,
+	Prismatic: PrismaticConstraint,
+	Distance: number,
+	MoveTime: number,
+	HoldTime: number,
+	StartDelay: number,
+}
+
+export type Slider = typeof(setmetatable({} :: SliderMembers, Slider))
+
+-- Sets `model` sliding, or returns a description of what's wrong with it.
+function Slider.new(model: Model): (Slider?, string?)
+	local rig, problem = ObstacleRig.new(model)
+	if not rig then
+		return nil, problem
+	end
+	local defaults = ObstacleConfig.SLIDER
+	local distance = Attributes.GetNumber(model, "Distance", defaults.Distance)
+	local moveTime = math.max(Attributes.GetNumber(model, "MoveTime", defaults.MoveTime), MIN_MOVE_TIME)
+
+	local prismatic = rig:AddPrismatic()
+	prismatic.ActuatorType = Enum.ActuatorType.Servo
+	prismatic.ServoMaxForce = math.huge
+	prismatic.Speed = math.abs(distance) / moveTime
+	prismatic.TargetPosition = 0
+	rig:Release()
+
+	return setmetatable(
+		{
+			Model = model,
+			Prismatic = prismatic,
+			Distance = distance,
+			MoveTime = moveTime,
+			HoldTime = math.max(Attributes.GetNumber(model, "HoldTime", defaults.HoldTime), 0),
+			StartDelay = Attributes.GetNumber(model, "StartDelay", defaults.StartDelay),
+		} :: SliderMembers,
+		Slider
+	),
+		nil
+end
+
+-- Points the slider at the end it should be heading for at server time `serverTime`.
+function Slider.Update(self: Slider, serverTime: number)
+	local isHeadingToEnd = Cycle.IsHeadingToSecondEnd(serverTime, self.MoveTime, self.HoldTime, self.StartDelay)
+	local targetPosition = if isHeadingToEnd then self.Distance else 0
+	if self.Prismatic.TargetPosition ~= targetPosition then
+		self.Prismatic.TargetPosition = targetPosition
+	end
+end
+
+return Slider
+]==],
+	},
+	{
+		ParentPath = { "ServerScriptService", "Classes", "Obstacles" },
+		Name = "Spinner",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Classes.Obstacles.Spinner
+--
+-- An obstacle that turns round and round, like fan blades slicing the water or spinning
+-- spike arms. Its Moving part (and everything welded to it) turns around the line
+-- through the middle of its Base along Base's front face, at a steady speed nothing can
+-- stop. See ObstacleRig for the parts it needs.
+--
+-- Settings (attributes on the Model, defaults in ObstacleConfig.SPINNER):
+--   Speed   turns a minute; negative turns the other way
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Attributes = require(ReplicatedStorage.Shared.Modules.Core.Attributes)
+local ObstacleConfig = require(ReplicatedStorage.Shared.Modules.Game.ObstacleConfig)
+local ObstacleRig = require(ServerScriptService.Classes.Obstacles.ObstacleRig)
+
+local Spinner = {}
+Spinner.__index = Spinner
+
+type SpinnerMembers = {
+	Model: Model,
+	Hinge: HingeConstraint,
+}
+
+export type Spinner = typeof(setmetatable({} :: SpinnerMembers, Spinner))
+
+-- Sets `model` spinning, or returns a description of what's wrong with it.
+function Spinner.new(model: Model): (Spinner?, string?)
+	local rig, problem = ObstacleRig.new(model)
+	if not rig then
+		return nil, problem
+	end
+	local turnsPerMinute = Attributes.GetNumber(model, "Speed", ObstacleConfig.SPINNER.Speed)
+
+	local hinge = rig:AddHinge()
+	hinge.ActuatorType = Enum.ActuatorType.Motor
+	hinge.MotorMaxTorque = math.huge
+	hinge.MotorMaxAcceleration = math.huge
+	hinge.AngularVelocity = turnsPerMinute * 2 * math.pi / 60
+	rig:Release()
+
+	return setmetatable({ Model = model, Hinge = hinge } :: SpinnerMembers, Spinner), nil
+end
+
+return Spinner
+]==],
+	},
+	{
+		ParentPath = { "ServerScriptService", "Classes", "Obstacles" },
+		Name = "Swinger",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Classes.Obstacles.Swinger
+--
+-- An obstacle that swings back and forth between two angles on a hinge, like swinging
+-- doors or a swinging spiked mace. Its Moving part (and everything welded to it) swings
+-- around the line through the middle of its Base along Base's front face: it waits at
+-- FromAngle, swings to ToAngle, waits, swings back, and so on, with nothing able to stop
+-- it. See ObstacleRig for the parts it needs. Angles turn the right-hand way around
+-- Base's front face (curl your right hand's fingers with your thumb along it).
+--
+-- Settings (attributes on the Model, defaults in ObstacleConfig.SWINGER):
+--   FromAngle, ToAngle   degrees from how it was built (-180 to 180)
+--   MoveTime             seconds to swing from one angle to the other
+--   HoldTime             seconds it waits at each end
+--   StartDelay           seconds to shift its cycle by
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Attributes = require(ReplicatedStorage.Shared.Modules.Core.Attributes)
+local Cycle = require(ReplicatedStorage.Shared.Modules.Math.Cycle)
+local ObstacleConfig = require(ReplicatedStorage.Shared.Modules.Game.ObstacleConfig)
+local ObstacleRig = require(ServerScriptService.Classes.Obstacles.ObstacleRig)
+
+local MIN_MOVE_TIME = 0.05
+
+local Swinger = {}
+Swinger.__index = Swinger
+
+type SwingerMembers = {
+	Model: Model,
+	Hinge: HingeConstraint,
+	FromAngle: number,
+	ToAngle: number,
+	MoveTime: number,
+	HoldTime: number,
+	StartDelay: number,
+}
+
+export type Swinger = typeof(setmetatable({} :: SwingerMembers, Swinger))
+
+-- Sets `model` swinging, or returns a description of what's wrong with it.
+function Swinger.new(model: Model): (Swinger?, string?)
+	local rig, problem = ObstacleRig.new(model)
+	if not rig then
+		return nil, problem
+	end
+	local defaults = ObstacleConfig.SWINGER
+	local fromAngle = math.clamp(Attributes.GetNumber(model, "FromAngle", defaults.FromAngle), -180, 180)
+	local toAngle = math.clamp(Attributes.GetNumber(model, "ToAngle", defaults.ToAngle), -180, 180)
+	local moveTime = math.max(Attributes.GetNumber(model, "MoveTime", defaults.MoveTime), MIN_MOVE_TIME)
+
+	local hinge = rig:AddHinge()
+	hinge.ActuatorType = Enum.ActuatorType.Servo
+	hinge.ServoMaxTorque = math.huge
+	hinge.AngularSpeed = math.rad(math.abs(toAngle - fromAngle)) / moveTime
+	hinge.TargetAngle = fromAngle
+	rig:Release()
+
+	return setmetatable(
+		{
+			Model = model,
+			Hinge = hinge,
+			FromAngle = fromAngle,
+			ToAngle = toAngle,
+			MoveTime = moveTime,
+			HoldTime = math.max(Attributes.GetNumber(model, "HoldTime", defaults.HoldTime), 0),
+			StartDelay = Attributes.GetNumber(model, "StartDelay", defaults.StartDelay),
+		} :: SwingerMembers,
+		Swinger
+	),
+		nil
+end
+
+-- Points the hinge at the end it should be heading for at server time `serverTime`.
+function Swinger.Update(self: Swinger, serverTime: number)
+	local isHeadingToEnd = Cycle.IsHeadingToSecondEnd(serverTime, self.MoveTime, self.HoldTime, self.StartDelay)
+	local targetAngle = if isHeadingToEnd then self.ToAngle else self.FromAngle
+	if self.Hinge.TargetAngle ~= targetAngle then
+		self.Hinge.TargetAngle = targetAngle
+	end
+end
+
+return Swinger
+]==],
+	},
+	{
+		ParentPath = { "ServerScriptService", "Classes", "Obstacles" },
+		Name = "WindFan",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Classes.Obstacles.WindFan
+--
+-- A big fan that blows boats sideways: while it's on, every boat whose middle is inside
+-- its Wind zone is pushed toward the zone's front face. It blows for OnTime, rests for
+-- OffTime, and so on. While it blows, the Model's Blowing attribute is true, its fan
+-- (if it has one) spins up, and any ParticleEmitters, Beams and Sounds inside it are on.
+-- The push is a force, so heavier boats are pushed less, and the crew can fart against it.
+--
+-- Parts:
+--   Wind     Part   the zone that blows (boats are pushed toward its front face). Make it
+--                   CanCollide off and see-through or invisible.
+--   Base     Part   optional: the fan's fixed axle. Its fan turns around the line through
+--                   Base's middle along its front face.
+--   Moving   Part   optional: the fan, with its blades welded to it.
+--
+-- Settings (attributes on the Model, defaults in ObstacleConfig.WIND_FAN):
+--   Strength     studs/s² of push on a boat of FartConfig.REFERENCE_MASS
+--   OnTime, OffTime, StartDelay   seconds
+--   Speed        turns a minute its fan spins at while it blows
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Attributes = require(ReplicatedStorage.Shared.Modules.Core.Attributes)
+local Cycle = require(ReplicatedStorage.Shared.Modules.Math.Cycle)
+local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
+local Geometry = require(ReplicatedStorage.Shared.Modules.Math.Geometry)
+local ObstacleConfig = require(ReplicatedStorage.Shared.Modules.Game.ObstacleConfig)
+local ObstacleRig = require(ServerScriptService.Classes.Obstacles.ObstacleRig)
+local ObstacleServiceShared = require(ReplicatedStorage.Shared.Services.ObstacleService.ObstacleServiceShared)
+
+local WindFan = {}
+WindFan.__index = WindFan
+
+type WindFanMembers = {
+	Model: Model,
+	Wind: BasePart,
+	Hinge: HingeConstraint?, -- spins its fan, if it has one
+	Effects: { Instance }, -- ParticleEmitters, Beams and Sounds to switch on while it blows
+	Force: number, -- Roblox force units it pushes with
+	SpinSpeed: number, -- rad/s its fan spins at while it blows
+	OnTime: number,
+	OffTime: number,
+	StartDelay: number,
+	IsBlowing: boolean,
+}
+
+export type WindFan = typeof(setmetatable({} :: WindFanMembers, WindFan))
+
+-- Sets up `model`, or returns a description of what's wrong with it.
+function WindFan.new(model: Model, serverTime: number): (WindFan?, string?)
+	local wind = model:FindFirstChild(ObstacleServiceShared.WIND_NAME)
+	if not wind or not wind:IsA("BasePart") then
+		return nil, `has no part named {ObstacleServiceShared.WIND_NAME}`
+	end
+	wind.Anchored = true
+	wind.CanCollide = false
+	wind.CanTouch = false
+	wind.CanQuery = false
+
+	local defaults = ObstacleConfig.WIND_FAN
+	local hinge: HingeConstraint? = nil
+	local hasFan = model:FindFirstChild(ObstacleServiceShared.BASE_NAME) ~= nil
+		or model:FindFirstChild(ObstacleServiceShared.MOVING_NAME) ~= nil
+	if hasFan then
+		local rig, problem = ObstacleRig.new(model)
+		if not rig then
+			return nil, problem
+		end
+		local fanHinge = rig:AddHinge()
+		fanHinge.ActuatorType = Enum.ActuatorType.Motor
+		fanHinge.MotorMaxTorque = math.huge
+		fanHinge.MotorMaxAcceleration = ObstacleConfig.FAN_SPIN_ACCELERATION
+		fanHinge.AngularVelocity = 0
+		rig:Release()
+		hinge = fanHinge
+	end
+
+	local effects: { Instance } = {}
+	for _, descendant in model:GetDescendants() do
+		if descendant:IsA("ParticleEmitter") or descendant:IsA("Beam") or descendant:IsA("Sound") then
+			table.insert(effects, descendant)
+		end
+	end
+
+	local self = setmetatable(
+		{
+			Model = model,
+			Wind = wind,
+			Hinge = hinge,
+			Effects = effects,
+			Force = Attributes.GetNumber(model, "Strength", defaults.Strength) * FartConfig.REFERENCE_MASS,
+			SpinSpeed = Attributes.GetNumber(model, "Speed", defaults.Speed) * 2 * math.pi / 60,
+			OnTime = math.max(Attributes.GetNumber(model, "OnTime", defaults.OnTime), 0),
+			OffTime = math.max(Attributes.GetNumber(model, "OffTime", defaults.OffTime), 0),
+			StartDelay = Attributes.GetNumber(model, "StartDelay", defaults.StartDelay),
+			IsBlowing = false,
+		} :: WindFanMembers,
+		WindFan
+	)
+	self:SetBlowing(self:ShouldBlow(serverTime))
+	return self, nil
+end
+
+function WindFan.ShouldBlow(self: WindFan, serverTime: number): boolean
+	return Cycle.IsOn(serverTime, self.OnTime, self.OffTime, self.StartDelay)
+end
+
+-- Turns it on or off for server time `serverTime`.
+function WindFan.Update(self: WindFan, serverTime: number)
+	local shouldBlow = self:ShouldBlow(serverTime)
+	if shouldBlow ~= self.IsBlowing then
+		self:SetBlowing(shouldBlow)
+	end
+end
+
+function WindFan.SetBlowing(self: WindFan, isBlowing: boolean)
+	self.IsBlowing = isBlowing
+	self.Model:SetAttribute(ObstacleServiceShared.BLOWING_ATTRIBUTE, isBlowing)
+	local hinge = self.Hinge
+	if hinge then
+		hinge.AngularVelocity = if isBlowing then self.SpinSpeed else 0
+	end
+	for _, effect in self.Effects do
+		if effect:IsA("ParticleEmitter") then
+			effect.Enabled = isBlowing
+		elseif effect:IsA("Beam") then
+			effect.Enabled = isBlowing
+		elseif effect:IsA("Sound") then
+			if isBlowing then
+				effect:Play()
+			else
+				effect:Stop()
+			end
+		end
+	end
+end
+
+-- The push on something with its middle at `position` (Roblox force units, flat), or
+-- nil if it's not in the wind.
+function WindFan.GetForceAt(self: WindFan, position: Vector3): Vector3?
+	if not self.IsBlowing or not Geometry.IsPointInPart(position, self.Wind) then
+		return nil
+	end
+	local direction = self.Wind.CFrame.LookVector * Vector3.new(1, 0, 1)
+	if direction.Magnitude < 1e-3 then
+		return nil
+	end
+	return direction.Unit * self.Force
+end
+
+return WindFan
+]==],
+	},
+	{
 		ParentPath = { "ServerScriptService", "Services", "BoatService" },
 		Name = "BoatServiceServer",
 		ClassName = "ModuleScript",
@@ -1800,15 +2293,16 @@ function BoatServiceServer.GetRiddenSeat(self: BoatServiceServer, player: Player
 	return nil, nil
 end
 
--- A boat fell off the river: freeze it, tell its crew, then remove it. Removing it
--- sends the crew back to their checkpoint (CheckpointService listens to CrewMemberLeft).
-function BoatServiceServer.WipeBoat(self: BoatServiceServer, boat: Boat.Boat)
+-- A boat is out of the run (it fell off the river, or something popped it): freeze it,
+-- tell its crew why, then remove it. Removing it sends the crew back to their checkpoint
+-- (CheckpointService listens to CrewMemberLeft).
+function BoatServiceServer.WipeBoat(self: BoatServiceServer, boat: Boat.Boat, reason: BoatServiceShared.WipeReason)
 	if not boat:IsFloating() then
 		return
 	end
 	boat:Freeze()
 	for _, player in boat.Crew do
-		self.NotifyBoatWipedRemote:FireClient(player)
+		self.NotifyBoatWipedRemote:FireClient(player, reason)
 	end
 	task.delay(BoatConfig.WIPE_DELAY, function()
 		self:DestroyBoat(boat)
@@ -2745,6 +3239,242 @@ return FartServiceServer :: FartServiceServer
 ]==],
 	},
 	{
+		ParentPath = { "ServerScriptService", "Services", "ObstacleService" },
+		Name = "ObstacleServiceServer",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Services.ObstacleService.ObstacleServiceServer
+--
+-- Runs every obstacle on the river. At startup it:
+--   1. swaps each marker in Workspace.Map.Obstacles for a copy of its template from
+--      ReplicatedStorage.Assets.Obstacles (so one model can be placed many times, and
+--      swapping a template's art updates every copy),
+--   2. sets up every obstacle Model there by its Obstacle attribute (the Spinner,
+--      Swinger, Slider and WindFan classes in ServerScriptService.Classes.Obstacles),
+--   3. watches every part in Workspace.Map marked Hazard, popping any boat on the river
+--      that touches one.
+-- Every frame it moves the Swingers, Sliders and WindFans along their cycles, all timed
+-- from the server clock. WaterService asks GetObstacleForces for the wind on each boat.
+--
+-- Map contract:
+--   Workspace.Map.Obstacles (Folder, can have Folders inside to organize it)
+--     <any name> (Model, attribute Obstacle = "Spinner" | "Swinger" | "Slider" | "WindFan")
+--       Base, Moving, Wind   the parts each kind needs (see its class); the rest is scenery
+--     <any name> (Part or Model marker, attribute ObstacleTemplate = a template's name)
+--       Replaced at startup by a copy of ReplicatedStorage.Assets.Obstacles.<that name>,
+--       with the template's pivot on the marker's pivot. Every other attribute on the
+--       marker (like Speed or StartDelay) is copied onto the copy, so each copy can be tuned.
+--   Any part anywhere in Workspace.Map with attribute Hazard = true pops boats that touch
+--   it (spikes, blades). It doesn't need to be in an obstacle.
+
+local PhysicsService = game:GetService("PhysicsService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Boat = require(ServerScriptService.Classes.Boat)
+local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
+local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local Hull = require(ServerScriptService.Classes.Hull)
+local ObstacleServiceShared = require(ReplicatedStorage.Shared.Services.ObstacleService.ObstacleServiceShared)
+local Slider = require(ServerScriptService.Classes.Obstacles.Slider)
+local Spinner = require(ServerScriptService.Classes.Obstacles.Spinner)
+local Swinger = require(ServerScriptService.Classes.Obstacles.Swinger)
+local WindFan = require(ServerScriptService.Classes.Obstacles.WindFan)
+
+local ObstacleServiceServer = {}
+
+type ObstacleServiceServerMembers = {
+	Spinners: { Spinner.Spinner },
+	Swingers: { Swinger.Swinger },
+	Sliders: { Slider.Slider },
+	WindFans: { WindFan.WindFan },
+	Hazards: { [BasePart]: RBXScriptConnection }, -- every hazard part being watched
+}
+
+export type ObstacleServiceServer = typeof(ObstacleServiceServer) & ObstacleServiceServerMembers
+
+function ObstacleServiceServer.Init(self: ObstacleServiceServer)
+	self.Spinners = {}
+	self.Swingers = {}
+	self.Sliders = {}
+	self.WindFans = {}
+	self.Hazards = {}
+
+	-- Obstacles hit boats, and pass through the map, riders and each other.
+	local obstacleGroup = ObstacleServiceShared.COLLISION_GROUP
+	if not PhysicsService:IsCollisionGroupRegistered(obstacleGroup) then
+		PhysicsService:RegisterCollisionGroup(obstacleGroup)
+	end
+	for _, otherGroup in { "Default", obstacleGroup, BoatServiceShared.RIDER_COLLISION_GROUP } do
+		PhysicsService:CollisionGroupSetCollidable(obstacleGroup, otherGroup, false)
+	end
+	PhysicsService:CollisionGroupSetCollidable(obstacleGroup, BoatServiceShared.COLLISION_GROUP, true)
+
+	local map = workspace:FindFirstChild("Map")
+	local obstaclesFolder = if map then map:FindFirstChild(ObstacleServiceShared.OBSTACLES_FOLDER_NAME) else nil
+	if obstaclesFolder then
+		self:PlaceTemplates(obstaclesFolder)
+		self:SetUpObstacles(obstaclesFolder)
+	end
+	if map then
+		for _, descendant in map:GetDescendants() do
+			self:WatchIfHazard(descendant)
+		end
+		map.DescendantAdded:Connect(function(descendant)
+			self:WatchIfHazard(descendant)
+		end)
+	end
+
+	RunService.Heartbeat:Connect(function()
+		self:Update()
+	end)
+end
+
+-- Swaps every marker in `folder` for a copy of its template.
+function ObstacleServiceServer.PlaceTemplates(self: ObstacleServiceServer, folder: Instance)
+	local templatesFolder = ReplicatedStorage.Assets:FindFirstChild(ObstacleServiceShared.TEMPLATES_FOLDER_NAME)
+	for _, marker in folder:GetDescendants() do
+		local templateName = marker:GetAttribute(ObstacleServiceShared.TEMPLATE_ATTRIBUTE)
+		if templateName == nil or not marker:IsA("PVInstance") then
+			continue
+		end
+		local template = if templatesFolder and typeof(templateName) == "string"
+			then templatesFolder:FindFirstChild(templateName)
+			else nil
+		if not template or not template:IsA("Model") then
+			warn(
+				`Obstacle marker {marker:GetFullName()} wants template "{templateName}", but ReplicatedStorage.Assets.{ObstacleServiceShared.TEMPLATES_FOLDER_NAME} has no Model by that name.`
+			)
+			continue
+		end
+
+		local copy = template:Clone()
+		copy:PivotTo(marker:GetPivot())
+		for name, value in marker:GetAttributes() do
+			if name ~= ObstacleServiceShared.TEMPLATE_ATTRIBUTE then
+				copy:SetAttribute(name, value)
+			end
+		end
+		copy.Name = marker.Name
+		copy.Parent = marker.Parent
+		marker:Destroy()
+	end
+end
+
+-- Sets up every obstacle Model in `folder` by its Obstacle attribute.
+function ObstacleServiceServer.SetUpObstacles(self: ObstacleServiceServer, folder: Instance)
+	local serverTime = workspace:GetServerTimeNow()
+	for _, model in folder:GetDescendants() do
+		local obstacleType = model:GetAttribute(ObstacleServiceShared.TYPE_ATTRIBUTE)
+		if obstacleType == nil or not model:IsA("Model") then
+			continue
+		end
+		if not ObstacleServiceShared.IsObstacleType(obstacleType) then
+			warn(
+				`Obstacle {model:GetFullName()} has {ObstacleServiceShared.TYPE_ATTRIBUTE} = "{obstacleType}", which isn't a kind of obstacle (Spinner, Swinger, Slider or WindFan).`
+			)
+			continue
+		end
+
+		local problem: string? = nil
+		if obstacleType == "Spinner" then
+			local spinner, spinnerProblem = Spinner.new(model)
+			problem = spinnerProblem
+			if spinner then
+				table.insert(self.Spinners, spinner)
+			end
+		elseif obstacleType == "Swinger" then
+			local swinger, swingerProblem = Swinger.new(model)
+			problem = swingerProblem
+			if swinger then
+				table.insert(self.Swingers, swinger)
+			end
+		elseif obstacleType == "Slider" then
+			local slider, sliderProblem = Slider.new(model)
+			problem = sliderProblem
+			if slider then
+				table.insert(self.Sliders, slider)
+			end
+		else
+			local windFan, windFanProblem = WindFan.new(model, serverTime)
+			problem = windFanProblem
+			if windFan then
+				table.insert(self.WindFans, windFan)
+			end
+		end
+		if problem then
+			warn(`Obstacle {model:GetFullName()} ({obstacleType}) {problem}. It won't move.`)
+		end
+	end
+end
+
+-- Starts watching `instance` if it's a hazard part.
+function ObstacleServiceServer.WatchIfHazard(self: ObstacleServiceServer, instance: Instance)
+	if not instance:IsA("BasePart") or instance:GetAttribute(ObstacleServiceShared.HAZARD_ATTRIBUTE) ~= true then
+		return
+	end
+	if self.Hazards[instance] then
+		return
+	end
+	instance.CanTouch = true
+	self.Hazards[instance] = instance.Touched:Connect(function(otherPart: BasePart)
+		self:OnHazardTouched(otherPart)
+	end)
+	instance.Destroying:Connect(function()
+		local connection = self.Hazards[instance]
+		if connection then
+			connection:Disconnect()
+			self.Hazards[instance] = nil
+		end
+	end)
+end
+
+-- A hazard touched `otherPart`: if it's part of a boat on the river, the boat pops.
+function ObstacleServiceServer.OnHazardTouched(self: ObstacleServiceServer, otherPart: BasePart)
+	local boatModel = BoatServiceShared.GetBoatModelFromPart(otherPart)
+	local boat = if boatModel then BoatServiceServer:GetBoatByModel(boatModel) else nil
+	if boat and boat:IsFloating() then
+		BoatServiceServer:WipeBoat(boat, "Popped")
+	end
+end
+
+function ObstacleServiceServer.Update(self: ObstacleServiceServer)
+	local serverTime = workspace:GetServerTimeNow()
+	for _, swinger in self.Swingers do
+		swinger:Update(serverTime)
+	end
+	for _, slider in self.Sliders do
+		slider:Update(serverTime)
+	end
+	for _, windFan in self.WindFans do
+		windFan:Update(serverTime)
+	end
+end
+
+-- The pushes obstacles put on `boat` right now (the wind from every WindFan it's in),
+-- through its center of mass.
+function ObstacleServiceServer.GetObstacleForces(self: ObstacleServiceServer, boat: Boat.Boat): { Hull.AppliedForce }
+	local forces: { Hull.AppliedForce } = {}
+	local primaryPart = boat.Model.PrimaryPart
+	if not primaryPart then
+		return forces
+	end
+	local centerOfMass = primaryPart.AssemblyCenterOfMass
+	for _, windFan in self.WindFans do
+		local force = windFan:GetForceAt(centerOfMass)
+		if force then
+			table.insert(forces, { Position = centerOfMass, Force = force })
+		end
+	end
+	return forces
+end
+
+return ObstacleServiceServer :: ObstacleServiceServer
+]==],
+	},
+	{
 		ParentPath = { "ServerScriptService", "Services", "RiderService" },
 		Name = "RiderServiceServer",
 		ClassName = "ModuleScript",
@@ -2754,9 +3484,11 @@ return FartServiceServer :: FartServiceServer
 --
 -- Slides riders round the edge of their boat. A client asks to slide left or right, or
 -- to stop (RequestSlide); the server moves them at a set speed (RiderConfig.SLIDE_SPEED),
--- easing in and out, and never past the ends of their own stretch of the edge (see the
--- Boat class). Where a rider is, and so where their farts push from, is always the
--- server's call. Works the same at the dock and on the river.
+-- easing in and out, and never past the ends of their own stretch of the edge (the rules
+-- are in RiderSpots). Where a rider is, and so where their farts push from, is always the
+-- server's call; the sliding player's client shows their slide straight away with the
+-- same rules, then settles onto the server's answer. Works the same at the dock and on
+-- the river.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -2765,11 +3497,10 @@ local ServerScriptService = game:GetService("ServerScriptService")
 
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
-local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
 local RiderServiceShared = require(ReplicatedStorage.Shared.Services.RiderService.RiderServiceShared)
+local RiderSpots = require(ReplicatedStorage.Shared.Services.RiderService.RiderSpots)
 
 local MIN_SLIDE_SPEED = 0.01 -- a slide that has eased below this (studs/s) has stopped
-local MIN_TURN_RADIUS = 1 -- a rider this close to the middle (studs) turns on the spot as if this far out
 
 local RiderServiceServer = {}
 
@@ -2819,32 +3550,20 @@ function RiderServiceServer.Update(self: RiderServiceServer, deltaTime: number)
 		sliders[player] = true
 	end
 
-	local blend = if RiderConfig.SLIDE_RESPONSE_TIME > 0
-		then 1 - math.exp(-deltaTime / RiderConfig.SLIDE_RESPONSE_TIME)
-		else 1
 	for player in sliders do
 		local boat, seat = BoatServiceServer:GetRiddenSeat(player)
-		if not boat or not seat then
+		local spot = if boat and seat then boat:GetRiderSpot(seat) else nil
+		if not boat or not seat or not spot then
 			self:ForgetRider(player)
 			continue
 		end
-		local speed = self.SlideSpeeds[player] or 0
-		speed += ((self.SlideInputs[player] or 0) * RiderConfig.SLIDE_SPEED - speed) * blend
-		local radius = math.max(boat:GetRiderRadius(seat), MIN_TURN_RADIUS)
-		local angle = boat:GetRiderSlide(seat) + speed / radius * deltaTime
-
-		local minAngle, maxAngle = boat:GetSlideRange(seat)
-		if minAngle and maxAngle then
-			-- Stopped by the blockers at the ends of their stretch
-			if angle <= minAngle or angle >= maxAngle then
-				angle = math.clamp(angle, minAngle, maxAngle)
-				speed = 0
-			end
-		else
-			-- All the way round: keep the angle between -pi and pi.
-			angle = (angle + math.pi) % (2 * math.pi) - math.pi
-		end
-
+		local angle, speed = RiderSpots.StepSlide(
+			spot,
+			boat:GetRiderSlide(seat),
+			self.SlideSpeeds[player] or 0,
+			self.SlideInputs[player] or 0,
+			deltaTime
+		)
 		if self.SlideInputs[player] or math.abs(speed) >= MIN_SLIDE_SPEED then
 			self.SlideSpeeds[player] = speed
 		else
@@ -2867,8 +3586,8 @@ return RiderServiceServer :: RiderServiceServer
 --
 -- Moves every boat on the river. Each frame, for each boat, it works out what the
 -- water under the boat is doing (its surface with the waves, its current and how rough
--- it is), asks FartService for the pushes from the crew's farts, and steps the boat's Hull
--- with both. Where there's no water under a boat, nothing holds it up and it falls. A
+-- it is), asks FartService for the pushes from the crew's farts and ObstacleService for
+-- the wind from any fans, and steps the boat's Hull with all of it. Where there's no water under a boat, nothing holds it up and it falls. A
 -- boat that falls FALL_DISTANCE below the last water it was over has fallen off the
 -- river, and BoatService wipes it.
 --
@@ -2885,6 +3604,7 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartServiceServer = require(ServerScriptService.Services.FartService.FartServiceServer)
 local Hull = require(ServerScriptService.Classes.Hull)
+local ObstacleServiceServer = require(ServerScriptService.Services.ObstacleService.ObstacleServiceServer)
 local WaterConfig = require(ReplicatedStorage.Shared.Modules.Game.WaterConfig)
 
 -- A wave from WaterConfig.WAVES, ready for the math.
@@ -3012,14 +3732,47 @@ function WaterServiceServer.Update(self: WaterServiceServer, deltaTime: number)
 		local position = hull.PrimaryPart.Position
 		local water = self:GetWater(position, now)
 		if not water and position.Y < hull.LastWaterHeight - WaterConfig.FALL_DISTANCE then
-			BoatServiceServer:WipeBoat(boat)
+			BoatServiceServer:WipeBoat(boat, "Fell")
 			continue
 		end
-		hull:Step(water, FartServiceServer:GetFartForces(boat), stepTime)
+		local forces = FartServiceServer:GetFartForces(boat)
+		for _, obstacleForce in ObstacleServiceServer:GetObstacleForces(boat) do
+			table.insert(forces, obstacleForce)
+		end
+		hull:Step(water, forces, stepTime)
 	end
 end
 
 return WaterServiceServer :: WaterServiceServer
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Core" },
+		Name = "Attributes",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Modules.Core.Attributes
+--
+-- Reads settings that designers put on instances as attributes in Studio.
+
+local Attributes = {}
+
+-- `instance`'s number attribute `name`, or `default` if it hasn't got one. Warns (and
+-- uses `default`) if it's set to something that isn't a number.
+function Attributes.GetNumber(instance: Instance, name: string, default: number): number
+	local value = instance:GetAttribute(name)
+	if value == nil then
+		return default
+	end
+	if typeof(value) ~= "number" then
+		warn(`{instance:GetFullName()} has its {name} attribute set to a {typeof(value)}; it should be a number.`)
+		return default
+	end
+	return value
+end
+
+return Attributes
 ]==],
 	},
 	{
@@ -3308,6 +4061,56 @@ return FartConfig
 	},
 	{
 		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Game" },
+		Name = "ObstacleConfig",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Modules.Game.ObstacleConfig
+--
+-- Obstacles' settings when they don't set their own. Any obstacle (or the marker it's
+-- made from) can change one for itself with an attribute of the same name, like Speed.
+-- Times are in seconds. StartDelay shifts where an obstacle is in its cycle, so
+-- obstacles of the same kind can be staggered instead of moving in step.
+
+local ObstacleConfig = {
+	-- Spinner: turns round and round (fan blades, spinning spike arms)
+	SPINNER = {
+		Speed = 12, -- turns a minute; negative turns the other way
+	},
+
+	-- Swinger: swings between two angles on a hinge (swinging doors, a swinging mace)
+	SWINGER = {
+		FromAngle = 0, -- degrees from how it was built
+		ToAngle = 90,
+		MoveTime = 1.2, -- to swing from one angle to the other
+		HoldTime = 1.5, -- it waits this long at each end
+		StartDelay = 0,
+	},
+
+	-- Slider: slides back and forth along a line (opening gates, a patrolling spike ball)
+	SLIDER = {
+		Distance = 10, -- studs it slides from where it was built
+		MoveTime = 1,
+		HoldTime = 2,
+		StartDelay = 0,
+	},
+
+	-- WindFan: blows boats in its wind zone sideways, on and off (a big fan on the side)
+	WIND_FAN = {
+		Strength = 28, -- studs/s² of push on a boat of FartConfig.REFERENCE_MASS (heavier boats are pushed less)
+		OnTime = 3,
+		OffTime = 3,
+		StartDelay = 0,
+		Speed = 120, -- turns a minute its fan spins at while it blows
+	},
+	FAN_SPIN_ACCELERATION = 8, -- rad/s² a WindFan's fan speeds up and slows down at
+}
+
+return ObstacleConfig
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Game" },
 		Name = "RiderConfig",
 		ClassName = "ModuleScript",
 		Source = [==[
@@ -3326,8 +4129,14 @@ local RiderConfig = {
 	-- Sliding round the edge (A and D). Each rider has their own stretch of the edge: from
 	-- their seat halfway to the next seat each way, or all the way round on a one-seat boat.
 	SLIDE_SPEED = 6, -- studs/s along the edge
-	SLIDE_RESPONSE_TIME = 0.15, -- sliding speeds up and slows down most of the way (63%) in this many seconds
+	SLIDE_RESPONSE_TIME = 0.12, -- sliding speeds up and slows down most of the way (63%) in this many seconds
+	SLIDE_SOFT_END = 1.5, -- studs before a blocker a rider starts easing into it...
+	SLIDE_END_SPEED = 0.25, -- ...down to this fraction of SLIDE_SPEED when they reach it
 	RIDER_SPACING = 2.5, -- studs kept between neighbouring riders at the ends of their stretches
+	OTHER_RIDER_SMOOTHING = 0.08, -- other players' riders glide to where the server has them, most of the way in this many seconds
+	SLIDE_CORRECTION_TIME = 0.25, -- once you stop, your rider settles onto where the server has you over about this long
+	SLIDE_SNAP_DISTANCE = 4, -- studs your rider can be from where the server has you before it jumps straight there
+	STICK_DEADZONE = 0.5, -- how far a controller's left stick has to be pushed left or right to slide
 
 	-- Their pose while they hang on (RiderService, on every player's screen)
 	ARM_REACH = math.rad(60), -- arms raised forward this far from hanging down, to hold on to the boat
@@ -3422,6 +4231,45 @@ return WaterConfig
 	},
 	{
 		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Math" },
+		Name = "Cycle",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Modules.Math.Cycle
+--
+-- Repeating timings, worked out from a clock time, so anything using the same clock
+-- (like workspace:GetServerTimeNow()) stays in step without keeping any state.
+
+local Cycle = {}
+
+-- Something that goes back and forth between two ends: it waits `holdTime` seconds at
+-- the first end, takes `moveTime` seconds to get to the second, waits there, comes back,
+-- and so on, starting at the first end at `startDelay`. True while it's heading to (or
+-- waiting at) the second end.
+function Cycle.IsHeadingToSecondEnd(time: number, moveTime: number, holdTime: number, startDelay: number): boolean
+	local period = 2 * (math.max(moveTime, 0) + math.max(holdTime, 0))
+	if period <= 0 then
+		return false
+	end
+	local phase = (time - startDelay) % period
+	return phase >= holdTime and phase < 2 * holdTime + moveTime
+end
+
+-- Something that's on for `onTime` seconds, then off for `offTime`, and so on, starting
+-- on at `startDelay`. True while it's on.
+function Cycle.IsOn(time: number, onTime: number, offTime: number, startDelay: number): boolean
+	local period = math.max(onTime, 0) + math.max(offTime, 0)
+	if period <= 0 then
+		return false
+	end
+	return (time - startDelay) % period < onTime
+end
+
+return Cycle
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Math" },
 		Name = "Geometry",
 		ClassName = "ModuleScript",
 		Source = [==[
@@ -3453,7 +4301,8 @@ return Geometry
 -- The client half of BoatService.
 --   - While the local player sits in a boat on the river, jumping is switched off so
 --     they don't fall out by accident. (The server still handles anyone who leaves.)
---   - BoatWiped fires when their boat falls off the river, for the UI (a RIP screen).
+--   - BoatWiped fires when their boat is out of the run, with why ("Fell" off the river
+--     or "Popped" by a hazard), for the UI (a RIP screen).
 --   - RequestJoinBoat, RequestStartRun, IsLeaderOf and GetSecondsUntilDeparture are for
 --     the joining UI (to be built): a Join button, the leader's Start button and the timer.
 
@@ -3469,7 +4318,7 @@ local BoatServiceClient = {}
 
 type BoatServiceClientMembers = {
 	LockedHumanoid: Humanoid?, -- the humanoid whose jumping is currently switched off
-	BoatWiped: Signal.Signal, -- fires () when the local player's boat falls off the river
+	BoatWiped: Signal.Signal, -- fires (reason: BoatServiceShared.WipeReason) when the local player's boat is out of the run
 }
 
 export type BoatServiceClient = typeof(BoatServiceClient) & BoatServiceClientMembers
@@ -3485,8 +4334,8 @@ function BoatServiceClient.Init(self: BoatServiceClient)
 	-- Remotes are waited for in a separate thread so Init never yields.
 	task.spawn(function()
 		Remotes.WaitForEvent(BoatServiceShared.SERVICE_NAME, BoatServiceShared.NOTIFY_BOAT_WIPED).OnClientEvent
-			:Connect(function()
-				self.BoatWiped:Fire()
+			:Connect(function(reason: BoatServiceShared.WipeReason)
+				self.BoatWiped:Fire(reason)
 			end)
 	end)
 end
@@ -3560,6 +4409,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 
 export type BoatState = "Docked" | "Launched" | "Destroyed"
+export type WipeReason = "Fell" | "Popped" -- fell off the river, or a hazard popped it
 
 local BoatServiceShared = {
 	SERVICE_NAME = "BoatService",
@@ -3574,7 +4424,7 @@ local BoatServiceShared = {
 	DEPARTURE_TIME_ATTRIBUTE = "DepartureTime", -- server time (workspace:GetServerTimeNow()) a docked boat leaves
 
 	-- Remotes
-	NOTIFY_BOAT_WIPED = "NotifyBoatWiped", -- RemoteEvent to each crew member when their boat falls off the river
+	NOTIFY_BOAT_WIPED = "NotifyBoatWiped", -- RemoteEvent to each crew member when their boat is out of the run (reason: WipeReason)
 	REQUEST_JOIN_BOAT = "RequestJoinBoat", -- RemoteFunction (boat: Model) -> (success: boolean, message: string?)
 	REQUEST_START_RUN = "RequestStartRun", -- RemoteFunction () -> (success: boolean, message: string?); party leader only
 }
@@ -4395,6 +5245,44 @@ return FartServiceShared
 ]==],
 	},
 	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "ObstacleService" },
+		Name = "ObstacleServiceShared",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.ObstacleService.ObstacleServiceShared
+--
+-- Names the obstacle system and the map agree on (see ObstacleServiceServer for how to
+-- build obstacles).
+
+export type ObstacleType = "Spinner" | "Swinger" | "Slider" | "WindFan"
+
+local ObstacleServiceShared = {
+	OBSTACLES_FOLDER_NAME = "Obstacles", -- Workspace.Map.Obstacles holds every obstacle, or a marker for one
+	TEMPLATES_FOLDER_NAME = "Obstacles", -- ReplicatedStorage.Assets.Obstacles holds obstacle templates
+	COLLISION_GROUP = "Obstacles", -- obstacles' fixed and moving parts: they hit boats and nothing else
+
+	-- Attributes
+	TYPE_ATTRIBUTE = "Obstacle", -- on an obstacle Model: an ObstacleType
+	TEMPLATE_ATTRIBUTE = "ObstacleTemplate", -- on a marker: the template in Assets.Obstacles to put there
+	HAZARD_ATTRIBUTE = "Hazard", -- true on any part in the map that pops a boat that touches it
+	BLOWING_ATTRIBUTE = "Blowing", -- on a WindFan, kept up to date by the server: true while it blows
+
+	-- Parts inside an obstacle Model
+	BASE_NAME = "Base", -- the fixed part it moves around or along
+	MOVING_NAME = "Moving", -- the part that moves; everything else that moves is welded to it
+	WIND_NAME = "Wind", -- a WindFan's wind zone
+}
+
+-- Whether `value` is the name of a kind of obstacle.
+function ObstacleServiceShared.IsObstacleType(value: unknown): boolean
+	return value == "Spinner" or value == "Swinger" or value == "Slider" or value == "WindFan"
+end
+
+return ObstacleServiceShared
+]==],
+	},
+	{
 		ParentPath = { "ReplicatedStorage", "Shared", "Services", "RiderService" },
 		Name = "RiderServiceClient",
 		ClassName = "ModuleScript",
@@ -4406,11 +5294,14 @@ return FartServiceShared
 -- server puts them there; see the Boat class).
 --
 -- Sliding: hold a slide key to slide round the edge of your boat, within your own
--- stretch of it. The server does the moving (RiderServiceServer); this asks it to.
---   Slide left    A, Left arrow, Q, or LB
---   Slide right   D, Right arrow, E, or RB
+-- stretch of it.
+--   Slide left    A, Left arrow, Q, LB, or the left stick pushed left
+--   Slide right   D, Right arrow, E, RB, or the left stick pushed right
 -- If you hold both, the one you pressed last wins. On-screen buttons for touch devices
 -- (UI, to be built) call PressSlide and ReleaseSlide.
+-- The server decides where everyone is (RiderServiceServer), but your own slide shows
+-- straight away: this runs the same rules (RiderSpots) and settles onto the server's
+-- answer once you stop. Other riders glide smoothly to where the server has them.
 --
 -- Posing: every player hanging on to a boat is posed on this player's screen: arms
 -- reaching over the side (going hand over hand while they slide) and legs kicking in
@@ -4426,6 +5317,7 @@ local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
 local RiderServiceShared = require(ReplicatedStorage.Shared.Services.RiderService.RiderServiceShared)
+local RiderSpots = require(ReplicatedStorage.Shared.Services.RiderService.RiderSpots)
 
 export type Side = "Left" | "Right"
 
@@ -4437,6 +5329,8 @@ local SIDE_DIRECTIONS: { [Side]: number } = {
 	Left = -1,
 	Right = 1,
 }
+local STICK_INPUT = "Thumbstick1" -- what the left stick counts as among the held slide inputs
+local MIN_SLIDE_SPEED = 0.01 -- a slide that has eased below this (studs/s) has stopped
 
 -- The joints a rider is posed by, by what they do.
 type Rig = { [string]: Motor6D }
@@ -4461,6 +5355,12 @@ local R6_JOINTS: { [string]: { string } } = {
 	LeftHip = { "Torso", "Left Hip" },
 }
 
+-- Where a seat's rider is shown, and who that is (so a new rider starts fresh).
+type ShownAngle = {
+	Rider: Player,
+	Angle: number, -- radians round from the seat
+}
+
 -- What a rider's pose remembers between frames.
 type Rider = {
 	Rig: Rig,
@@ -4477,6 +5377,11 @@ type RiderServiceClientMembers = {
 	SlideDirection: number, -- what the server was last asked: -1 left, 1 right, 0 not sliding
 	RequestSlideRemote: RemoteEvent?, -- set once the server has created it
 	Riders: { [Model]: Rider }, -- each rider's pose state, by character
+	BoatSpots: { [Model]: { [BasePart]: RiderSpots.RiderSpot } }, -- each boat's rider spots, worked out once
+	ShownAngles: { [BasePart]: ShownAngle }, -- how far round from each seat its rider is shown
+	LocalSeat: BasePart?, -- the seat the local player's own slide is being worked out from
+	LocalAngle: number, -- where the local player is shown, ahead of the server
+	LocalSpeed: number,
 }
 
 export type RiderServiceClient = typeof(RiderServiceClient) & RiderServiceClientMembers
@@ -4522,6 +5427,11 @@ function RiderServiceClient.Init(self: RiderServiceClient)
 	self.SlideDirection = 0
 	self.RequestSlideRemote = nil
 	self.Riders = setmetatable({}, { __mode = "k" }) :: any
+	self.BoatSpots = setmetatable({}, { __mode = "k" }) :: any
+	self.ShownAngles = setmetatable({}, { __mode = "k" }) :: any
+	self.LocalSeat = nil
+	self.LocalAngle = 0
+	self.LocalSpeed = 0
 
 	local function OnSlideAction(actionName: string, inputState: Enum.UserInputState, input: InputObject)
 		local side: Side? = SLIDE_ACTIONS[actionName]
@@ -4565,6 +5475,18 @@ function RiderServiceClient.Init(self: RiderServiceClient)
 		Enum.KeyCode.E,
 		Enum.KeyCode.ButtonR1
 	)
+	ContextActionService:BindAction("SlideStick", function(_actionName, _inputState, input: InputObject)
+		local _, seat = GetBoatSeat(localPlayer.Character)
+		local x = input.Position.X
+		local side: Side? = if not seat
+			then nil
+			elseif x <= -RiderConfig.STICK_DEADZONE then "Left"
+			elseif x >= RiderConfig.STICK_DEADZONE then "Right"
+			else nil
+		self:SetHeldSlide(STICK_INPUT, side)
+		-- Let the stick do its normal job too (it doesn't walk while hanging on).
+		return Enum.ContextActionResult.Pass
+	end, false, Enum.KeyCode.Thumbstick1)
 
 	-- After animations are applied each frame, so the pose wins over the sitting animation.
 	RunService.PreSimulation:Connect(function(deltaTime)
@@ -4580,19 +5502,27 @@ end
 
 -- A slide key (or on-screen button, which can leave out `inputName`) went down.
 function RiderServiceClient.PressSlide(self: RiderServiceClient, side: Side, inputName: string?)
-	local input = inputName or `Button{side}`
-	self:ReleaseSlide(side, input)
-	table.insert(self.HeldSlides, { Input = input, Side = side })
-	self:UpdateSlideDirection()
+	self:SetHeldSlide(inputName or `Button{side}`, side)
 end
 
 -- A slide key (or on-screen button) was let go.
 function RiderServiceClient.ReleaseSlide(self: RiderServiceClient, side: Side, inputName: string?)
-	local input = inputName or `Button{side}`
+	self:SetHeldSlide(inputName or `Button{side}`, nil)
+end
+
+-- Records that `input` is now holding a slide to `side`, or nothing (nil), and tells the
+-- server if that changes which way to slide.
+function RiderServiceClient.SetHeldSlide(self: RiderServiceClient, input: string, side: Side?)
 	for index = #self.HeldSlides, 1, -1 do
 		if self.HeldSlides[index].Input == input then
+			if self.HeldSlides[index].Side == side then
+				return -- already held that way
+			end
 			table.remove(self.HeldSlides, index)
 		end
+	end
+	if side then
+		table.insert(self.HeldSlides, { Input = input, Side = side })
 	end
 	self:UpdateSlideDirection()
 end
@@ -4611,10 +5541,11 @@ function RiderServiceClient.UpdateSlideDirection(self: RiderServiceClient)
 end
 
 function RiderServiceClient.Update(self: RiderServiceClient, deltaTime: number)
-	-- Got off the boat while sliding: stop.
-	if #self.HeldSlides > 0 then
-		local _, seat = GetBoatSeat(localPlayer.Character)
-		if not seat then
+	-- Got off the boat: stop sliding, and start fresh next time.
+	local _, localSeat = GetBoatSeat(localPlayer.Character)
+	if not localSeat then
+		self.LocalSeat = nil
+		if #self.HeldSlides > 0 then
 			table.clear(self.HeldSlides)
 			self:UpdateSlideDirection()
 		end
@@ -4623,11 +5554,101 @@ function RiderServiceClient.Update(self: RiderServiceClient, deltaTime: number)
 	local time = os.clock()
 	for _, player in Players:GetPlayers() do
 		local character = player.Character
-		local humanoid, _, boatModel = GetBoatSeat(character)
-		if character and humanoid and boatModel then
+		local humanoid, seat, boatModel = GetBoatSeat(character)
+		if character and humanoid and seat and boatModel then
+			self:PlaceRider(player, seat, boatModel, deltaTime)
 			self:PoseRider(player, character, humanoid, boatModel, time)
 		end
 	end
+end
+
+-- Where riders on `boatModel` hang on and can slide, worked out once per boat.
+function RiderServiceClient.GetSpot(self: RiderServiceClient, boatModel: Model, seat: BasePart): RiderSpots.RiderSpot?
+	local spots = self.BoatSpots[boatModel]
+	if spots and spots[seat] then
+		return spots[seat]
+	end
+	local primaryPart = boatModel.PrimaryPart
+	if not primaryPart then
+		return nil
+	end
+	local seats: { BasePart } = {}
+	for _, descendant in boatModel:GetDescendants() do
+		if descendant:IsA("Seat") then
+			table.insert(seats, descendant)
+		end
+	end
+	local newSpots = RiderSpots.GetSpots(primaryPart.CFrame, seats)
+	self.BoatSpots[boatModel] = newSpots
+	return newSpots[seat]
+end
+
+-- Hangs `player` where they should be shown round `seat`: the local player straight
+-- away (ahead of the server), everyone else gliding to where the server has them.
+function RiderServiceClient.PlaceRider(
+	self: RiderServiceClient,
+	player: Player,
+	seat: BasePart,
+	boatModel: Model,
+	deltaTime: number
+)
+	local spot = self:GetSpot(boatModel, seat)
+	if not spot then
+		return
+	end
+	local serverValue = seat:GetAttribute(RiderServiceShared.SLIDE_ANGLE_ATTRIBUTE)
+	local serverAngle = if typeof(serverValue) == "number" then serverValue else 0
+
+	local angle: number
+	if player == localPlayer then
+		angle = self:PredictLocalSlide(seat, spot, serverAngle, deltaTime)
+	else
+		local shown = self.ShownAngles[seat]
+		local current = if shown and shown.Rider == player then shown.Angle else serverAngle
+		local blend = if RiderConfig.OTHER_RIDER_SMOOTHING > 0
+			then 1 - math.exp(-deltaTime / RiderConfig.OTHER_RIDER_SMOOTHING)
+			else 1
+		angle = current + RiderSpots.GetAngleDifference(current, serverAngle) * blend
+	end
+	self.ShownAngles[seat] = { Rider = player, Angle = angle }
+
+	local seatWeld = seat:FindFirstChild("SeatWeld")
+	if seatWeld and seatWeld:IsA("Weld") then
+		seatWeld.C0 = RiderSpots.GetSeatWeldC0(spot, angle)
+		seatWeld.C1 = CFrame.identity
+	end
+end
+
+-- Moves the local player's own rider on by one frame with the same rules the server
+-- uses, so their slide shows straight away. Once they stop, it settles onto where the
+-- server has them; if it's ever far off (the server stopped them), it jumps there.
+function RiderServiceClient.PredictLocalSlide(
+	self: RiderServiceClient,
+	seat: BasePart,
+	spot: RiderSpots.RiderSpot,
+	serverAngle: number,
+	deltaTime: number
+): number
+	if self.LocalSeat ~= seat then
+		self.LocalSeat = seat
+		self.LocalAngle = serverAngle
+		self.LocalSpeed = 0
+	end
+	local angle, speed = RiderSpots.StepSlide(spot, self.LocalAngle, self.LocalSpeed, self.SlideDirection, deltaTime)
+
+	local offBy = RiderSpots.GetAngleDifference(angle, serverAngle)
+	if math.abs(offBy) * math.max(spot.Radius, 1) > RiderConfig.SLIDE_SNAP_DISTANCE then
+		angle = serverAngle
+		speed = 0
+	elseif self.SlideDirection == 0 and math.abs(speed) < MIN_SLIDE_SPEED then
+		local blend = if RiderConfig.SLIDE_CORRECTION_TIME > 0
+			then 1 - math.exp(-deltaTime / RiderConfig.SLIDE_CORRECTION_TIME)
+			else 1
+		angle += offBy * blend
+	end
+	self.LocalAngle = angle
+	self.LocalSpeed = speed
+	return angle
 end
 
 -- Poses one rider hanging on to their boat.
@@ -4701,12 +5722,140 @@ return RiderServiceClient :: RiderServiceClient
 
 local RiderServiceShared = {
 	SERVICE_NAME = "RiderService",
+	SLIDE_ANGLE_ATTRIBUTE = "SlideAngle", -- on each boat Seat: how far round the edge its rider has slid (see RiderSpots)
 
 	-- Remotes
 	REQUEST_SLIDE = "RequestSlide", -- RemoteEvent client -> server (direction: number): -1 slide left, 1 slide right, 0 stop
 }
 
 return RiderServiceShared
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "RiderService" },
+		Name = "RiderSpots",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.RiderService.RiderSpots
+--
+-- Where riders hang on round a boat, and how they slide round its edge. Pure math, shared
+-- by the server (which decides where every rider is) and the client (which shows its own
+-- player's slide straight away, without waiting for the server, using the same rules).
+--
+-- Each seat's rider hangs at RiderConfig.HANG_OFFSET from it and slides round a circle
+-- about the boat's PrimaryPart. The edge is shared out between the seats: each rider
+-- gets from their seat halfway to the next seat each way, less RIDER_SPACING so
+-- neighbours never overlap. A lone seat's rider can go all the way round. Slide angles
+-- are in radians round from the seat; positive is to the rider's right as they face the
+-- middle of the boat.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
+
+-- Where a rider hangs on from one seat, and how far round the edge they can slide.
+export type RiderSpot = {
+	SeatCFrame: CFrame, -- the seat, in the PrimaryPart's space
+	HangCFrame: CFrame, -- the rider's HumanoidRootPart right at the seat, in the PrimaryPart's space
+	Radius: number, -- how far that is from the PrimaryPart, flat (studs)
+	MinAngle: number?, -- how far they can slide to their left (negative)...
+	MaxAngle: number?, -- ...and to their right. Both nil: all the way round.
+}
+
+local FULL_TURN = 2 * math.pi
+local MIN_SLIDE_RADIUS = 1 -- a rider this close to the middle (studs) turns on the spot as if this far out
+
+local RiderSpots = {}
+
+-- The spot for each of `seats` on a boat whose PrimaryPart is at `primaryCFrame`.
+function RiderSpots.GetSpots(primaryCFrame: CFrame, seats: { BasePart }): { [BasePart]: RiderSpot }
+	local spots: { [BasePart]: RiderSpot } = {}
+	local angles: { [BasePart]: number } = {}
+	for _, seat in seats do
+		local seatCFrame = primaryCFrame:ToObjectSpace(seat.CFrame)
+		local hangCFrame = seatCFrame * RiderConfig.HANG_OFFSET
+		spots[seat] = {
+			SeatCFrame = seatCFrame,
+			HangCFrame = hangCFrame,
+			Radius = Vector3.new(hangCFrame.X, 0, hangCFrame.Z).Magnitude,
+			MinAngle = nil,
+			MaxAngle = nil,
+		}
+		-- Measured the way CFrame.Angles(0, angle, 0) turns things: from +Z toward +X.
+		angles[seat] = math.atan2(hangCFrame.X, hangCFrame.Z)
+	end
+	if #seats < 2 then
+		return spots
+	end
+
+	local seatsInOrder = table.clone(seats)
+	table.sort(seatsInOrder, function(first, second)
+		return angles[first] < angles[second]
+	end)
+	for index, seat in seatsInOrder do
+		local previousSeat = seatsInOrder[(index - 2) % #seatsInOrder + 1]
+		local nextSeat = seatsInOrder[index % #seatsInOrder + 1]
+		local gapBefore = (angles[seat] - angles[previousSeat]) % FULL_TURN
+		local gapAfter = (angles[nextSeat] - angles[seat]) % FULL_TURN
+		local spot = spots[seat]
+		local spacing = if spot.Radius > 0 then RiderConfig.RIDER_SPACING / 2 / spot.Radius else 0
+		spot.MinAngle = -math.max(0, gapBefore / 2 - spacing)
+		spot.MaxAngle = math.max(0, gapAfter / 2 - spacing)
+	end
+	return spots
+end
+
+-- The SeatWeld C0 that hangs a rider `angle` round the edge from `spot`'s seat (with C1
+-- left at identity). Roblox's own weld would sit them on the seat.
+function RiderSpots.GetSeatWeldC0(spot: RiderSpot, angle: number): CFrame
+	return spot.SeatCFrame:Inverse() * CFrame.Angles(0, angle, 0) * spot.HangCFrame
+end
+
+-- The shortest way round from angle `from` to angle `to` (radians, -pi to pi).
+function RiderSpots.GetAngleDifference(from: number, to: number): number
+	return (to - from + math.pi) % FULL_TURN - math.pi
+end
+
+-- One step of a rider sliding round the edge from `spot`'s seat: `angle` (radians) and
+-- `speed` (studs/s, positive to their right) `deltaTime` seconds later, while they slide
+-- `direction` (-1 left, 1 right, 0 not at all). Speeds up and slows down smoothly, eases
+-- into the blockers at the ends of their stretch, and never goes past them.
+function RiderSpots.StepSlide(
+	spot: RiderSpot,
+	angle: number,
+	speed: number,
+	direction: number,
+	deltaTime: number
+): (number, number)
+	local radius = math.max(spot.Radius, MIN_SLIDE_RADIUS)
+	local minAngle, maxAngle = spot.MinAngle, spot.MaxAngle
+
+	local targetSpeed = direction * RiderConfig.SLIDE_SPEED
+	if minAngle and maxAngle and RiderConfig.SLIDE_SOFT_END > 0 and targetSpeed ~= 0 then
+		-- Slow down near the blocker ahead (but still reach it).
+		local studsToEnd = if targetSpeed > 0 then (maxAngle - angle) * radius else (angle - minAngle) * radius
+		local slowdown = math.clamp(studsToEnd / RiderConfig.SLIDE_SOFT_END, RiderConfig.SLIDE_END_SPEED, 1)
+		targetSpeed *= slowdown
+	end
+	local blend = if RiderConfig.SLIDE_RESPONSE_TIME > 0
+		then 1 - math.exp(-deltaTime / RiderConfig.SLIDE_RESPONSE_TIME)
+		else 1
+	speed += (targetSpeed - speed) * blend
+	angle += speed / radius * deltaTime
+
+	if minAngle and maxAngle then
+		if angle <= minAngle or angle >= maxAngle then
+			angle = math.clamp(angle, minAngle, maxAngle)
+			speed = 0
+		end
+	else
+		angle = RiderSpots.GetAngleDifference(0, angle)
+	end
+	return angle, speed
+end
+
+return RiderSpots
 ]==],
 	},
 }

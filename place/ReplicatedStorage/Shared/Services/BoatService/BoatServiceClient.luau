@@ -4,7 +4,8 @@
 -- The client half of BoatService.
 --   - While the local player sits in a boat on the river, jumping is switched off so
 --     they don't fall out by accident. (The server still handles anyone who leaves.)
---   - BoatWiped fires when their boat falls off the river, for the UI (a RIP screen).
+--   - BoatWiped fires when their boat is out of the run, with why ("Fell" off the river
+--     or "Popped" by a hazard), for the UI (a RIP screen).
 --   - RequestJoinBoat, RequestStartRun, IsLeaderOf and GetSecondsUntilDeparture are for
 --     the joining UI (to be built): a Join button, the leader's Start button and the timer.
 
@@ -20,7 +21,7 @@ local BoatServiceClient = {}
 
 type BoatServiceClientMembers = {
 	LockedHumanoid: Humanoid?, -- the humanoid whose jumping is currently switched off
-	BoatWiped: Signal.Signal, -- fires () when the local player's boat falls off the river
+	BoatWiped: Signal.Signal, -- fires (reason: BoatServiceShared.WipeReason) when the local player's boat is out of the run
 }
 
 export type BoatServiceClient = typeof(BoatServiceClient) & BoatServiceClientMembers
@@ -36,8 +37,8 @@ function BoatServiceClient.Init(self: BoatServiceClient)
 	-- Remotes are waited for in a separate thread so Init never yields.
 	task.spawn(function()
 		Remotes.WaitForEvent(BoatServiceShared.SERVICE_NAME, BoatServiceShared.NOTIFY_BOAT_WIPED).OnClientEvent
-			:Connect(function()
-				self.BoatWiped:Fire()
+			:Connect(function(reason: BoatServiceShared.WipeReason)
+				self.BoatWiped:Fire(reason)
 			end)
 	end)
 end

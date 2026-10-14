@@ -8,9 +8,12 @@
 -- playtest stops. Nothing is saved into your place.
 --   - A lobby and every checkpoint in CheckpointConfig.CHECKPOINTS: a platform, docks,
 --     a "start the run" prompt on every dock, and teleport posts.
---   - Ponds joined by rivers without walls (Current and Rapids), a few rocks and the finish.
---   - Round boat templates Boat1-Boat6, a fart cloud and a placeholder fart sound, but only
---     where you haven't made your own yet.
+--   - Ponds joined by rivers without walls (Current and Rapids) and the finish.
+--   - A mock obstacle course along the rivers (MockCourse, inside this module): swinging
+--     doors, a sliding gate, slicing fan blades, spike balls, a swinging mace and side
+--     fans, built from plain blocks through the real obstacle system.
+--   - Round boat templates Boat1-Boat6, mock obstacle templates, a fart cloud and a
+--     placeholder fart sound, but only where you haven't made your own yet.
 --   - A stand-in gas meter at the bottom middle of the screen (StarterGui.HUD, with the names
 --     the UI.HUD.GasMeter module looks for), unless you've built your own HUD.
 -- If Workspace.Map already exists, it's moved to ServerStorage for this playtest only.
@@ -33,6 +36,8 @@ local CheckpointServiceServer = require(ServerScriptService.Services.CheckpointS
 local DockServiceServer = require(ServerScriptService.Services.DockService.DockServiceServer)
 local DockServiceShared = require(ReplicatedStorage.Shared.Services.DockService.DockServiceShared)
 local GasMeter = require(ReplicatedStorage.UI.HUD.GasMeter)
+local MockCourse = require(script.MockCourse)
+local ObstacleServiceShared = require(ReplicatedStorage.Shared.Services.ObstacleService.ObstacleServiceShared)
 
 local WATER_Y = 100 -- height of the water surface; high up, so boats that fall off fall far
 local POND_LENGTH = 140
@@ -51,7 +56,6 @@ local RAPIDS_COLOR = Color3.fromRGB(160, 215, 250)
 local WALL_COLOR = Color3.fromRGB(150, 110, 75)
 local PLATFORM_COLOR = Color3.fromRGB(120, 170, 90)
 local PIER_COLOR = Color3.fromRGB(170, 130, 85)
-local ROCK_COLOR = Color3.fromRGB(110, 110, 115)
 local POST_COLOR = Color3.fromRGB(240, 200, 60)
 local BOAT_COLORS = {
 	Color3.fromRGB(255, 170, 60),
@@ -139,12 +143,6 @@ local function AddWall(sceneryFolder: Instance, x0: number, z0: number, x1: numb
 	local size = Vector3.new(math.max(math.abs(x1 - x0), 2), 6, math.max(math.abs(z1 - z0), 2))
 	local center = Vector3.new((x0 + x1) / 2, WATER_Y + 1, (z0 + z1) / 2)
 	MakePart(sceneryFolder, "Wall", size, CFrame.new(center), WALL_COLOR)
-end
-
-local function AddRock(sceneryFolder: Instance, x: number, z: number)
-	local rock = MakePart(sceneryFolder, "Rock", Vector3.new(8, 8, 8), CFrame.new(x, WATER_Y, z), ROCK_COLOR)
-	rock.Shape = Enum.PartType.Ball
-	rock.Material = Enum.Material.Slate
 end
 
 -- Walls across the pond at z, with a gap in the middle for the river.
@@ -258,6 +256,7 @@ local function BuildMap()
 	local map = MakeFolder(workspace, "Map")
 	local waterFolder = MakeFolder(map, "Water")
 	local sceneryFolder = MakeFolder(map, "Scenery")
+	local obstaclesFolder = MakeFolder(map, ObstacleServiceShared.OBSTACLES_FOLDER_NAME)
 	local checkpointsFolder = MakeFolder(map, "Checkpoints")
 
 	local locationFolders: { Instance } = {}
@@ -287,8 +286,7 @@ local function BuildMap()
 		-- A river with no walls: fall off the side and you start over at your checkpoint.
 		local riverName = if locationIndex % 2 == 1 then "Current" else "Rapids"
 		AddWater(waterFolder, riverName, -RIVER_HALF_WIDTH, riverStartZ, RIVER_HALF_WIDTH, riverStartZ + RIVER_LENGTH)
-		AddRock(sceneryFolder, -9, riverStartZ + 40)
-		AddRock(sceneryFolder, 9, riverStartZ + 90)
+		MockCourse.PlaceRiver(obstaclesFolder, locationIndex, riverStartZ, WATER_Y)
 	end
 
 	-- The finish pond after the last river
@@ -435,6 +433,8 @@ local function BuildAssets()
 		placeholder.SoundId = "rbxasset://sounds/impact_water.mp3"
 		placeholder.Parent = fartSoundsFolder
 	end
+
+	MockCourse.BuildTemplates(GetOrMakeFolder(assets, ObstacleServiceShared.TEMPLATES_FOLDER_NAME))
 
 	GetOrMakeFolder(workspace, "Boats")
 end

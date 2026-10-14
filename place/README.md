@@ -90,16 +90,21 @@ To playtest before the real map, boats and menus exist:
    into the Command Bar.
 2. Press **Play**. Every playtest now builds a grey-box test world at runtime (it's gone
    when you stop): a lobby and every checkpoint with docks, ponds joined by rivers
-   without walls, currents, rocks, the finish, boat templates `Boat1`–`Boat6`, a fart
-   cloud, a placeholder sound and a gas meter at the bottom of the screen. Your own
+   without walls, currents, the finish, boat templates `Boat1`–`Boat6`, a fart cloud, a
+   placeholder sound and a gas meter at the bottom of the screen. Your own
    `Workspace.Map` is set aside for the playtest,
-   and your own boat templates and effects are used if you've made them.
+   and your own boat templates, obstacle templates and effects are used if you've made them.
+   - **A mock obstacle course** runs along the four rivers, built from plain blocks by
+     `TestKit.MockCourse` through the real obstacle system (see *Obstacles*): swinging
+     doors and spike balls, then slicing fan blades and a side fan, then a sliding gate
+     and a patrolling spike ball, then a swinging mace, another side fan and more blades.
+     Red parts pop your boat.
 3. In the test world:
    - **E** at a dock's pier spawns a boat with that dock's number of seats (dock 1 = 1 seat).
    - Walk into a seat. The boat leaves after the 30 second timer, or press **F** next to
      it to start early (party leader only, sitting in the boat).
    - Fart with **W**, slide round the edge with **A / D** (or the arrow keys). Fall off a
-     river to test wiping.
+     river, or hit something red, to test wiping.
    - **E** at the yellow posts on each platform teleports there, once unlocked.
    - Anything that didn't work is explained in Output, starting with `[TestKit]`.
 4. Use **Test → Clients and Servers** with 2+ players to test together.
@@ -120,16 +125,18 @@ ReplicatedStorage
       CheckpointService   CheckpointServiceClient, CheckpointServiceShared
       DockService         DockServiceClient, DockServiceShared
       FartService         FartServiceClient, FartServiceShared, FartPhysics
-      RiderService        RiderServiceClient, RiderServiceShared
+      ObstacleService     ObstacleServiceShared
+      RiderService        RiderServiceClient, RiderServiceShared, RiderSpots
     Classes
     Modules
-      Core                Remotes
-      Game                BoatConfig, CameraConfig, CheckpointConfig, DataConfig,
-                          DockConfig, FartConfig, RiderConfig, WaterConfig
-      Math                Geometry
+      Core                Attributes, Remotes
+      Game                BoatConfig, CameraConfig, CheckpointConfig, DataConfig, DockConfig,
+                          FartConfig, ObstacleConfig, RiderConfig, WaterConfig
+      Math                Cycle, Geometry
       Platform
   Assets                you build everything in here
     Boats                 boat templates
+    Obstacles             obstacle templates (see Obstacles)
     VFX                   FartCloud (a ParticleEmitter)
     Sounds
       Farts               fart Sounds
@@ -146,9 +153,11 @@ ServerScriptService
     DataService           DataServiceServer
     DockService           DockServiceServer
     FartService           FartServiceServer
+    ObstacleService       ObstacleServiceServer
     RiderService          RiderServiceServer
     WaterService          WaterServiceServer
   Classes                 Boat, Dock, Hull, Location
+    Obstacles             ObstacleRig, Spinner, Swinger, Slider, WindFan
 
 StarterPlayer.StarterPlayerScripts
   Client                  startup script
@@ -184,9 +193,9 @@ Workspace
      aboard, the boat is removed.
 5. On the river, players **fart and slide round the edge to steer** (controls below). The server checks every
    fart and spends gas. Every frame, **WaterService** moves each boat with its crew's
-   farts and the water under it (see *How boats move*). A boat that **falls off**
-   the river freezes for `WIPE_DELAY`, then it's removed and its crew goes back to
-   their checkpoint to spawn a new boat.
+   farts, the water under it and the wind from any fans (see *How boats move*). A boat
+   that **falls off** the river or is **popped** by a hazard freezes for `WIPE_DELAY`,
+   then it's removed and its crew goes back to their checkpoint to spawn a new boat.
 6. When a boat on the river enters a checkpoint's **Zone**, that checkpoint and every
    one before it are **unlocked** and saved for everyone aboard. From then on they
    respawn there.
@@ -202,8 +211,8 @@ Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`
 | Action | Keyboard | Controller | What it does |
 | ------ | -------- | ---------- | ------------ |
 | Fart | `W`, `↑`, `Space` | `RT` | farts straight out behind you: pushes the boat the way you face |
-| Slide left | `A`, `←`, `Q` | `LB` | slides you left round the edge of the boat |
-| Slide right | `D`, `→`, `E` | `RB` | slides you right round the edge of the boat |
+| Slide left | `A`, `←`, `Q` | `LB`, left stick left | slides you left round the edge of the boat |
+| Slide right | `D`, `→`, `E` | `RB`, left stick right | slides you right round the edge of the boat |
 
 Riders **hang on to the outside of the raft**, arms over the side and legs kicking in the
 water, facing its middle, and **fart straight off it**. A fart pushes the boat from where
@@ -215,7 +224,10 @@ until you're on its right-hand side, then fart. The physics is real (see *How bo
 shared out evenly between the seats: from your seat, halfway to the next seat each way.
 On a one-seat boat you can slide all the way round and push any way you like; on a
 six-seat boat you only get a sixth of it, so the crew has to work together to go
-anywhere. You slide at 6 studs/s (`RiderConfig.SLIDE_SPEED`), easing in and out.
+anywhere. You slide at 6 studs/s (`RiderConfig.SLIDE_SPEED`), easing in and out and
+easing into the blockers. The server decides where everyone is, but your own slide shows
+the moment you press (your game runs the same rules and settles onto the server's answer
+when you stop), and other riders glide smoothly.
 
 | Boat | Your stretch of the edge (test kit boats) |
 | ---- | ---- |
@@ -265,6 +277,8 @@ no hard speed caps:
   round the rim slows its spinning, times `WaterConfig.SPIN_DRAG_SCALE` (raise it for less
   spin from bumps and rapids).
 - **Currents** carry it along, and **rapids** shove and twist it around at random.
+- **Wind** from side fans pushes it through its middle (see *Obstacles*), harder on
+  lighter boats; the crew can fart against it.
 - **Buoyancy** holds it at the surface like a soft spring: it bobs on gentle **waves**,
   and a boat that drops in plunges, then settles in about 2 seconds without bouncing
   back out. Off the water, only gravity, a little air drag and the farts act on it.
@@ -322,6 +336,7 @@ Workspace
       ...              Parts     the TOP face is the water surface; any other name is calm water
       Current          Part      named after an entry in WaterConfig.WATER_TYPES: flows toward its front face
       Rapids           Part      the same, faster, choppier and rough
+    Obstacles (Folder)           every obstacle, or a marker for one (see Obstacles)
 ```
 
 - Make `Spawn`, `Launch`, `Zone`, `BoatSpawn` and `Finish` **Anchored**, **CanCollide off**
@@ -338,6 +353,65 @@ Workspace
 - Put each `Launch` part at water level, over a water part.
 - The checkpoints and their order live in `CheckpointConfig.CHECKPOINTS`. The three
   there now are placeholders: edit the list to match the map.
+
+## Obstacles
+
+Obstacles are built by hand (or from templates) and run by **ObstacleService** on the
+server. The moving ones are driven by physics constraints the server runs, so they shove
+boats properly, nothing can stop them, and they move smoothly for every player. Their
+moving parts hit boats but pass through the map, riders and each other.
+
+| Kind | What it does | For example |
+| ---- | ------------ | ----------- |
+| `Spinner` | turns round and round | fan blades slicing the water, spinning spike arms |
+| `Swinger` | swings between two angles on a hinge, waiting at each end | swinging doors, a swinging mace |
+| `Slider` | slides back and forth along a line, waiting at each end | gates that open and close, a patrolling spike ball |
+| `WindFan` | blows boats in its wind zone sideways, on and off | a big fan at the side of the river |
+| Hazard | any part with attribute `Hazard` = true pops a boat that touches it | spikes, blades |
+
+**Building one:** make a Model in `Workspace.Map.Obstacles` (Folders inside are fine) with
+the attribute `Obstacle` set to the kind, and these parts:
+
+```
+<any name> (Model, attribute Obstacle = "Spinner" | "Swinger" | "Slider" | "WindFan")
+  Base     Part   the fixed part. Spinners, Swingers and WindFans turn around the line
+                  through its middle along its front face; Sliders slide along its front face.
+  Moving   Part   the part that moves. Weld everything else that moves to it (WeldConstraints).
+                  Anchoring doesn't matter: the code sets it.
+  Wind     Part   WindFan only: the zone that blows; boats in it are pushed toward its front
+                  face. CanCollide off, see-through. (A WindFan's Base and Moving are optional:
+                  they're its spinning fan.)
+  ...             anything else is scenery and stays put.
+```
+
+Mark any part (in an obstacle or anywhere else in the map) with the attribute `Hazard` =
+true to make it pop boats. A WindFan switches on any ParticleEmitters, Beams and Sounds
+inside it while it blows, spins its fan, and sets its `Blowing` attribute for clients.
+
+**Settings** are attributes on the Model; anything not set uses the default in
+`ObstacleConfig`. Times are in seconds.
+
+| Kind | Attributes (defaults) |
+| ---- | --------------------- |
+| `Spinner` | `Speed` turns a minute, negative turns the other way (12) |
+| `Swinger` | `FromAngle`, `ToAngle` degrees from how it was built (0, 90), `MoveTime` (1.2), `HoldTime` at each end (1.5), `StartDelay` (0) |
+| `Slider` | `Distance` studs toward Base's front face (10), `MoveTime` (1), `HoldTime` at each end (2), `StartDelay` (0) |
+| `WindFan` | `Strength` push in studs/s² on a boat of `REFERENCE_MASS` (28), `OnTime` (3), `OffTime` (3), `StartDelay` (0), `Speed` of its fan (120) |
+
+Everything runs off the server clock, so `StartDelay` staggers obstacles of the same kind.
+
+**Templates:** to place the same obstacle many times, build it once as a Model in
+**`ReplicatedStorage.Assets.Obstacles`**, and in the map put a **marker** (any Part or
+Model) with the attribute `ObstacleTemplate` = the template's name. At startup each marker
+is swapped for a copy of the template, with the template's pivot on the marker's pivot.
+Any other attributes on the marker (like `StartDelay` or `Speed`) override the template's,
+so each copy can be tuned. Swap a template's art and every copy updates. The test kit's
+mock course is built this way: its templates are `SwingingDoor`, `SlidingGate`,
+`FanBlades`, `SpikeBall`, `PatrolSpikeBall`, `SwingingMace` and `SideFan`. Make real
+models with those names in `Assets.Obstacles` and the course uses them instead.
+
+Output warns about any obstacle that's missing a part or has a setting of the wrong type,
+and any marker whose template doesn't exist.
 
 ## Building the boats
 
@@ -405,7 +479,8 @@ The client halves have everything the menus need:
 | Touch fart button | call `FartServiceClient:PressFart()` on press and `FartServiceClient:ReleaseFart()` on release |
 | Touch slide buttons | call `RiderServiceClient:PressSlide("Left")` (or `"Right"`) on press and `RiderServiceClient:ReleaseSlide("Left")` (or `"Right"`) on release |
 | Farting on and off (e.g. button glow) | `FartServiceClient.FartStarted` and `FartStopped` |
-| RIP screen | `BoatServiceClient.BoatWiped` |
+| RIP screen | `BoatServiceClient.BoatWiped` fires with why: `"Fell"` off the river or `"Popped"` by a hazard |
+| A fan is blowing (e.g. a warning) | the WindFan Model's `Blowing` attribute |
 
 ## Saving
 

@@ -299,15 +299,16 @@ function BoatServiceServer.GetRiddenSeat(self: BoatServiceServer, player: Player
 	return nil, nil
 end
 
--- A boat fell off the river: freeze it, tell its crew, then remove it. Removing it
--- sends the crew back to their checkpoint (CheckpointService listens to CrewMemberLeft).
-function BoatServiceServer.WipeBoat(self: BoatServiceServer, boat: Boat.Boat)
+-- A boat is out of the run (it fell off the river, or something popped it): freeze it,
+-- tell its crew why, then remove it. Removing it sends the crew back to their checkpoint
+-- (CheckpointService listens to CrewMemberLeft).
+function BoatServiceServer.WipeBoat(self: BoatServiceServer, boat: Boat.Boat, reason: BoatServiceShared.WipeReason)
 	if not boat:IsFloating() then
 		return
 	end
 	boat:Freeze()
 	for _, player in boat.Crew do
-		self.NotifyBoatWipedRemote:FireClient(player)
+		self.NotifyBoatWipedRemote:FireClient(player, reason)
 	end
 	task.delay(BoatConfig.WIPE_DELAY, function()
 		self:DestroyBoat(boat)

@@ -3,8 +3,8 @@
 --
 -- Moves every boat on the river. Each frame, for each boat, it works out what the
 -- water under the boat is doing (its surface with the waves, its current and how rough
--- it is), asks FartService for the pushes from the crew's farts, and steps the boat's Hull
--- with both. Where there's no water under a boat, nothing holds it up and it falls. A
+-- it is), asks FartService for the pushes from the crew's farts and ObstacleService for
+-- the wind from any fans, and steps the boat's Hull with all of it. Where there's no water under a boat, nothing holds it up and it falls. A
 -- boat that falls FALL_DISTANCE below the last water it was over has fallen off the
 -- river, and BoatService wipes it.
 --
@@ -21,6 +21,7 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
 local FartServiceServer = require(ServerScriptService.Services.FartService.FartServiceServer)
 local Hull = require(ServerScriptService.Classes.Hull)
+local ObstacleServiceServer = require(ServerScriptService.Services.ObstacleService.ObstacleServiceServer)
 local WaterConfig = require(ReplicatedStorage.Shared.Modules.Game.WaterConfig)
 
 -- A wave from WaterConfig.WAVES, ready for the math.
@@ -148,10 +149,14 @@ function WaterServiceServer.Update(self: WaterServiceServer, deltaTime: number)
 		local position = hull.PrimaryPart.Position
 		local water = self:GetWater(position, now)
 		if not water and position.Y < hull.LastWaterHeight - WaterConfig.FALL_DISTANCE then
-			BoatServiceServer:WipeBoat(boat)
+			BoatServiceServer:WipeBoat(boat, "Fell")
 			continue
 		end
-		hull:Step(water, FartServiceServer:GetFartForces(boat), stepTime)
+		local forces = FartServiceServer:GetFartForces(boat)
+		for _, obstacleForce in ObstacleServiceServer:GetObstacleForces(boat) do
+			table.insert(forces, obstacleForce)
+		end
+		hull:Step(water, forces, stepTime)
 	end
 end
 

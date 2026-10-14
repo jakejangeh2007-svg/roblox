@@ -25,6 +25,9 @@
           "Farts": {
             "$className": "Folder"
           }
+        },
+        "Obstacles": {
+          "$className": "Folder"
         }
       }
     },
@@ -39,7 +42,7 @@
         "$path": "ServerScriptService/Classes"
       },
       "TestKit": {
-        "$path": "TestKit/TestKit.luau"
+        "$path": "TestKit/TestKit"
       }
     },
     "StarterPlayer": {

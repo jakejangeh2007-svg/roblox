@@ -40,20 +40,12 @@ local ServerScriptService = game:GetService("ServerScriptService")
 local BoatConfig = require(ReplicatedStorage.Shared.Modules.Game.BoatConfig)
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
 local Hull = require(ServerScriptService.Classes.Hull)
-local RiderConfig = require(ReplicatedStorage.Shared.Modules.Game.RiderConfig)
+local RiderServiceShared = require(ReplicatedStorage.Shared.Services.RiderService.RiderServiceShared)
+local RiderSpots = require(ReplicatedStorage.Shared.Services.RiderService.RiderSpots)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
 local Boat = {}
 Boat.__index = Boat
-
--- Where a rider hangs on from one seat, and how far round the edge they can slide.
-type RiderSpot = {
-	SeatCFrame: CFrame, -- the seat, in the PrimaryPart's space
-	HangCFrame: CFrame, -- the rider's HumanoidRootPart right at the seat, in the PrimaryPart's space
-	Radius: number, -- how far that is from the PrimaryPart, flat (studs)
-	MinAngle: number?, -- how far they can slide to their left (radians, negative)...
-	MaxAngle: number?, -- ...and to their right. Both nil: all the way round.
-}
 
 type BoatMembers = {
 	Model: Model,
@@ -64,7 +56,7 @@ type BoatMembers = {
 	Crew: { Player }, -- who was aboard at launch, minus anyone who has left since
 	Hull: Hull.Hull?, -- how it moves on the river; made when it launches
 	SeatRiders: { [Seat]: Player }, -- who is hanging on at each seat right now
-	RiderSpots: { [Seat]: RiderSpot },
+	RiderSpots: { [BasePart]: RiderSpots.RiderSpot }, -- where each seat's rider hangs on and can slide
 	RiderSlides: { [Seat]: number }, -- how far round the edge each seat's rider has slid (radians)
 	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
 	LaunchCFrame: CFrame,
@@ -93,48 +85,6 @@ local function EjectFromSeat(seat: Seat)
 	if seatWeld then
 		seatWeld:Destroy()
 	end
-end
-
--- Where riders hang on from each of `seats`, and the stretch of the edge each can slide
--- along: from their seat halfway to the next seat each way, less RIDER_SPACING so
--- neighbours never overlap. A lone seat's rider can go all the way round.
-local function GetRiderSpots(primaryPart: BasePart, seats: { Seat }): { [Seat]: RiderSpot }
-	local spots: { [Seat]: RiderSpot } = {}
-	local angles: { [Seat]: number } = {}
-	for _, seat in seats do
-		local seatCFrame = primaryPart.CFrame:ToObjectSpace(seat.CFrame)
-		local hangCFrame = seatCFrame * RiderConfig.HANG_OFFSET
-		local flatPosition = Vector3.new(hangCFrame.X, 0, hangCFrame.Z)
-		spots[seat] = {
-			SeatCFrame = seatCFrame,
-			HangCFrame = hangCFrame,
-			Radius = flatPosition.Magnitude,
-			MinAngle = nil,
-			MaxAngle = nil,
-		}
-		-- Measured the same way CFrame.Angles(0, angle, 0) turns things: from +Z toward +X.
-		angles[seat] = math.atan2(hangCFrame.X, hangCFrame.Z)
-	end
-	if #seats < 2 then
-		return spots
-	end
-
-	local seatsInOrder = table.clone(seats)
-	table.sort(seatsInOrder, function(first, second)
-		return angles[first] < angles[second]
-	end)
-	local fullTurn = 2 * math.pi
-	for index, seat in seatsInOrder do
-		local previousSeat = seatsInOrder[(index - 2) % #seatsInOrder + 1]
-		local nextSeat = seatsInOrder[index % #seatsInOrder + 1]
-		local gapBefore = (angles[seat] - angles[previousSeat]) % fullTurn
-		local gapAfter = (angles[nextSeat] - angles[seat]) % fullTurn
-		local spot = spots[seat]
-		local spacing = if spot.Radius > 0 then RiderConfig.RIDER_SPACING / 2 / spot.Radius else 0
-		spot.MinAngle = -math.max(0, gapBefore / 2 - spacing)
-		spot.MaxAngle = math.max(0, gapAfter / 2 - spacing)
-	end
-	return spots
 end
 
 local function GetPlayerInSeat(seat: Seat): Player?
@@ -255,7 +205,11 @@ function Boat.new(
 		end
 	end
 	if primaryPart then
-		self.RiderSpots = GetRiderSpots(primaryPart, self.Seats)
+		local seatParts: { BasePart } = {}
+		for _, seat in self.Seats do
+			table.insert(seatParts, seat)
+		end
+		self.RiderSpots = RiderSpots.GetSpots(primaryPart.CFrame, seatParts)
 	end
 	self:MoveTo(dockCFrame)
 
@@ -465,21 +419,22 @@ function Boat.Launch(self: Boat)
 	end
 end
 
--- Moves whoever hangs on at `seat` `angle` radians round the edge from it (positive is
--- to the rider's right, as they face the middle), within GetSlideRange.
+-- Moves whoever hangs on at `seat` `angle` radians round the edge from it (see
+-- RiderSpots), and tells every client (the seat's SlideAngle attribute).
 function Boat.SetRiderSlide(self: Boat, seat: Seat, angle: number)
 	local spot = self.RiderSpots[seat]
-	local seatWeld = seat:FindFirstChild("SeatWeld")
 	if not spot then
 		return
 	end
 	self.RiderSlides[seat] = angle
-	if not seatWeld or not seatWeld:IsA("Weld") then
-		return
+	if seat:GetAttribute(RiderServiceShared.SLIDE_ANGLE_ATTRIBUTE) ~= angle then
+		seat:SetAttribute(RiderServiceShared.SLIDE_ANGLE_ATTRIBUTE, angle)
 	end
-	-- Roblox welds the rider to sit on the seat; instead, hang them at their spot.
-	seatWeld.C0 = spot.SeatCFrame:Inverse() * CFrame.Angles(0, angle, 0) * spot.HangCFrame
-	seatWeld.C1 = CFrame.identity
+	local seatWeld = seat:FindFirstChild("SeatWeld")
+	if seatWeld and seatWeld:IsA("Weld") then
+		seatWeld.C0 = RiderSpots.GetSeatWeldC0(spot, angle)
+		seatWeld.C1 = CFrame.identity
+	end
 end
 
 -- How far round the edge from `seat` its rider has slid (radians, positive is to their right).
@@ -487,20 +442,9 @@ function Boat.GetRiderSlide(self: Boat, seat: Seat): number
 	return self.RiderSlides[seat] or 0
 end
 
--- How far round the edge the rider at `seat` can slide: to their left (negative) and
--- right (positive), in radians. Nil for both if they can go all the way round.
-function Boat.GetSlideRange(self: Boat, seat: Seat): (number?, number?)
-	local spot = self.RiderSpots[seat]
-	if not spot then
-		return 0, 0
-	end
-	return spot.MinAngle, spot.MaxAngle
-end
-
--- How far from the middle of the boat the rider at `seat` hangs (studs).
-function Boat.GetRiderRadius(self: Boat, seat: Seat): number
-	local spot = self.RiderSpots[seat]
-	return if spot then spot.Radius else 0
+-- Where `seat`'s rider hangs on and how far they can slide, if it's one of this boat's seats.
+function Boat.GetRiderSpot(self: Boat, seat: Seat): RiderSpots.RiderSpot?
+	return self.RiderSpots[seat]
 end
 
 -- While `player` hangs on, their body doesn't bump into anything; only the hull does.
