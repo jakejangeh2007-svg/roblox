@@ -23,7 +23,7 @@ local WaterConfig = {
 	-- drag that grows with speed, so a boat levels off smoothly at its top speed instead
 	-- of hitting a limit.
 	GLIDE_DRAG = 0.5, -- per second
-	TOP_SPEED = 24, -- studs/s one rider pushing at full strength levels a boat of FartConfig.REFERENCE_MASS off at
+	TOP_SPEED = 27, -- studs/s one rider pushing at full strength levels a boat of FartConfig.REFERENCE_MASS off at
 	-- Spinning is slowed by the same water drag acting round the boat's rim, times this
 	-- (the hull and the riders' legs churn the water as it spins). Higher = less spin.
 	SPIN_DRAG_SCALE = 10,

@@ -224,7 +224,7 @@ until you're on its right-hand side, then fart. The physics is real (see *How bo
 shared out evenly between the seats: from your seat, halfway to the next seat each way.
 On a one-seat boat you can slide all the way round and push any way you like; on a
 six-seat boat you only get a sixth of it, so the crew has to work together to go
-anywhere. You slide at 6 studs/s (`RiderConfig.SLIDE_SPEED`), easing in and out and
+anywhere. You slide at 10 studs/s (`RiderConfig.SLIDE_SPEED`), easing in and out and
 easing into the blockers. The server decides where everyone is, but your own slide shows
 the moment you press (your game runs the same rules and settles onto the server's answer
 when you stop), and other riders glide smoothly.
@@ -238,11 +238,11 @@ when you stop), and other riders glide smoothly.
 | 5 seats | 56°, about 9 studs |
 | 6 seats | 45°, about 8 studs |
 
-**Hold the fart key to keep farting.** A fart starts at 12 studs/s² and builds up by 8
-every second you keep going, up to 30 (on a boat weighing `FartConfig.REFERENCE_MASS`;
+**Hold the fart key to keep farting.** A fart starts at 18 studs/s² and builds up by 10
+every second you keep going, up to 36 (on a boat weighing `FartConfig.REFERENCE_MASS`;
 heavier boats speed up slower). Letting go stops, but the built-up strength fades out
 instead of resetting (3 times as fast as it built up), so a quick re-press picks up close
-to where you left off. A fart's push swells in and trails off over about a fifth of a
+to where you left off. A fart's push swells in and trails off in under a tenth of a
 second (`PUSH_RESPONSE_TIME`). You can slide while you fart.
 
 **Gas** drains at a flat 10 per second while you fart, however long you've been going, so a full tank
@@ -273,7 +273,7 @@ no hard speed caps:
 - **Water drag** pulls its speed toward the water's own speed. It's gentle at low speed,
   so a boat glides on for a few seconds after the crew stops, and grows with speed, so a
   boat levels off smoothly at its top speed: one rider at full strength cruises a boat of
-  `REFERENCE_MASS` at about 24 studs/s (`WaterConfig.TOP_SPEED`). The same drag acting
+  `REFERENCE_MASS` at about 27 studs/s (`WaterConfig.TOP_SPEED`). The same drag acting
   round the rim slows its spinning, times `WaterConfig.SPIN_DRAG_SCALE` (raise it for less
   spin from bumps and rapids).
 - **Currents** carry it along, and **rapids** shove and twist it around at random.
@@ -292,12 +292,12 @@ With the test kit's boats and one rider farting:
 
 | Boat | Weight (boat + rider) | Speed after 1 s / 3 s |
 | ---- | ---- | ---- |
-| 1 seat | 74 + 14 | 10 / 23 studs/s |
-| 2 seats | 97 + 14 | 8 / 20 |
-| 3 seats | 121 + 14 | 6 / 17 |
-| 4 seats | 146 + 14 | 5 / 15 |
-| 5 seats | 173 + 14 | 5 / 13 |
-| 6 seats | 200 + 14 | 4 / 12 |
+| 1 seat | 74 + 14 | 15 / 27 studs/s |
+| 2 seats | 97 + 14 | 12 / 23 |
+| 3 seats | 121 + 14 | 10 / 20 |
+| 4 seats | 146 + 14 | 9 / 18 |
+| 5 seats | 173 + 14 | 8 / 16 |
+| 6 seats | 200 + 14 | 7 / 15 |
 
 To make a boat nimbler or heavier, change its parts (their size and Material set how
 much they weigh). Fart strength is in `FartConfig`; water feel (drag, spin drag, bobbing,

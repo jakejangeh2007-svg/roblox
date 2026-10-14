@@ -12,9 +12,9 @@ local RiderConfig = {
 
 	-- Sliding round the edge (A and D). Each rider has their own stretch of the edge: from
 	-- their seat halfway to the next seat each way, or all the way round on a one-seat boat.
-	SLIDE_SPEED = 6, -- studs/s along the edge
-	SLIDE_RESPONSE_TIME = 0.12, -- sliding speeds up and slows down most of the way (63%) in this many seconds
-	SLIDE_SOFT_END = 1.5, -- studs before a blocker a rider starts easing into it...
+	SLIDE_SPEED = 10, -- studs/s along the edge
+	SLIDE_RESPONSE_TIME = 0.1, -- sliding speeds up and slows down most of the way (63%) in this many seconds
+	SLIDE_SOFT_END = 2, -- studs before a blocker a rider starts easing into it...
 	SLIDE_END_SPEED = 0.25, -- ...down to this fraction of SLIDE_SPEED when they reach it
 	RIDER_SPACING = 2.5, -- studs kept between neighbouring riders at the ends of their stretches
 	OTHER_RIDER_SMOOTHING = 0.08, -- other players' riders glide to where the server has them, most of the way in this many seconds

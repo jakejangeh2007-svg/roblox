@@ -12,12 +12,12 @@ local FartConfig = {
 	-- quick re-press picks up close to where you left off. Strengths are in studs/s²: how
 	-- much speed a fart adds every second to a boat weighing REFERENCE_MASS. Heavier boats
 	-- speed up slower, lighter ones faster.
-	PUSH_ACCELERATION = 12, -- when a fart starts
-	PUSH_ACCELERATION_GAIN = 8, -- added for every second you keep farting
-	MAX_PUSH_ACCELERATION = 30, -- reached after 2.25 seconds of farting
+	PUSH_ACCELERATION = 18, -- when a fart starts
+	PUSH_ACCELERATION_GAIN = 10, -- added for every second you keep farting
+	MAX_PUSH_ACCELERATION = 36, -- reached after 1.8 seconds of farting
 	REFERENCE_MASS = 89, -- the test kit's one-seat boat with its rider aboard
 	RAMP_DECAY = 3, -- after you let go, built-up strength fades this many times faster than it built up
-	PUSH_RESPONSE_TIME = 0.2, -- a fart's push eases in and out, most of the way in this many seconds
+	PUSH_RESPONSE_TIME = 0.08, -- a fart's push eases in and out, most of the way in this many seconds
 
 	-- Gas meter (each player's is in their "Gas" attribute)
 	GAS_MAX = 100,
