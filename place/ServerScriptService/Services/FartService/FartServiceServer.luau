@@ -2,14 +2,16 @@
 -- ModuleScript: ServerScriptService.Services.FartService.FartServiceServer
 --
 -- Runs every player's farting. A client asks to start farting (or to stop); this checks
--- they're riding a boat on the river and have gas, and keeps them farting until they
--- stop, run out of gas or leave the boat. Their fart builds up strength while they keep
--- it going and fades after they stop (FartPhysics), and its push eases in and out
--- smoothly. Gas drains at a flat rate while farting and refills while not. Other players
--- are told when someone starts or stops, so they can show it.
+-- they're riding a boat on the river (or swimming back to theirs after being knocked off)
+-- and have gas, and keeps them farting until they stop, run out of gas or can't any more.
+-- Their fart builds up strength while they keep it going and fades after they stop
+-- (FartPhysics), and its push eases in and out smoothly. Gas drains at a flat rate while
+-- farting and refills while not. Other players are told when someone starts or stops, so
+-- they can show it.
 --
--- This service doesn't move boats. WaterService asks GetFartForces for the pushes from
--- each boat's crew and moves the boat with everything else acting on it.
+-- This service doesn't move boats or swimmers. WaterService asks GetFartForces for the
+-- pushes from each boat's crew and moves the boat with everything else acting on it;
+-- OverboardService asks GetPush for each swimmer's.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -22,6 +24,7 @@ local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
 local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
 local Hull = require(ServerScriptService.Classes.Hull)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 
 local SERVICE_NAME = FartServiceShared.SERVICE_NAME
@@ -104,17 +107,24 @@ function FartServiceServer.HandleStartRequest(self: FartServiceServer, player: P
 	self:StartFart(player)
 end
 
+-- Whether `player` is somewhere they can fart: hanging on to a boat on the river, or
+-- swimming back to theirs (not while they're knocked out).
+function FartServiceServer.CanFart(self: FartServiceServer, player: Player): boolean
+	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
+	if not boat or not boat:IsFloating() then
+		return false
+	end
+	if boat:GetSeatOf(player) then
+		return true
+	end
+	return boat:IsOverboard(player) and OverboardServiceShared.GetState(player) == "Swimming"
+end
+
 -- Starts `player` farting, if they're allowed to. If they aren't, their client is told
 -- to stop showing the fart.
 function FartServiceServer.StartFart(self: FartServiceServer, player: Player)
 	self.PendingStarts[player] = nil
-	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
-	if
-		not boat
-		or not boat:IsFloating()
-		or not boat:GetSeatOf(player)
-		or (self.Gas[player] or 0) < FartConfig.MIN_GAS_TO_START
-	then
+	if not self:CanFart(player) or (self.Gas[player] or 0) < FartConfig.MIN_GAS_TO_START then
 		self.StopFartRemote:FireClient(player, player)
 		return
 	end
@@ -141,6 +151,12 @@ function FartServiceServer.StopFart(self: FartServiceServer, player: Player, not
 			self.StopFartRemote:FireClient(otherPlayer, player)
 		end
 	end
+end
+
+-- How hard `player`'s fart is pushing right now (studs/s² on a boat of
+-- FartConfig.REFERENCE_MASS), eased in and out; 0 if they aren't farting.
+function FartServiceServer.GetPush(self: FartServiceServer, player: Player): number
+	return self.Pushes[player] or 0
 end
 
 -- The pushes from `boat`'s crew's farts right now: each rider's fart as a force from
@@ -177,11 +193,11 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 		end
 	end
 
-	-- Farts end when the farter runs out of gas or isn't riding on the river any more.
+	-- Farts end when the farter runs out of gas, or isn't riding on the river or swimming
+	-- any more (knocked off, say).
 	for player in self.Farters do
-		local boat = BoatServiceServer:GetLaunchedBoatOf(player)
 		local gas = self.Gas[player] or 0
-		if not boat or not boat:IsFloating() or not boat:GetSeatOf(player) or gas <= 0 then
+		if gas <= 0 or not self:CanFart(player) then
 			self:StopFart(player, true)
 			continue
 		end

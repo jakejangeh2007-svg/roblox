@@ -12,8 +12,9 @@
 --   - A mock obstacle course along the rivers (MockCourse, inside this module): swinging
 --     doors, a sliding gate, slicing fan blades, spike balls, a swinging mace and side
 --     fans, built from plain blocks through the real obstacle system.
---   - Round boat templates Boat1-Boat6, mock obstacle templates, a fart cloud and a
---     placeholder fart sound, but only where you haven't made your own yet.
+--   - Round boat templates Boat1-Boat6, mock obstacle templates, a fart cloud, a dazed
+--     effect for knocked-out players and a placeholder fart sound, but only where you
+--     haven't made your own yet.
 --   - A stand-in gas meter at the bottom middle of the screen (StarterGui.HUD, with the names
 --     the UI.HUD.GasMeter module looks for), unless you've built your own HUD.
 -- If Workspace.Map already exists, it's moved to ServerStorage for this playtest only.
@@ -423,6 +424,22 @@ local function BuildAssets()
 		fartCloud.Transparency = NumberSequence.new(0.2, 1)
 		fartCloud.RotSpeed = NumberRange.new(-90, 90)
 		fartCloud.Parent = vfxFolder
+	end
+	if not vfxFolder:FindFirstChild("Dazed") then
+		-- Yellow sparkles popping up over a knocked-out player's head
+		local dazed = Instance.new("ParticleEmitter")
+		dazed.Name = "Dazed"
+		dazed.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+		dazed.Color = ColorSequence.new(Color3.fromRGB(255, 230, 90))
+		dazed.LightEmission = 0.6
+		dazed.EmissionDirection = Enum.NormalId.Top
+		dazed.Rate = 14
+		dazed.Lifetime = NumberRange.new(0.6, 1)
+		dazed.Speed = NumberRange.new(1.5, 3)
+		dazed.SpreadAngle = Vector2.new(60, 60)
+		dazed.Size = NumberSequence.new(0.6, 0)
+		dazed.RotSpeed = NumberRange.new(-180, 180)
+		dazed.Parent = vfxFolder
 	end
 
 	local fartSoundsFolder = GetOrMakeFolder(GetOrMakeFolder(assets, "Sounds"), "Farts")

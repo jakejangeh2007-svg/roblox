@@ -5,9 +5,10 @@
 -- plays everyone's fart effects. Hold the fart key to keep farting; its push builds up
 -- the longer you keep farting (FartPhysics), and letting go stops. Riders fart straight
 -- out behind them, pushing the boat toward its middle; they steer by sliding round the
--- edge of the boat (RiderService). Your own fart starts the moment you press, so it
--- feels instant; the server still decides whether the boat moves, and tells this client
--- to stop if it says no.
+-- edge of the boat (RiderService). Riders knocked off their boat swim back by farting
+-- (OverboardService). Your own fart starts the moment you press, so it feels instant;
+-- the server still decides whether it pushes anything, and tells this client to stop if
+-- it says no.
 --
 --   Fart   W, Up arrow, Space, or RT
 --
@@ -30,6 +31,7 @@ local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
 local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
@@ -67,8 +69,12 @@ type FartServiceClientMembers = {
 
 export type FartServiceClient = typeof(FartServiceClient) & FartServiceClientMembers
 
--- True while the local player hangs on to a boat that's on the river.
-local function IsRiding(): boolean
+-- True while the local player hangs on to a boat that's on the river, or is swimming
+-- back to theirs.
+local function CanFart(): boolean
+	if OverboardServiceShared.GetState(localPlayer) == "Swimming" then
+		return true
+	end
 	local character = localPlayer.Character
 	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
 	local seat = if humanoid then humanoid.SeatPart else nil
@@ -123,7 +129,7 @@ function FartServiceClient.Init(self: FartServiceClient)
 		function(_actionName: string, inputState: Enum.UserInputState, input: InputObject)
 			local inputName = input.KeyCode.Name
 			if inputState == Enum.UserInputState.Begin then
-				if not IsRiding() then
+				if not CanFart() then
 					-- Not on the river: let the keys do their normal job (like walking).
 					return Enum.ContextActionResult.Pass
 				end
@@ -214,9 +220,10 @@ function FartServiceClient.SetLocalFarting(self: FartServiceClient, isFarting: b
 end
 
 -- Every frame: build up (or fade) everyone's fart strength, grow each fart's effects
--- with it, and stop the local fart if the player ran out of gas or isn't riding any more.
+-- with it, and stop the local fart if the player ran out of gas or can't fart any more
+-- (knocked off their boat, say).
 function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
-	if self.IsLocalFarting and (GetLocalGas() <= 0 or not IsRiding()) then
+	if self.IsLocalFarting and (GetLocalGas() <= 0 or not CanFart()) then
 		table.clear(self.HeldInputs)
 		self:SetLocalFarting(false)
 	end

@@ -160,6 +160,82 @@ StartServices()
 	},
 	{
 		ParentPath = { "ReplicatedStorage", "Packages" },
+		Name = "RigPose",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Packages.RigPose
+--
+-- Poses a character by hand, every frame, without animation assets: find its joints
+-- once with FindRig, then turn each one with PoseJoint (on RunService.PreSimulation, so
+-- the pose wins over whatever animation is playing). Works for R15 and R6 characters;
+-- joints a rig doesn't have (like an R6's elbows) are skipped.
+
+-- A character's joints, by what they do: Root, RightShoulder, LeftShoulder, RightElbow,
+-- LeftElbow, RightHip, LeftHip, RightKnee, LeftKnee.
+export type Rig = { [string]: Motor6D }
+
+-- Where each joint is, as { the part it's in, its name }.
+local R15_JOINTS: { [string]: { string } } = {
+	Root = { "LowerTorso", "Root" },
+	RightShoulder = { "RightUpperArm", "RightShoulder" },
+	LeftShoulder = { "LeftUpperArm", "LeftShoulder" },
+	RightElbow = { "RightLowerArm", "RightElbow" },
+	LeftElbow = { "LeftLowerArm", "LeftElbow" },
+	RightHip = { "RightUpperLeg", "RightHip" },
+	LeftHip = { "LeftUpperLeg", "LeftHip" },
+	RightKnee = { "RightLowerLeg", "RightKnee" },
+	LeftKnee = { "LeftLowerLeg", "LeftKnee" },
+}
+local R6_JOINTS: { [string]: { string } } = {
+	Root = { "HumanoidRootPart", "RootJoint" },
+	RightShoulder = { "Torso", "Right Shoulder" },
+	LeftShoulder = { "Torso", "Left Shoulder" },
+	RightHip = { "Torso", "Right Hip" },
+	LeftHip = { "Torso", "Left Hip" },
+}
+
+local RigPose = {}
+
+-- `character`'s joints, found by `humanoid`'s rig type.
+function RigPose.FindRig(character: Model, humanoid: Humanoid): Rig
+	local jointPlaces: { [string]: { string } } = if humanoid.RigType == Enum.HumanoidRigType.R15
+		then R15_JOINTS
+		else R6_JOINTS
+	local rig: Rig = {}
+	for role, place in jointPlaces do
+		local part = character:FindFirstChild(place[1])
+		local joint = if part then part:FindFirstChild(place[2]) else nil
+		if joint and joint:IsA("Motor6D") then
+			rig[role] = joint
+		end
+	end
+	return rig
+end
+
+-- Whether `rig`'s joints still belong to a character (it gets rebuilt when they respawn).
+function RigPose.IsCurrent(rig: Rig): boolean
+	local root = rig.Root
+	if not root then
+		return true
+	end
+	return root.Parent ~= nil
+end
+
+-- Turns the part below `joint` by `rotation`, given in the axes of the part above it,
+-- about the joint itself. (A joint's own axes are its C0's; this converts into them.)
+function RigPose.PoseJoint(joint: Motor6D?, rotation: CFrame)
+	if joint then
+		local jointRotation = joint.C0.Rotation
+		joint.Transform = jointRotation:Inverse() * rotation * jointRotation
+	end
+end
+
+return RigPose
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Packages" },
 		Name = "Signal",
 		ClassName = "ModuleScript",
 		Source = [==[
@@ -296,6 +372,8 @@ return TableUtil
 -- getting from their seat halfway to the next seat each way (a lone seat gets the whole
 -- way round). RiderService moves them. They weigh what they weigh, but while they're on
 -- a boat they don't bump into anything, so only the hull touches the world.
+-- A rider knocked off on the river (OverboardService) is still part of the crew, and
+-- their seat is kept for them until they swim back and grab on again, or give up.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
 --   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
@@ -339,6 +417,8 @@ type BoatMembers = {
 	RiderSpots: { [BasePart]: RiderSpots.RiderSpot }, -- where each seat's rider hangs on and can slide
 	RiderSlides: { [Seat]: number }, -- how far round the edge each seat's rider has slid (radians)
 	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
+	Overboard: { [Player]: Seat }, -- crew knocked off on the river, and the seat kept for each of them
+	Reboarding: { [Seat]: Player }, -- who is grabbing back on at each seat right now
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
 	JoinDeadline: number, -- server time the join timer runs out
@@ -457,6 +537,8 @@ function Boat.new(
 			RiderSpots = {},
 			RiderSlides = {},
 			RiderParts = {},
+			Overboard = {},
+			Reboarding = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
 			JoinDeadline = workspace:GetServerTimeNow() + BoatConfig.JOIN_TIME,
@@ -501,13 +583,13 @@ function Boat.new(
 			end)
 		)
 		-- Roblox welds a rider to their seat when they sit; once it has, move them to
-		-- hang on outside it.
+		-- hang on outside it, where OnSeatChanged put them.
 		table.insert(
 			self.Connections,
 			seat.ChildAdded:Connect(function(child)
 				if child.Name == "SeatWeld" then
 					task.defer(function()
-						self:SetRiderSlide(seat, 0)
+						self:SetRiderSlide(seat, self:GetRiderSlide(seat))
 					end)
 				end
 			end)
@@ -589,15 +671,20 @@ function Boat.OnSeatChanged(self: Boat, seat: Seat)
 	local isLaunched = self.State == "Launched"
 	local humanoid = seat.Occupant
 	local rider = GetPlayerInSeat(seat)
-	if humanoid and (isLaunched or not rider) then
-		-- Only players ride, and nobody climbs aboard after launch.
+	local isReboarding = rider ~= nil and self.Reboarding[seat] == rider
+	self.Reboarding[seat] = nil
+	if humanoid and ((isLaunched and not isReboarding) or not rider) then
+		-- Only players ride, and nobody climbs aboard after launch (apart from crew
+		-- grabbing back on after being knocked off).
 		EjectFromSeat(seat)
 		return
 	end
 	if rider then
 		self.SeatRiders[seat] = rider
 		self:PrepareRider(rider)
-		self:SetRiderSlide(seat, 0)
+		-- Someone grabbing back on was put where they grabbed (by Reboard); anyone else
+		-- starts at their seat.
+		self:SetRiderSlide(seat, if isReboarding then self:GetRiderSlide(seat) else 0)
 	end
 
 	if isLaunched then
@@ -766,12 +853,68 @@ function Boat.Freeze(self: Boat)
 	end
 end
 
--- After launch: anyone in the crew who is no longer seated has left the boat.
+-- Knocks `player` off this boat on the river: they let go, but stay in the crew, and
+-- their seat is kept for them. Returns that seat, or nil if they weren't hanging on here.
+function Boat.KnockOff(self: Boat, player: Player): Seat?
+	local seat = self:GetSeatOf(player)
+	if self.State ~= "Launched" or not seat then
+		return nil
+	end
+	self.Overboard[player] = seat
+	self.SeatRiders[seat] = nil
+	self:ReleaseRider(player)
+	EjectFromSeat(seat)
+	return seat
+end
+
+-- Whether `player` is in the crew but knocked off.
+function Boat.IsOverboard(self: Boat, player: Player): boolean
+	return if self.Overboard[player] then true else false
+end
+
+-- The seat kept for `player` while they're knocked off, if they are.
+function Boat.GetOverboardSeat(self: Boat, player: Player): Seat?
+	return self.Overboard[player]
+end
+
+-- Puts knocked-off `player` back on at their seat, `angle` radians round the edge from it
+-- (see RiderSpots). Returns false if they can't grab on (they aren't overboard, the boat
+-- isn't floating, or their character isn't alive).
+function Boat.Reboard(self: Boat, player: Player, angle: number): boolean
+	local seat = self.Overboard[player]
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	if not seat or not self:IsFloating() or seat.Occupant or not humanoid or humanoid.Health <= 0 then
+		return false
+	end
+	self.Overboard[player] = nil
+	self.Reboarding[seat] = player
+	self.RiderSlides[seat] = angle
+	seat:Sit(humanoid)
+	if not seat:FindFirstChild("SeatWeld") then
+		-- Roblox wouldn't sit them: they're still overboard.
+		self.Reboarding[seat] = nil
+		self.Overboard[player] = seat
+		return false
+	end
+	return true
+end
+
+-- Takes knocked-off `player` out of the crew (they gave up, or fell off the river).
+function Boat.RemoveFromCrew(self: Boat, player: Player)
+	if self.Overboard[player] then
+		self.Overboard[player] = nil
+		self:RemoveMissingCrew()
+	end
+end
+
+-- After launch: anyone in the crew who is no longer seated, and wasn't knocked off, has
+-- left the boat.
 function Boat.RemoveMissingCrew(self: Boat)
 	local seatedPlayers = self:GetSeatedPlayers()
 	for index = #self.Crew, 1, -1 do
 		local player = self.Crew[index]
-		if not table.find(seatedPlayers, player) then
+		if not table.find(seatedPlayers, player) and not self.Overboard[player] then
 			table.remove(self.Crew, index)
 			self.CrewMemberLeft:Fire(player)
 		end
@@ -797,6 +940,8 @@ function Boat.Destroy(self: Boat)
 		self:ReleaseRider(player)
 	end
 	table.clear(self.SeatRiders)
+	table.clear(self.Overboard)
+	table.clear(self.Reboarding)
 	if wasLaunched then
 		for _, player in self.Crew do
 			self.CrewMemberLeft:Fire(player)
@@ -1285,6 +1430,419 @@ function Location.IsInZone(self: Location, point: Vector3): boolean
 end
 
 return Location
+]==],
+	},
+	{
+		ParentPath = { "ServerScriptService", "Classes" },
+		Name = "Ragdoll",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Classes.Ragdoll
+--
+-- Makes a character go limp, and back. Every Motor6D joint except the one holding the
+-- HumanoidRootPart to the body is switched off and a ball-and-socket joint stands in for
+-- it, so arms, legs and head flop around under physics. Each joint can only swing so far
+-- from how the body was when it went limp (OverboardConfig), so limbs never bend the
+-- wrong way. Works for R15 and R6 characters. The server should be running the
+-- character's physics while it's limp (the Swimmer class makes sure of that).
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local OverboardConfig = require(ReplicatedStorage.Shared.Modules.Game.OverboardConfig)
+
+local JOINT_NAME = "RagdollJoint"
+local SPINE_JOINT_NAMES = { "Neck", "Waist" }
+local MIN_LIMB_LENGTH = 0.05 -- a limb whose middle is closer than this to its joint (studs) hangs straight down
+
+local Ragdoll = {}
+Ragdoll.__index = Ragdoll
+
+type RagdollMembers = {
+	Humanoid: Humanoid,
+	Motors: { Motor6D }, -- the joints switched off
+	Joints: { Instance }, -- the ball-and-socket joints standing in for them, and their attachments
+	RequiredNeck: boolean, -- what Humanoid.RequiresNeck was before (it's off while limp)
+}
+
+export type Ragdoll = typeof(setmetatable({} :: RagdollMembers, Ragdoll))
+
+-- An attachment in `part` at `worldCFrame`.
+local function MakeAttachment(part: BasePart, worldCFrame: CFrame): Attachment
+	local attachment = Instance.new("Attachment")
+	attachment.Name = JOINT_NAME
+	attachment.CFrame = part.CFrame:ToObjectSpace(worldCFrame)
+	attachment.Parent = part
+	return attachment
+end
+
+-- Swaps `motor` for a ball-and-socket joint where it is now. The joint's cone of swing
+-- points along the limb, from the joint toward the middle of the part it moves.
+local function MakeJoint(motor: Motor6D, part0: BasePart, part1: BasePart): { Instance }
+	local jointPosition = (part0.CFrame * motor.C0).Position
+	local limb = part1.Position - jointPosition
+	local along = if limb.Magnitude >= MIN_LIMB_LENGTH then limb.Unit else -part0.CFrame.UpVector
+	local reference = if math.abs(along:Dot(part0.CFrame.LookVector)) < 0.9
+		then part0.CFrame.LookVector
+		else part0.CFrame.UpVector
+	local across = (reference - along * reference:Dot(along)).Unit
+	local jointCFrame = CFrame.fromMatrix(jointPosition, along, across)
+
+	local isSpine = table.find(SPINE_JOINT_NAMES, motor.Name) ~= nil
+	local attachment0 = MakeAttachment(part0, jointCFrame)
+	local attachment1 = MakeAttachment(part1, jointCFrame)
+	local socket = Instance.new("BallSocketConstraint")
+	socket.Name = JOINT_NAME
+	socket.Attachment0 = attachment0
+	socket.Attachment1 = attachment1
+	socket.LimitsEnabled = true
+	socket.UpperAngle = if isSpine then OverboardConfig.SPINE_SWING else OverboardConfig.LIMB_SWING
+	socket.TwistLimitsEnabled = true
+	socket.TwistLowerAngle = -OverboardConfig.JOINT_TWIST
+	socket.TwistUpperAngle = OverboardConfig.JOINT_TWIST
+	socket.Parent = part1
+	return { socket, attachment0, attachment1 }
+end
+
+-- Makes `character` go limp now.
+function Ragdoll.new(character: Model, humanoid: Humanoid): Ragdoll
+	local rootPart = humanoid.RootPart
+	local motors = {}
+	local joints = {}
+	for _, descendant in character:GetDescendants() do
+		if not descendant:IsA("Motor6D") or not descendant.Enabled then
+			continue
+		end
+		local part0, part1 = descendant.Part0, descendant.Part1
+		if not part0 or not part1 or part0 == rootPart or part1 == rootPart then
+			continue -- the HumanoidRootPart stays joined to the body
+		end
+		for _, joint in MakeJoint(descendant, part0, part1) do
+			table.insert(joints, joint)
+		end
+		descendant.Enabled = false
+		table.insert(motors, descendant)
+	end
+
+	local self = setmetatable(
+		{
+			Humanoid = humanoid,
+			Motors = motors,
+			Joints = joints,
+			RequiredNeck = humanoid.RequiresNeck,
+		} :: RagdollMembers,
+		Ragdoll
+	)
+	-- A switched-off neck would otherwise count as a broken one, and kill them.
+	humanoid.RequiresNeck = false
+	return self
+end
+
+-- Stiffens the body back up: switches its joints back on and removes the stand-ins.
+function Ragdoll.Destroy(self: Ragdoll)
+	for _, joint in self.Joints do
+		joint:Destroy()
+	end
+	table.clear(self.Joints)
+	for _, motor in self.Motors do
+		if motor.Parent then
+			motor.Enabled = true
+		end
+	end
+	table.clear(self.Motors)
+	if self.Humanoid.Parent then
+		self.Humanoid.RequiresNeck = self.RequiredNeck
+	end
+end
+
+return Ragdoll
+]==],
+	},
+	{
+		ParentPath = { "ServerScriptService", "Classes" },
+		Name = "Swimmer",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Classes.Swimmer
+--
+-- How an overboard player's body moves in the water. The server runs its physics while
+-- it's overboard (like it runs boats), so where swimmers are is always the server's call.
+-- OverboardService makes a Swimmer when a rider is knocked off and steps it every frame
+-- with what the water under them is doing.
+--   - While they're knocked out their body is limp (the Ragdoll class): every loose part
+--     of it floats on its own, so it lies sprawled on the surface, tumbling to a stop.
+--   - Once they come round they swim: their body faces where they're heading and floats
+--     with its head and shoulders out of the water. Farting pushes them the way they
+--     face, and they turn left and right.
+--   - Either way the water holds them up like a soft spring and drags them toward its own
+--     speed, so currents carry them along, and rapids shove them about. Out of the water
+--     only gravity acts on them.
+-- Their body goes in the Swimmers collision group: it bumps into the map and obstacles,
+-- but passes through boats and other swimmers.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
+local Hull = require(ServerScriptService.Classes.Hull)
+local OverboardConfig = require(ReplicatedStorage.Shared.Modules.Game.OverboardConfig)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
+
+local FACING_NAME = "SwimFacing"
+-- Changes to the way a swimmer faces smaller than this aren't worth sending to the
+-- Facing constraint (every change is sent to every player).
+local MIN_FACING_CHANGE = math.rad(1)
+
+-- The part of water drag that grows with speed, sized so a swimmer farting at full
+-- strength levels off at TOP_SPEED.
+local SPEED_DRAG = math.max(
+	0,
+	(
+		FartConfig.MAX_PUSH_ACCELERATION * OverboardConfig.FART_PUSH_SCALE
+		- OverboardConfig.GLIDE_DRAG * OverboardConfig.TOP_SPEED
+	) / OverboardConfig.TOP_SPEED ^ 2
+)
+
+local Swimmer = {}
+Swimmer.__index = Swimmer
+
+type SwimmerMembers = {
+	RootPart: BasePart, -- their HumanoidRootPart
+	Parts: { BasePart }, -- every part of their body
+	CollisionGroups: { [BasePart]: string }, -- each part's collision group from before, to put back
+	IsSwimming: boolean, -- false while they're knocked out
+	Heading: Vector3, -- the way they face and swim, flat on the water
+	TurnSpeed: number, -- radians per second, positive turns left (counter-clockwise from above)
+	Facing: AlignOrientation?, -- turns their body to face Heading while they swim
+	LastWaterHeight: number, -- the surface height they were last in (where they started at first)
+}
+
+export type Swimmer = typeof(setmetatable({} :: SwimmerMembers, Swimmer))
+
+local function Flatten(vector: Vector3): Vector3
+	local flat = Vector3.new(vector.X, 0, vector.Z)
+	return if flat.Magnitude > 1e-6 then flat.Unit else -Vector3.zAxis
+end
+
+-- Takes over `character`'s body (with `rootPart` its HumanoidRootPart): the server runs
+-- its physics from now on, and it bumps into what swimmers bump into.
+function Swimmer.new(character: Model, rootPart: BasePart): Swimmer
+	local parts = {}
+	local collisionGroups: { [BasePart]: string } = {}
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			table.insert(parts, descendant)
+			collisionGroups[descendant] = descendant.CollisionGroup
+			descendant.CollisionGroup = OverboardServiceShared.COLLISION_GROUP
+		end
+	end
+
+	local self = setmetatable(
+		{
+			RootPart = rootPart,
+			Parts = parts,
+			CollisionGroups = collisionGroups,
+			IsSwimming = false,
+			Heading = Flatten(rootPart.CFrame.LookVector),
+			TurnSpeed = 0,
+			Facing = nil,
+			LastWaterHeight = rootPart.Position.Y,
+		} :: SwimmerMembers,
+		Swimmer
+	)
+	self:ClaimNetworkOwnership()
+	return self
+end
+
+-- The root part of every separate piece of the body (just one once it's stiff again).
+function Swimmer.GetAssemblyRoots(self: Swimmer): { BasePart }
+	local roots: { BasePart } = {}
+	local found: { [BasePart]: boolean } = {}
+	for _, part in self.Parts do
+		local root = part.AssemblyRootPart
+		if root and not found[root] and not root.Anchored and root:IsDescendantOf(workspace) then
+			found[root] = true
+			table.insert(roots, root)
+		end
+	end
+	return roots
+end
+
+-- Makes sure the server runs the body's physics. Its player can otherwise end up
+-- running it, so this is checked every step.
+function Swimmer.ClaimNetworkOwnership(self: Swimmer)
+	for _, root in self:GetAssemblyRoots() do
+		if root:CanSetNetworkOwnership() and (root:GetNetworkOwnershipAuto() or root:GetNetworkOwner() ~= nil) then
+			root:SetNetworkOwner(nil)
+		end
+	end
+end
+
+-- Sends the whole body flying at `velocity`, tumbling at `spin` (radians per second about
+-- each axis) all in one piece.
+function Swimmer.Throw(self: Swimmer, velocity: Vector3, spin: Vector3)
+	local center = self.RootPart.AssemblyCenterOfMass
+	for _, root in self:GetAssemblyRoots() do
+		root.AssemblyLinearVelocity = velocity + spin:Cross(root.AssemblyCenterOfMass - center)
+		root.AssemblyAngularVelocity = spin
+	end
+end
+
+-- They've come round (their body must be stiff again): they face `heading` and start
+-- swimming.
+function Swimmer.StartSwimming(self: Swimmer, heading: Vector3)
+	if self.IsSwimming then
+		return
+	end
+	self.IsSwimming = true
+	self.Heading = Flatten(heading)
+	self.TurnSpeed = 0
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = FACING_NAME
+	attachment.Parent = self.RootPart
+	local facing = Instance.new("AlignOrientation")
+	facing.Name = FACING_NAME
+	facing.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	facing.AlignType = Enum.AlignType.AllAxes
+	facing.Attachment0 = attachment
+	facing.MaxTorque = math.huge
+	facing.Responsiveness = OverboardConfig.FACING_RESPONSIVENESS
+	facing.CFrame = CFrame.lookAt(Vector3.zero, self.Heading)
+	facing.Parent = self.RootPart
+	self.Facing = facing
+	self.RootPart.AssemblyAngularVelocity = Vector3.zero
+end
+
+-- Has the Facing constraint turn the body toward Heading.
+function Swimmer.UpdateFacing(self: Swimmer)
+	local facing = self.Facing
+	if not facing then
+		return
+	end
+	if facing.CFrame.LookVector:Dot(self.Heading) < math.cos(MIN_FACING_CHANGE) then
+		facing.CFrame = CFrame.lookAt(Vector3.zero, self.Heading)
+	end
+end
+
+-- Moves the body on by `deltaTime` seconds. `water` is what the water under them is
+-- doing, or nil if there's no water under them. While they swim, `pushAcceleration`
+-- (studs/s²) pushes them the way they face, and they turn `turnDirection` (-1 left,
+-- 1 right, 0 not at all).
+function Swimmer.Step(
+	self: Swimmer,
+	water: Hull.Water?,
+	pushAcceleration: number,
+	turnDirection: number,
+	deltaTime: number
+)
+	if deltaTime <= 0 then
+		return
+	end
+	self:ClaimNetworkOwnership()
+
+	if self.IsSwimming then
+		local blend = if OverboardConfig.TURN_RESPONSE_TIME > 0
+			then 1 - math.exp(-deltaTime / OverboardConfig.TURN_RESPONSE_TIME)
+			else 1
+		local targetTurnSpeed = -turnDirection * OverboardConfig.TURN_SPEED
+		self.TurnSpeed += (targetTurnSpeed - self.TurnSpeed) * blend
+		if water then
+			self.TurnSpeed += water.TurnTurbulence * deltaTime
+		end
+		self.Heading = Flatten(CFrame.Angles(0, self.TurnSpeed * deltaTime, 0) * self.Heading)
+		self:UpdateFacing()
+	end
+
+	if not water then
+		return -- out of the water, only gravity acts on them
+	end
+	self.LastWaterHeight = water.SurfaceHeight
+	local swimmingRoot = self.RootPart.AssemblyRootPart
+	local floatHeight = if self.IsSwimming then OverboardConfig.FLOAT_HEIGHT else OverboardConfig.LIMP_FLOAT_HEIGHT
+	local gravity = workspace.Gravity
+
+	for _, root in self:GetAssemblyRoots() do
+		local isSwimmingRoot = self.IsSwimming and root == swimmingRoot
+		local height = if isSwimmingRoot then self.RootPart.Position.Y else root.AssemblyCenterOfMass.Y
+
+		-- How much this piece is in the water: 1 at or below the surface, fading to 0 at
+		-- AIRBORNE_HEIGHT above it. Everything the water does is scaled by this.
+		local depth = water.SurfaceHeight + floatHeight - height
+		local wetness = math.clamp(1 + depth / math.max(OverboardConfig.AIRBORNE_HEIGHT, 1e-3), 0, 1)
+		if wetness <= 0 then
+			continue
+		end
+		local velocity = root.AssemblyLinearVelocity
+
+		-- Up and down: the water holds up its weight, pushes back up on it when it's
+		-- under, and settles the bobbing. Applied implicitly, so it never overshoots.
+		local verticalSpeed = velocity.Y
+		local submergedDepth = math.clamp(depth, 0, OverboardConfig.MAX_FLOAT_DEPTH)
+		local verticalDamping = wetness
+			* (OverboardConfig.FLOAT_DAMPING + OverboardConfig.SPLASH_DAMPING * math.abs(verticalSpeed))
+		verticalSpeed = (
+			verticalSpeed + (gravity * wetness + OverboardConfig.FLOAT_STIFFNESS * submergedDepth) * deltaTime
+		) / (1 + verticalDamping * deltaTime)
+
+		-- Across the water: farting (while swimming) and rough water speed it up, and drag
+		-- pulls its speed toward the water's.
+		local flow = Vector3.new(water.FlowVelocity.X, 0, water.FlowVelocity.Z) * wetness
+		local acceleration = Vector3.new(water.Turbulence.X, 0, water.Turbulence.Z)
+			* (OverboardConfig.TURBULENCE_SCALE * wetness)
+		if isSwimmingRoot then
+			acceleration += self.Heading * pushAcceleration * wetness
+		end
+		local relativeVelocity = Vector3.new(velocity.X, 0, velocity.Z) - flow
+		local glideDrag = if self.IsSwimming then OverboardConfig.GLIDE_DRAG else OverboardConfig.LIMP_DRAG
+		local drag = wetness * (glideDrag + SPEED_DRAG * relativeVelocity.Magnitude)
+		relativeVelocity = (relativeVelocity + acceleration * deltaTime) / (1 + drag * deltaTime)
+		local flatVelocity = relativeVelocity + flow
+		root.AssemblyLinearVelocity = Vector3.new(flatVelocity.X, verticalSpeed, flatVelocity.Z)
+
+		-- A limp body stops tumbling in the water.
+		if not self.IsSwimming then
+			local spinDamping = math.exp(-OverboardConfig.LIMP_SPIN_DAMPING * wetness * deltaTime)
+			root.AssemblyAngularVelocity *= spinDamping
+		end
+	end
+end
+
+-- Hands the body back, stopped still: puts back its collision groups and stops running
+-- its physics. `owner` (its player) gets to run its physics again straight away; without
+-- one, Roblox decides who does.
+function Swimmer.Destroy(self: Swimmer, owner: Player?)
+	local facing = self.Facing
+	if facing then
+		local attachment = facing.Attachment0
+		facing:Destroy()
+		if attachment then
+			attachment:Destroy()
+		end
+		self.Facing = nil
+	end
+	self.IsSwimming = false
+	for part, collisionGroup in self.CollisionGroups do
+		if part.Parent then
+			part.CollisionGroup = collisionGroup
+		end
+	end
+	for _, root in self:GetAssemblyRoots() do
+		-- Whatever happens to them next starts from a standstill.
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		if root:CanSetNetworkOwnership() then
+			if owner and owner.Parent then
+				root:SetNetworkOwner(owner)
+			else
+				root:SetNetworkOwnershipAuto()
+			end
+		end
+	end
+end
+
+return Swimmer
 ]==],
 	},
 	{
@@ -3021,14 +3579,16 @@ return DockServiceServer :: DockServiceServer
 -- ModuleScript: ServerScriptService.Services.FartService.FartServiceServer
 --
 -- Runs every player's farting. A client asks to start farting (or to stop); this checks
--- they're riding a boat on the river and have gas, and keeps them farting until they
--- stop, run out of gas or leave the boat. Their fart builds up strength while they keep
--- it going and fades after they stop (FartPhysics), and its push eases in and out
--- smoothly. Gas drains at a flat rate while farting and refills while not. Other players
--- are told when someone starts or stops, so they can show it.
+-- they're riding a boat on the river (or swimming back to theirs after being knocked off)
+-- and have gas, and keeps them farting until they stop, run out of gas or can't any more.
+-- Their fart builds up strength while they keep it going and fades after they stop
+-- (FartPhysics), and its push eases in and out smoothly. Gas drains at a flat rate while
+-- farting and refills while not. Other players are told when someone starts or stops, so
+-- they can show it.
 --
--- This service doesn't move boats. WaterService asks GetFartForces for the pushes from
--- each boat's crew and moves the boat with everything else acting on it.
+-- This service doesn't move boats or swimmers. WaterService asks GetFartForces for the
+-- pushes from each boat's crew and moves the boat with everything else acting on it;
+-- OverboardService asks GetPush for each swimmer's.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -3041,6 +3601,7 @@ local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
 local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
 local Hull = require(ServerScriptService.Classes.Hull)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 
 local SERVICE_NAME = FartServiceShared.SERVICE_NAME
@@ -3123,17 +3684,24 @@ function FartServiceServer.HandleStartRequest(self: FartServiceServer, player: P
 	self:StartFart(player)
 end
 
+-- Whether `player` is somewhere they can fart: hanging on to a boat on the river, or
+-- swimming back to theirs (not while they're knocked out).
+function FartServiceServer.CanFart(self: FartServiceServer, player: Player): boolean
+	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
+	if not boat or not boat:IsFloating() then
+		return false
+	end
+	if boat:GetSeatOf(player) then
+		return true
+	end
+	return boat:IsOverboard(player) and OverboardServiceShared.GetState(player) == "Swimming"
+end
+
 -- Starts `player` farting, if they're allowed to. If they aren't, their client is told
 -- to stop showing the fart.
 function FartServiceServer.StartFart(self: FartServiceServer, player: Player)
 	self.PendingStarts[player] = nil
-	local boat = BoatServiceServer:GetLaunchedBoatOf(player)
-	if
-		not boat
-		or not boat:IsFloating()
-		or not boat:GetSeatOf(player)
-		or (self.Gas[player] or 0) < FartConfig.MIN_GAS_TO_START
-	then
+	if not self:CanFart(player) or (self.Gas[player] or 0) < FartConfig.MIN_GAS_TO_START then
 		self.StopFartRemote:FireClient(player, player)
 		return
 	end
@@ -3160,6 +3728,12 @@ function FartServiceServer.StopFart(self: FartServiceServer, player: Player, not
 			self.StopFartRemote:FireClient(otherPlayer, player)
 		end
 	end
+end
+
+-- How hard `player`'s fart is pushing right now (studs/s² on a boat of
+-- FartConfig.REFERENCE_MASS), eased in and out; 0 if they aren't farting.
+function FartServiceServer.GetPush(self: FartServiceServer, player: Player): number
+	return self.Pushes[player] or 0
 end
 
 -- The pushes from `boat`'s crew's farts right now: each rider's fart as a force from
@@ -3196,11 +3770,11 @@ function FartServiceServer.Update(self: FartServiceServer, deltaTime: number)
 		end
 	end
 
-	-- Farts end when the farter runs out of gas or isn't riding on the river any more.
+	-- Farts end when the farter runs out of gas, or isn't riding on the river or swimming
+	-- any more (knocked off, say).
 	for player in self.Farters do
-		local boat = BoatServiceServer:GetLaunchedBoatOf(player)
 		local gas = self.Gas[player] or 0
-		if not boat or not boat:IsFloating() or not boat:GetSeatOf(player) or gas <= 0 then
+		if gas <= 0 or not self:CanFart(player) then
 			self:StopFart(player, true)
 			continue
 		end
@@ -3472,6 +4046,454 @@ function ObstacleServiceServer.GetObstacleForces(self: ObstacleServiceServer, bo
 end
 
 return ObstacleServiceServer :: ObstacleServiceServer
+]==],
+	},
+	{
+		ParentPath = { "ServerScriptService", "Services", "OverboardService" },
+		Name = "OverboardServiceServer",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ServerScriptService.Services.OverboardService.OverboardServiceServer
+--
+-- Riders who get knocked off their boat, from the hit to grabbing back on.
+--   1. Knocked off: every frame, each rider hanging on to a boat on the river is checked
+--      for anything solid overlapping them (hazards aside: those pop the boat instead).
+--      If it's coming at them at KNOCK_OFF_SPEED or more, compared to how they're moving,
+--      they're knocked off: thrown clear, tumbling. They stay in the crew, with their
+--      seat kept for them.
+--   2. Knocked out: they go limp (the Ragdoll class) and float for KNOCKOUT_TIME.
+--   3. Swimming: they come round facing their boat. Farting (FartService, with the same
+--      gas) pushes them the way they face, and they turn left and right (RequestSwimTurn).
+--      The Swimmer class moves their body; the server runs its physics.
+--   4. Back aboard: swimming to within GRAB_DISTANCE of anywhere along their own stretch
+--      of their boat's edge grabs them back on there.
+-- A swimmer who isn't back aboard within SWIM_TIME_LIMIT, or falls off the river, is taken
+-- out of the crew, which sends them back to their checkpoint (CheckpointService), and is
+-- told why (NotifyLeftBehind). If their boat is wiped or finishes, they go with the rest
+-- of the crew. All the numbers are in OverboardConfig.
+--
+-- Each player's Overboard, WakeTime and GiveUpTime attributes tell clients and UI where
+-- they're at (see OverboardServiceShared).
+
+local PhysicsService = game:GetService("PhysicsService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Boat = require(ServerScriptService.Classes.Boat)
+local BoatServiceServer = require(ServerScriptService.Services.BoatService.BoatServiceServer)
+local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
+local FartServiceServer = require(ServerScriptService.Services.FartService.FartServiceServer)
+local ObstacleServiceShared = require(ReplicatedStorage.Shared.Services.ObstacleService.ObstacleServiceShared)
+local OverboardConfig = require(ReplicatedStorage.Shared.Modules.Game.OverboardConfig)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
+local Ragdoll = require(ServerScriptService.Classes.Ragdoll)
+local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
+local RiderSpots = require(ReplicatedStorage.Shared.Services.RiderService.RiderSpots)
+local Swimmer = require(ServerScriptService.Classes.Swimmer)
+local WaterConfig = require(ReplicatedStorage.Shared.Modules.Game.WaterConfig)
+local WaterServiceServer = require(ServerScriptService.Services.WaterService.WaterServiceServer)
+
+local SERVICE_NAME = OverboardServiceShared.SERVICE_NAME
+-- How far (studs) outside a rider's hit box the nearest point of a part can be and still
+-- count as touching them. Spatial queries go by rough bounding boxes; this checks closer.
+local HIT_TOLERANCE = 0.5
+
+-- Someone knocked off their boat, and how they're getting on.
+type Overboard = {
+	Boat: Boat.Boat,
+	Character: Model,
+	Humanoid: Humanoid,
+	RootPart: BasePart,
+	Ragdoll: Ragdoll.Ragdoll?, -- while they're knocked out
+	Swimmer: Swimmer.Swimmer,
+	WakeTime: number, -- os.clock() they come round
+	GiveUpTime: number?, -- os.clock() they're sent back if they aren't aboard (set once they're swimming)
+}
+
+local OverboardServiceServer = {}
+
+type OverboardServiceServerMembers = {
+	Overboards: { [Player]: Overboard }, -- everyone overboard right now
+	TurnInputs: { [Player]: number }, -- -1 for each swimmer asking to turn left, 1 for right (missing = neither)
+	GraceTimes: { [Player]: number }, -- os.clock() until which each player who just grabbed back on can't be knocked off
+	HitParameters: OverlapParams,
+	Random: Random,
+	NotifyLeftBehindRemote: RemoteEvent,
+}
+
+export type OverboardServiceServer = typeof(OverboardServiceServer) & OverboardServiceServerMembers
+
+local function Flatten(vector: Vector3): Vector3
+	return Vector3.new(vector.X, 0, vector.Z)
+end
+
+-- Whether `point` is inside the box at `boxCFrame` of size `boxSize`, give or take `tolerance`.
+local function IsInBox(point: Vector3, boxCFrame: CFrame, boxSize: Vector3, tolerance: number): boolean
+	local offset = boxCFrame:PointToObjectSpace(point)
+	local halfSize = boxSize / 2 + Vector3.one * tolerance
+	return math.abs(offset.X) <= halfSize.X and math.abs(offset.Y) <= halfSize.Y and math.abs(offset.Z) <= halfSize.Z
+end
+
+-- Whether `part` belongs to a character (a player's, or any other model with a Humanoid).
+local function IsInCharacter(part: BasePart): boolean
+	local model = part:FindFirstAncestorOfClass("Model")
+	return model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+-- The point on `part` (counted as a box) closest to `position`.
+local function GetClosestPoint(part: BasePart, position: Vector3): Vector3
+	local offset = part.CFrame:PointToObjectSpace(position)
+	local halfSize = part.Size / 2
+	local clamped = Vector3.new(
+		math.clamp(offset.X, -halfSize.X, halfSize.X),
+		math.clamp(offset.Y, -halfSize.Y, halfSize.Y),
+		math.clamp(offset.Z, -halfSize.Z, halfSize.Z)
+	)
+	return part.CFrame:PointToWorldSpace(clamped)
+end
+
+function OverboardServiceServer.Init(self: OverboardServiceServer)
+	self.Overboards = {}
+	self.TurnInputs = {}
+	self.GraceTimes = {}
+	self.Random = Random.new()
+	self:SetUpCollisionGroups()
+
+	-- Only parts a boat would bump into count as hitting a rider.
+	local hitParameters = OverlapParams.new()
+	hitParameters.CollisionGroup = BoatServiceShared.COLLISION_GROUP
+	hitParameters.RespectCanCollide = true
+	self.HitParameters = hitParameters
+
+	self.NotifyLeftBehindRemote = Remotes.CreateEvent(SERVICE_NAME, OverboardServiceShared.NOTIFY_LEFT_BEHIND)
+	Remotes.CreateEvent(SERVICE_NAME, OverboardServiceShared.REQUEST_SWIM_TURN).OnServerEvent
+		:Connect(function(player: Player, direction: unknown)
+			self:HandleTurnRequest(player, direction)
+		end)
+
+	-- Anyone leaving their boat's crew (it was wiped or finished, say) stops being overboard.
+	BoatServiceServer.CrewMemberLeft:Connect(function(player: Player)
+		self:EndOverboard(player, false)
+	end)
+	Players.PlayerRemoving:Connect(function(player)
+		self:EndOverboard(player, true)
+		self.TurnInputs[player] = nil
+		self.GraceTimes[player] = nil
+	end)
+	RunService.Heartbeat:Connect(function(deltaTime)
+		self:Update(deltaTime)
+	end)
+end
+
+-- Swimmers bump into the map and get shoved by obstacles, but pass through boats,
+-- riders and each other.
+function OverboardServiceServer.SetUpCollisionGroups(self: OverboardServiceServer)
+	local swimmerGroup = OverboardServiceShared.COLLISION_GROUP
+	local obstacleGroup = ObstacleServiceShared.COLLISION_GROUP
+	for _, collisionGroup in { swimmerGroup, obstacleGroup } do
+		if not PhysicsService:IsCollisionGroupRegistered(collisionGroup) then
+			PhysicsService:RegisterCollisionGroup(collisionGroup)
+		end
+	end
+	for _, otherGroup in { BoatServiceShared.COLLISION_GROUP, BoatServiceShared.RIDER_COLLISION_GROUP, swimmerGroup } do
+		PhysicsService:CollisionGroupSetCollidable(swimmerGroup, otherGroup, false)
+	end
+	for _, otherGroup in { "Default", obstacleGroup } do
+		PhysicsService:CollisionGroupSetCollidable(swimmerGroup, otherGroup, true)
+	end
+end
+
+-- Client request: turn left (-1), right (1) or stop turning (0) while swimming.
+function OverboardServiceServer.HandleTurnRequest(self: OverboardServiceServer, player: Player, direction: unknown)
+	if direction == 0 then
+		self.TurnInputs[player] = nil
+	elseif direction == -1 or direction == 1 then
+		self.TurnInputs[player] = direction :: number
+	end
+end
+
+function OverboardServiceServer.Update(self: OverboardServiceServer, deltaTime: number)
+	local stepTime = math.min(deltaTime, WaterConfig.MAX_STEP_TIME)
+	local now = os.clock()
+	self:CheckHits(now)
+	for player, overboard in table.clone(self.Overboards) do
+		self:StepOverboard(player, overboard, now, stepTime)
+	end
+end
+
+-- Knocks off every rider on the river who something is hitting hard enough.
+function OverboardServiceServer.CheckHits(self: OverboardServiceServer, now: number)
+	for player, graceTime in self.GraceTimes do
+		if now >= graceTime then
+			self.GraceTimes[player] = nil
+		end
+	end
+	for _, boat in BoatServiceServer:GetLaunchedBoats() do
+		local primaryPart = boat.Model.PrimaryPart
+		if not boat:IsFloating() or not primaryPart then
+			continue
+		end
+		for _, player in table.clone(boat.SeatRiders) do
+			if self.GraceTimes[player] then
+				continue
+			end
+			local hitVelocity = self:FindHit(player, primaryPart)
+			if hitVelocity then
+				self:KnockOff(player, boat, primaryPart, hitVelocity)
+			end
+		end
+	end
+end
+
+-- How fast whatever is hitting `player` is coming at them (compared to how they're moving,
+-- as they hang on to the boat whose PrimaryPart is `primaryPart`), if anything solid is
+-- hitting them at KNOCK_OFF_SPEED or more. The hardest hit wins.
+function OverboardServiceServer.FindHit(self: OverboardServiceServer, player: Player, primaryPart: BasePart): Vector3?
+	local character = player.Character
+	local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
+	if not rootPart or not rootPart:IsA("BasePart") then
+		return nil
+	end
+	local hitBox = rootPart.CFrame * OverboardConfig.HIT_BOX_OFFSET
+	local halfHeight = OverboardConfig.HIT_BOX_SIZE.Y / 2
+
+	local hardestHit: Vector3? = nil
+	local hardestSpeed = OverboardConfig.KNOCK_OFF_SPEED
+	for _, part in workspace:GetPartBoundsInBox(hitBox, OverboardConfig.HIT_BOX_SIZE, self.HitParameters) do
+		-- Hazards pop the boat instead. Terrain has no shape to measure against here.
+		if
+			part:IsA("Terrain")
+			or part:GetAttribute(ObstacleServiceShared.HAZARD_ATTRIBUTE) == true
+			or IsInCharacter(part)
+		then
+			continue
+		end
+		-- Where on their body it's hitting (on the line up the middle of the hit box, so
+		-- something hitting only their legs counts), and the nearest point of it there.
+		local heightOnBody = hitBox:PointToObjectSpace(GetClosestPoint(part, hitBox.Position)).Y
+		local bodyPoint = hitBox:PointToWorldSpace(Vector3.new(0, math.clamp(heightOnBody, -halfHeight, halfHeight), 0))
+		local closestPoint = GetClosestPoint(part, bodyPoint)
+		if not IsInBox(closestPoint, hitBox, OverboardConfig.HIT_BOX_SIZE, HIT_TOLERANCE) then
+			continue -- near them, but not touching
+		end
+		local hitVelocity = part:GetVelocityAtPosition(closestPoint) - primaryPart:GetVelocityAtPosition(bodyPoint)
+		-- Only how fast it's coming at them counts, so sliding along a wall doesn't knock
+		-- them off but running into one does.
+		local awayFromPart = bodyPoint - closestPoint
+		local speed = if awayFromPart.Magnitude > 1e-3
+			then hitVelocity:Dot(awayFromPart.Unit)
+			else hitVelocity.Magnitude
+		if speed >= hardestSpeed then
+			hardestSpeed = speed
+			hardestHit = hitVelocity
+		end
+	end
+	return hardestHit
+end
+
+-- Knocks `player` off `boat`: thrown clear by a hit coming at them at `hitVelocity`,
+-- tumbling and limp.
+function OverboardServiceServer.KnockOff(
+	self: OverboardServiceServer,
+	player: Player,
+	boat: Boat.Boat,
+	primaryPart: BasePart,
+	hitVelocity: Vector3
+)
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	local rootPart = if humanoid then humanoid.RootPart else nil
+	if not character or not humanoid or not rootPart or humanoid.Health <= 0 or self.Overboards[player] then
+		return
+	end
+	local riderVelocity = primaryPart:GetVelocityAtPosition(rootPart.Position)
+	local outward = Flatten(rootPart.Position - boat:GetPosition())
+	if not boat:KnockOff(player) then
+		return
+	end
+
+	-- Thrown off with the hit's speed plus a bounce, up and away from the boat.
+	local velocity = riderVelocity
+		+ hitVelocity * (1 + OverboardConfig.THROW_BOUNCE)
+		+ (if outward.Magnitude > 0 then outward.Unit * OverboardConfig.THROW_OUT_SPEED else Vector3.zero)
+	local across = Flatten(velocity)
+	if across.Magnitude > OverboardConfig.MAX_THROW_SPEED then
+		across = across.Unit * OverboardConfig.MAX_THROW_SPEED
+	end
+	velocity = across + Vector3.yAxis * (velocity.Y + OverboardConfig.THROW_UP_SPEED)
+	local spinAxis =
+		Vector3.new(self.Random:NextNumber(-1, 1), self.Random:NextNumber(-1, 1), self.Random:NextNumber(-1, 1))
+	local spin = if spinAxis.Magnitude > 1e-3 then spinAxis.Unit * OverboardConfig.THROW_SPIN else Vector3.zero
+
+	humanoid.PlatformStand = true
+	local ragdoll = Ragdoll.new(character, humanoid)
+	local swimmer = Swimmer.new(character, rootPart)
+	swimmer:Throw(velocity, spin)
+
+	local now = os.clock()
+	self.Overboards[player] = {
+		Boat = boat,
+		Character = character,
+		Humanoid = humanoid,
+		RootPart = rootPart,
+		Ragdoll = ragdoll,
+		Swimmer = swimmer,
+		WakeTime = now + OverboardConfig.KNOCKOUT_TIME,
+		GiveUpTime = nil,
+	}
+	player:SetAttribute(OverboardServiceShared.STATE_ATTRIBUTE, "KnockedOut")
+	player:SetAttribute(
+		OverboardServiceShared.WAKE_TIME_ATTRIBUTE,
+		workspace:GetServerTimeNow() + OverboardConfig.KNOCKOUT_TIME
+	)
+end
+
+-- Moves one overboard player on by a frame: they come round when it's time, float and
+-- swim, grab back on if they've reached their boat, or are left behind.
+function OverboardServiceServer.StepOverboard(
+	self: OverboardServiceServer,
+	player: Player,
+	overboard: Overboard,
+	now: number,
+	deltaTime: number
+)
+	local isStillHere = overboard.Character.Parent ~= nil
+		and player.Character == overboard.Character
+		and overboard.Humanoid.Health > 0
+		and overboard.Boat:IsOverboard(player)
+	if not isStillHere then
+		-- They died, respawned or left the crew some other way.
+		self:EndOverboard(player, true)
+		return
+	end
+	if overboard.Ragdoll and now >= overboard.WakeTime then
+		self:WakeUp(player, overboard)
+	end
+
+	local swimmer = overboard.Swimmer
+	local position = overboard.RootPart.Position
+	local water = WaterServiceServer:GetWater(position, now)
+	if not water and position.Y < swimmer.LastWaterHeight - OverboardConfig.FALL_DISTANCE then
+		self:LeaveBehind(player, "Fell")
+		return
+	end
+
+	local isSwimming = overboard.Ragdoll == nil
+	local push = if isSwimming then FartServiceServer:GetPush(player) * OverboardConfig.FART_PUSH_SCALE else 0
+	local turnDirection = if isSwimming then self.TurnInputs[player] or 0 else 0
+	swimmer:Step(water, push, turnDirection, deltaTime)
+	if not isSwimming then
+		return
+	end
+
+	local giveUpTime = overboard.GiveUpTime
+	if giveUpTime and now >= giveUpTime then
+		self:LeaveBehind(player, "TooLong")
+		return
+	end
+	self:TryGrabOn(player, overboard)
+end
+
+-- `player` comes round: their body stiffens up and they start swimming, facing their boat.
+function OverboardServiceServer.WakeUp(self: OverboardServiceServer, player: Player, overboard: Overboard)
+	local ragdoll = overboard.Ragdoll
+	if ragdoll then
+		ragdoll:Destroy()
+		overboard.Ragdoll = nil
+	end
+	overboard.Swimmer:StartSwimming(overboard.Boat:GetPosition() - overboard.RootPart.Position)
+	overboard.GiveUpTime = os.clock() + OverboardConfig.SWIM_TIME_LIMIT
+
+	player:SetAttribute(OverboardServiceShared.STATE_ATTRIBUTE, "Swimming")
+	player:SetAttribute(OverboardServiceShared.WAKE_TIME_ATTRIBUTE, nil)
+	player:SetAttribute(
+		OverboardServiceShared.GIVE_UP_TIME_ATTRIBUTE,
+		workspace:GetServerTimeNow() + OverboardConfig.SWIM_TIME_LIMIT
+	)
+end
+
+-- Grabs `player` back on to their boat if they've swum close enough to their own
+-- stretch of its edge.
+function OverboardServiceServer.TryGrabOn(self: OverboardServiceServer, player: Player, overboard: Overboard)
+	local boat = overboard.Boat
+	local seat = boat:GetOverboardSeat(player)
+	local spot = if seat then boat:GetRiderSpot(seat) else nil
+	local primaryPart = boat.Model.PrimaryPart
+	if not boat:IsFloating() or not spot or not primaryPart then
+		return
+	end
+	local position = primaryPart.CFrame:PointToObjectSpace(overboard.RootPart.Position)
+	local angle, distance = RiderSpots.GetClosestSlide(spot, position)
+	if distance > OverboardConfig.GRAB_DISTANCE then
+		return
+	end
+
+	-- Hand the body back before Roblox welds it to the seat (so nothing keeps turning it),
+	-- then hang them on where they grabbed.
+	local swimmer = overboard.Swimmer
+	local heading = swimmer.Heading
+	swimmer:Destroy(nil)
+	overboard.Humanoid.PlatformStand = false
+	if not boat:Reboard(player, angle) then
+		-- Roblox wouldn't sit them: back into the water to try again.
+		overboard.Humanoid.PlatformStand = true
+		local newSwimmer = Swimmer.new(overboard.Character, overboard.RootPart)
+		newSwimmer:StartSwimming(heading)
+		overboard.Swimmer = newSwimmer
+		return
+	end
+	self:Forget(player)
+	self.GraceTimes[player] = os.clock() + OverboardConfig.REBOARD_GRACE_TIME
+end
+
+-- `player` didn't make it back to their boat: they leave its crew (which sends them back
+-- to their checkpoint) and are told why.
+function OverboardServiceServer.LeaveBehind(
+	self: OverboardServiceServer,
+	player: Player,
+	reason: OverboardServiceShared.LeftBehindReason
+)
+	if not self.Overboards[player] then
+		return
+	end
+	self:EndOverboard(player, true)
+	self.NotifyLeftBehindRemote:FireClient(player, reason)
+end
+
+-- Stops `player` being overboard, if they are: their body stiffens up and goes back to
+-- them. `leaveBoat` also takes them out of their boat's crew.
+function OverboardServiceServer.EndOverboard(self: OverboardServiceServer, player: Player, leaveBoat: boolean)
+	local overboard = self.Overboards[player]
+	if not overboard then
+		return
+	end
+	self:Forget(player)
+	local ragdoll = overboard.Ragdoll
+	if ragdoll then
+		ragdoll:Destroy()
+	end
+	overboard.Swimmer:Destroy(player)
+	if overboard.Humanoid.Parent then
+		overboard.Humanoid.PlatformStand = false
+	end
+	if leaveBoat then
+		overboard.Boat:RemoveFromCrew(player)
+	end
+end
+
+-- Clears what this service keeps about `player` being overboard.
+function OverboardServiceServer.Forget(self: OverboardServiceServer, player: Player)
+	self.Overboards[player] = nil
+	self.TurnInputs[player] = nil
+	player:SetAttribute(OverboardServiceShared.STATE_ATTRIBUTE, nil)
+	player:SetAttribute(OverboardServiceShared.WAKE_TIME_ATTRIBUTE, nil)
+	player:SetAttribute(OverboardServiceShared.GIVE_UP_TIME_ATTRIBUTE, nil)
+end
+
+return OverboardServiceServer :: OverboardServiceServer
 ]==],
 	},
 	{
@@ -3910,13 +4932,21 @@ local CameraConfig = {
 	SEAT_CAM_BACK = 14, -- studs behind your seat
 	SEAT_CAM_UP = 9, -- studs above your seat
 	SEAT_CAM_LOOK_AHEAD = 10, -- how far past the middle of the boat the camera looks
-	SEAT_CAM_SMOOTHING = 8, -- higher = the camera follows more tightly
+	SEAT_CAM_SMOOTHING = 8, -- higher = the camera follows more tightly (every cam here uses this)
 	SHAKE_DECAY = 8, -- how fast camera shake dies down
 
 	-- Your boat hitting something or landing hard shakes the Seat Cam
 	IMPACT_SPEED_CHANGE = 12, -- studs/s your boat's speed has to change by at once to count
 	IMPACT_SHAKE_PER_SPEED = 0.02, -- studs of shake per stud/s of that change
 	MAX_IMPACT_SHAKE = 0.8, -- studs
+
+	-- Knocked off your boat (OverboardService)
+	KNOCK_OFF_SHAKE = 0.6, -- studs of shake when you're knocked off
+	KNOCKOUT_CAM_BACK = 16, -- while you're knocked out, the camera follows you from this far away...
+	KNOCKOUT_CAM_UP = 10, -- ...and this far above you
+	SWIM_CAM_BACK = 10, -- while you swim, the camera sits this far behind you...
+	SWIM_CAM_UP = 6, -- ...and this far above you...
+	SWIM_CAM_LOOK_AHEAD = 6, -- ...looking at a point this far in front of you
 }
 
 return CameraConfig
@@ -4107,6 +5137,78 @@ local ObstacleConfig = {
 }
 
 return ObstacleConfig
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Modules", "Game" },
+		Name = "OverboardConfig",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Modules.Game.OverboardConfig
+--
+-- Riders who get knocked off their boat (OverboardService). Anything solid that hits a
+-- rider hard enough knocks them off (spikes and other hazards pop the boat instead).
+-- They go flying, lie limp in the water for a moment, then come round and have to swim
+-- back by farting, and grab back on along their own stretch of the edge.
+
+local OverboardConfig = {
+	-- Getting knocked off
+	KNOCK_OFF_SPEED = 7, -- studs/s something has to hit a rider at (compared to how they're moving) to knock them off
+	HIT_BOX_SIZE = Vector3.new(2.5, 5, 2), -- the space round a rider that counts as them being hit...
+	HIT_BOX_OFFSET = CFrame.new(0, -0.5, 0), -- ...from their HumanoidRootPart
+	THROW_BOUNCE = 0.4, -- they fly off what hit them with its speed, plus this much of it again
+	THROW_UP_SPEED = 45, -- studs/s they're thrown upward (about as high as a jump)
+	THROW_OUT_SPEED = 8, -- studs/s they're thrown away from their boat
+	MAX_THROW_SPEED = 45, -- studs/s they're never thrown faster than, across the water
+	THROW_SPIN = 8, -- rad/s they tumble at as they fly
+	REBOARD_GRACE_TIME = 1.5, -- seconds after grabbing back on before they can be knocked off again
+
+	-- Knocked out: limp as a ragdoll for this long
+	KNOCKOUT_TIME = 3,
+	LIMB_SWING = 75, -- degrees an arm, leg or hand can swing from how it was when they were hit...
+	SPINE_SWING = 30, -- ...and their neck and waist
+	JOINT_TWIST = 30, -- degrees any joint can twist either way
+
+	-- Floating. The water holds them up like a soft spring, like it holds up boats.
+	FLOAT_HEIGHT = -0.4, -- how far above the surface a swimmer's HumanoidRootPart floats
+	LIMP_FLOAT_HEIGHT = -0.2, -- how far above the surface each part of a knocked-out body floats
+	FLOAT_STIFFNESS = 40, -- studs/s² of push back up for every stud they're pushed under
+	MAX_FLOAT_DEPTH = 3, -- pushing them deeper than this doesn't push them back up any harder
+	FLOAT_DAMPING = 8, -- how quickly bobbing dies down, per second
+	SPLASH_DAMPING = 0.2, -- extra damping that grows with up/down speed, so landing in the water stops them quickly
+	AIRBORNE_HEIGHT = 1, -- studs above the surface they're out of the water; the water's hold fades in below that
+	LIMP_DRAG = 2.5, -- per second: how quickly a knocked-out body slows down in the water (sprawled out, it stops quickly)
+	LIMP_SPIN_DAMPING = 3, -- how quickly a knocked-out body stops tumbling in the water, per second
+	TURBULENCE_SCALE = 1, -- how hard rapids shove swimmers, compared to how hard they shove boats
+
+	-- Swimming. Farting pushes a swimmer the way they face; A and D turn them.
+	FART_PUSH_SCALE = 0.5, -- a fart pushes a swimmer at this fraction of FartConfig's push strengths
+	GLIDE_DRAG = 0.8, -- per second: how quickly a swimmer slows down when they stop farting
+	TOP_SPEED = 14, -- studs/s a swimmer farting at full strength levels off at (slower than a boat)
+	TURN_SPEED = math.rad(160), -- how fast a swimmer turns (radians per second)
+	TURN_RESPONSE_TIME = 0.12, -- turning speeds up and slows down most of the way in this many seconds
+	FACING_RESPONSIVENESS = 20, -- how quickly their body turns to face where they're heading (higher = snappier)
+
+	-- Grabbing back on: swim to within this many studs of anywhere along your own stretch
+	-- of your boat's edge and you grab straight back on there.
+	GRAB_DISTANCE = 3,
+	SWIM_TIME_LIMIT = 30, -- seconds a swimmer has to get back aboard before they're sent back to their checkpoint
+	FALL_DISTANCE = 30, -- a swimmer this far below the last water they were in has fallen off the river
+
+	-- Swimming pose (on every player's screen)
+	SWIM_LEAN = math.rad(50), -- leaning forward this far from upright
+	PADDLE_REACH = math.rad(110), -- arms reach forward this far from hanging down...
+	PADDLE_ANGLE = math.rad(35), -- ...and paddle this far either side of that, one arm after the other...
+	PADDLE_SPEED = 9, -- ...this fast (radians of the paddle cycle per second)
+	ELBOW_BEND = math.rad(30),
+	KICK_ANGLE = math.rad(25), -- legs kick this far either way...
+	KICK_SPEED = 12, -- ...this fast (radians of the kick cycle per second)
+	KNEE_BEND = math.rad(20),
+	STICK_DEADZONE = 0.5, -- how far a controller's left stick has to be pushed left or right to turn
+}
+
+return OverboardConfig
 ]==],
 	},
 	{
@@ -4469,6 +5571,10 @@ return BoatServiceShared
 -- The camera rides at the height of the boat's middle, so it bobs gently with the
 -- waves but doesn't swing up and down as the boat rocks. A hard bump or a big splash
 -- shakes it.
+--
+-- Knocked off your boat (OverboardService), it shakes and follows you as you fly and lie
+-- limp in the water; once you come round and swim, it sits behind you so farting pushes
+-- you up the screen, the same as on the boat. It glides between all of these.
 
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
@@ -4477,6 +5583,7 @@ local RunService = game:GetService("RunService")
 
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
 local CameraConfig = require(ReplicatedStorage.Shared.Modules.Game.CameraConfig)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
 
 local localPlayer = Players.LocalPlayer
 
@@ -4507,6 +5614,23 @@ local function GetRiddenBoat(): (Model?, BasePart?)
 	return boatModel, rootPart or seat
 end
 
+-- The local player's HumanoidRootPart while they're overboard, and how.
+local function GetOverboardRootPart(): (BasePart?, OverboardServiceShared.OverboardState?)
+	local state: OverboardServiceShared.OverboardState? = OverboardServiceShared.GetState(localPlayer)
+	local character = localPlayer.Character
+	local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
+	if not state or not rootPart or not rootPart:IsA("BasePart") then
+		return nil, nil
+	end
+	return rootPart, state
+end
+
+-- `vector` flat on the water, made unit length (straight ahead if it's straight up or down).
+local function FlatUnit(vector: Vector3): Vector3
+	local flat = Vector3.new(vector.X, 0, vector.Z)
+	return if flat.Magnitude > 1e-6 then flat.Unit else -Vector3.zAxis
+end
+
 function CameraServiceClient.Init(self: CameraServiceClient)
 	self.SeatCamEnabled = true
 	self.ShakeAmount = 0
@@ -4524,6 +5648,11 @@ function CameraServiceClient.Init(self: CameraServiceClient)
 		end
 		return Enum.ContextActionResult.Sink
 	end, false, Enum.KeyCode.V, Enum.KeyCode.ButtonY)
+	localPlayer:GetAttributeChangedSignal(OverboardServiceShared.STATE_ATTRIBUTE):Connect(function()
+		if OverboardServiceShared.GetState(localPlayer) == "KnockedOut" then
+			self:Shake(CameraConfig.KNOCK_OFF_SHAKE)
+		end
+	end)
 end
 
 -- Shakes the camera. Bigger numbers shake harder; it dies down by itself.
@@ -4551,8 +5680,11 @@ end
 
 function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number)
 	local camera = workspace.CurrentCamera
-	local boatModel, riderPart = GetRiddenBoat()
-	if not self.SeatCamEnabled or not boatModel or not riderPart then
+	local goal: CFrame? = nil
+	if self.SeatCamEnabled then
+		goal = self:GetSeatCamGoal() or self:GetOverboardCamGoal(camera)
+	end
+	if not goal then
 		if camera.CameraType == Enum.CameraType.Scriptable then
 			camera.CameraType = Enum.CameraType.Custom
 		end
@@ -4561,16 +5693,10 @@ function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number
 		self.LastBoatVelocity = nil
 		return
 	end
-	self:ShakeOnImpact(boatModel)
 
-	local boatPosition = boatModel:GetPivot().Position
-	local facing = BoatServiceShared.GetRiderFacing(boatPosition, riderPart.CFrame)
-	local riderPosition = Vector3.new(riderPart.Position.X, boatPosition.Y, riderPart.Position.Z)
-	local eye = riderPosition - facing * CameraConfig.SEAT_CAM_BACK + Vector3.yAxis * CameraConfig.SEAT_CAM_UP
-	local goal = CFrame.lookAt(eye, boatPosition + facing * CameraConfig.SEAT_CAM_LOOK_AHEAD)
-
+	-- Glides from wherever the camera was (switching between cams included).
 	local smoothing = 1 - math.exp(-CameraConfig.SEAT_CAM_SMOOTHING * deltaTime)
-	local current = (self.SmoothedCFrame or goal):Lerp(goal, smoothing)
+	local current = (self.SmoothedCFrame or camera.CFrame):Lerp(goal, smoothing)
 	self.SmoothedCFrame = current
 
 	if self.ShakeAmount > 0 then
@@ -4582,6 +5708,43 @@ function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number
 
 	camera.CameraType = Enum.CameraType.Scriptable
 	camera.CFrame = current
+end
+
+-- Where the Seat Cam wants to be while the local player rides a boat on the river: behind
+-- them, looking across the boat. Nil when they aren't riding.
+function CameraServiceClient.GetSeatCamGoal(self: CameraServiceClient): CFrame?
+	local boatModel, riderPart = GetRiddenBoat()
+	if not boatModel or not riderPart then
+		self.LastBoatModel = nil
+		self.LastBoatVelocity = nil
+		return nil
+	end
+	self:ShakeOnImpact(boatModel)
+
+	local boatPosition = boatModel:GetPivot().Position
+	local facing = BoatServiceShared.GetRiderFacing(boatPosition, riderPart.CFrame)
+	local riderPosition = Vector3.new(riderPart.Position.X, boatPosition.Y, riderPart.Position.Z)
+	local eye = riderPosition - facing * CameraConfig.SEAT_CAM_BACK + Vector3.yAxis * CameraConfig.SEAT_CAM_UP
+	return CFrame.lookAt(eye, boatPosition + facing * CameraConfig.SEAT_CAM_LOOK_AHEAD)
+end
+
+-- Where the camera wants to be while the local player is overboard: following them from
+-- where it is while they're knocked out, behind them while they swim. Nil when they
+-- aren't overboard.
+function CameraServiceClient.GetOverboardCamGoal(self: CameraServiceClient, camera: Camera): CFrame?
+	local rootPart, state = GetOverboardRootPart()
+	if not rootPart then
+		return nil
+	end
+	local position = rootPart.Position
+	if state == "KnockedOut" then
+		local fromThem = FlatUnit(camera.CFrame.Position - position)
+		local eye = position + fromThem * CameraConfig.KNOCKOUT_CAM_BACK + Vector3.yAxis * CameraConfig.KNOCKOUT_CAM_UP
+		return CFrame.lookAt(eye, position)
+	end
+	local heading = FlatUnit(rootPart.CFrame.LookVector)
+	local eye = position - heading * CameraConfig.SWIM_CAM_BACK + Vector3.yAxis * CameraConfig.SWIM_CAM_UP
+	return CFrame.lookAt(eye, position + heading * CameraConfig.SWIM_CAM_LOOK_AHEAD)
 end
 
 return CameraServiceClient :: CameraServiceClient
@@ -4863,9 +6026,10 @@ return FartPhysics
 -- plays everyone's fart effects. Hold the fart key to keep farting; its push builds up
 -- the longer you keep farting (FartPhysics), and letting go stops. Riders fart straight
 -- out behind them, pushing the boat toward its middle; they steer by sliding round the
--- edge of the boat (RiderService). Your own fart starts the moment you press, so it
--- feels instant; the server still decides whether the boat moves, and tells this client
--- to stop if it says no.
+-- edge of the boat (RiderService). Riders knocked off their boat swim back by farting
+-- (OverboardService). Your own fart starts the moment you press, so it feels instant;
+-- the server still decides whether it pushes anything, and tells this client to stop if
+-- it says no.
 --
 --   Fart   W, Up arrow, Space, or RT
 --
@@ -4888,6 +6052,7 @@ local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.
 local FartConfig = require(ReplicatedStorage.Shared.Modules.Game.FartConfig)
 local FartPhysics = require(ReplicatedStorage.Shared.Services.FartService.FartPhysics)
 local FartServiceShared = require(ReplicatedStorage.Shared.Services.FartService.FartServiceShared)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
 local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
 local Signal = require(ReplicatedStorage.Packages.Signal)
 
@@ -4925,8 +6090,12 @@ type FartServiceClientMembers = {
 
 export type FartServiceClient = typeof(FartServiceClient) & FartServiceClientMembers
 
--- True while the local player hangs on to a boat that's on the river.
-local function IsRiding(): boolean
+-- True while the local player hangs on to a boat that's on the river, or is swimming
+-- back to theirs.
+local function CanFart(): boolean
+	if OverboardServiceShared.GetState(localPlayer) == "Swimming" then
+		return true
+	end
 	local character = localPlayer.Character
 	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
 	local seat = if humanoid then humanoid.SeatPart else nil
@@ -4981,7 +6150,7 @@ function FartServiceClient.Init(self: FartServiceClient)
 		function(_actionName: string, inputState: Enum.UserInputState, input: InputObject)
 			local inputName = input.KeyCode.Name
 			if inputState == Enum.UserInputState.Begin then
-				if not IsRiding() then
+				if not CanFart() then
 					-- Not on the river: let the keys do their normal job (like walking).
 					return Enum.ContextActionResult.Pass
 				end
@@ -5072,9 +6241,10 @@ function FartServiceClient.SetLocalFarting(self: FartServiceClient, isFarting: b
 end
 
 -- Every frame: build up (or fade) everyone's fart strength, grow each fart's effects
--- with it, and stop the local fart if the player ran out of gas or isn't riding any more.
+-- with it, and stop the local fart if the player ran out of gas or can't fart any more
+-- (knocked off their boat, say).
 function FartServiceClient.Update(self: FartServiceClient, deltaTime: number)
-	if self.IsLocalFarting and (GetLocalGas() <= 0 or not IsRiding()) then
+	if self.IsLocalFarting and (GetLocalGas() <= 0 or not CanFart()) then
 		table.clear(self.HeldInputs)
 		self:SetLocalFarting(false)
 	end
@@ -5280,6 +6450,366 @@ function ObstacleServiceShared.IsObstacleType(value: unknown): boolean
 end
 
 return ObstacleServiceShared
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "OverboardService" },
+		Name = "OverboardServiceClient",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceClient
+--
+-- The client half of OverboardService. Riders who get knocked off their boat go limp for
+-- a moment, then have to swim back to it and grab on along their own stretch of its edge
+-- (the server decides all of that; see OverboardServiceServer).
+--
+-- Swimming: farting pushes you the way you face (FartService: W, Up arrow, Space or RT,
+-- with the same gas), and you turn with
+--   Turn left     A, Left arrow, Q, LB, or the left stick pushed left
+--   Turn right    D, Right arrow, E, RB, or the left stick pushed right
+-- If you hold both, the one you pressed last wins. On-screen buttons for touch devices
+-- (UI, to be built) call PressTurn and ReleaseTurn. The server does the turning.
+--
+-- Posing: every swimmer is posed on this player's screen, doggy-paddling: leaning forward
+-- with their arms paddling and legs kicking. It overrides their animation every frame,
+-- so it needs no animation assets. Knocked-out players are limp (that's physics) and
+-- show a dazed effect over their head. All the angles are in OverboardConfig.
+--
+-- For the UI: StateChanged fires (state: OverboardState?) when the local player is knocked
+-- out, starts swimming, or is back aboard (nil). LeftBehind fires (reason:
+-- LeftBehindReason) when they didn't make it back and are sent to their checkpoint.
+-- GetSecondsUntilWake and GetSecondsUntilGiveUp are for countdowns.
+--
+-- Asset contract:
+--   ReplicatedStorage.Assets.VFX.Dazed   ParticleEmitter (optional): shown over a knocked-out
+--                                        player's head (in an attachment at the top of it)
+
+local ContextActionService = game:GetService("ContextActionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local OverboardConfig = require(ReplicatedStorage.Shared.Modules.Game.OverboardConfig)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
+local Remotes = require(ReplicatedStorage.Shared.Modules.Core.Remotes)
+local RigPose = require(ReplicatedStorage.Packages.RigPose)
+local Signal = require(ReplicatedStorage.Packages.Signal)
+
+export type Side = "Left" | "Right"
+
+local SERVICE_NAME = OverboardServiceShared.SERVICE_NAME
+local TURN_ACTIONS: { [string]: Side } = {
+	SwimTurnLeft = "Left",
+	SwimTurnRight = "Right",
+}
+local SIDE_DIRECTIONS: { [Side]: number } = {
+	Left = -1,
+	Right = 1,
+}
+local STICK_INPUT = "Thumbstick1" -- what the left stick counts as among the held turn inputs
+local DAZED_NAME = "Dazed"
+
+local localPlayer = Players.LocalPlayer
+
+local OverboardServiceClient = {}
+
+type OverboardServiceClientMembers = {
+	HeldTurns: { { Input: string, Side: Side } }, -- turn keys and buttons held down, in the order pressed
+	TurnDirection: number, -- what the server was last asked: -1 left, 1 right, 0 not turning
+	RequestSwimTurnRemote: RemoteEvent?, -- set once the server has created it
+	Rigs: { [Model]: RigPose.Rig }, -- each swimmer's joints, by character
+	DazedEffects: { [Player]: Attachment }, -- the dazed effect over each knocked-out player's head
+	DazedTemplate: ParticleEmitter?,
+	StateChanged: Signal.Signal, -- fires (state: OverboardServiceShared.OverboardState?) when the local player's changes
+	LeftBehind: Signal.Signal, -- fires (reason: OverboardServiceShared.LeftBehindReason) when the local player didn't make it back
+}
+
+export type OverboardServiceClient = typeof(OverboardServiceClient) & OverboardServiceClientMembers
+
+local function IsLocalSwimming(): boolean
+	return OverboardServiceShared.GetState(localPlayer) == "Swimming"
+end
+
+local function FindDazedTemplate(): ParticleEmitter?
+	local vfxFolder = ReplicatedStorage.Assets:FindFirstChild("VFX")
+	local dazed = if vfxFolder then vfxFolder:FindFirstChild(DAZED_NAME) else nil
+	if dazed and dazed:IsA("ParticleEmitter") then
+		return dazed
+	end
+	warn(
+		`Asset missing: ReplicatedStorage.Assets.VFX.{DAZED_NAME} (a ParticleEmitter). Knocked-out players won't show it.`
+	)
+	return nil
+end
+
+-- Seconds until server time attribute `name` on the local player, or nil if it isn't set.
+local function GetSecondsUntil(name: string): number?
+	local serverTime = localPlayer:GetAttribute(name)
+	if typeof(serverTime) ~= "number" then
+		return nil
+	end
+	return math.max(0, serverTime - workspace:GetServerTimeNow())
+end
+
+function OverboardServiceClient.Init(self: OverboardServiceClient)
+	self.HeldTurns = {}
+	self.TurnDirection = 0
+	self.RequestSwimTurnRemote = nil
+	self.Rigs = setmetatable({}, { __mode = "k" }) :: any
+	self.DazedEffects = {}
+	self.DazedTemplate = FindDazedTemplate()
+	self.StateChanged = Signal.new()
+	self.LeftBehind = Signal.new()
+
+	local function OnTurnAction(actionName: string, inputState: Enum.UserInputState, input: InputObject)
+		local side: Side? = TURN_ACTIONS[actionName]
+		if not side then
+			return Enum.ContextActionResult.Pass
+		end
+		local inputName = input.KeyCode.Name
+		if inputState == Enum.UserInputState.Begin then
+			if not IsLocalSwimming() then
+				-- Not swimming: let the keys do their normal job (like sliding or walking).
+				return Enum.ContextActionResult.Pass
+			end
+			self:PressTurn(side, inputName)
+			return Enum.ContextActionResult.Sink
+		end
+		-- Letting go: only take it if the press was a turn, so other keys still let go normally.
+		for _, held in self.HeldTurns do
+			if held.Input == inputName then
+				self:ReleaseTurn(side, inputName)
+				return Enum.ContextActionResult.Sink
+			end
+		end
+		return Enum.ContextActionResult.Pass
+	end
+	ContextActionService:BindAction(
+		"SwimTurnLeft",
+		OnTurnAction,
+		false,
+		Enum.KeyCode.A,
+		Enum.KeyCode.Left,
+		Enum.KeyCode.Q,
+		Enum.KeyCode.ButtonL1
+	)
+	ContextActionService:BindAction(
+		"SwimTurnRight",
+		OnTurnAction,
+		false,
+		Enum.KeyCode.D,
+		Enum.KeyCode.Right,
+		Enum.KeyCode.E,
+		Enum.KeyCode.ButtonR1
+	)
+	ContextActionService:BindAction("SwimTurnStick", function(_actionName, _inputState, input: InputObject)
+		local x = input.Position.X
+		local side: Side? = if not IsLocalSwimming()
+			then nil
+			elseif x <= -OverboardConfig.STICK_DEADZONE then "Left"
+			elseif x >= OverboardConfig.STICK_DEADZONE then "Right"
+			else nil
+		self:SetHeldTurn(STICK_INPUT, side)
+		-- Let the stick do its normal job too (it doesn't walk while swimming).
+		return Enum.ContextActionResult.Pass
+	end, false, Enum.KeyCode.Thumbstick1)
+
+	localPlayer:GetAttributeChangedSignal(OverboardServiceShared.STATE_ATTRIBUTE):Connect(function()
+		local state = OverboardServiceShared.GetState(localPlayer)
+		if state ~= "Swimming" and #self.HeldTurns > 0 then
+			table.clear(self.HeldTurns)
+			self:UpdateTurnDirection()
+		end
+		self.StateChanged:Fire(state)
+	end)
+
+	-- After animations are applied each frame, so the pose wins over them.
+	RunService.PreSimulation:Connect(function()
+		self:Update()
+	end)
+
+	-- Remotes are waited for in a separate thread so Init never yields.
+	task.spawn(function()
+		self.RequestSwimTurnRemote = Remotes.WaitForEvent(SERVICE_NAME, OverboardServiceShared.REQUEST_SWIM_TURN)
+		Remotes.WaitForEvent(SERVICE_NAME, OverboardServiceShared.NOTIFY_LEFT_BEHIND).OnClientEvent
+			:Connect(function(reason: OverboardServiceShared.LeftBehindReason)
+				self.LeftBehind:Fire(reason)
+			end)
+	end)
+end
+
+-- A turn key (or on-screen button, which can leave out `inputName`) went down.
+function OverboardServiceClient.PressTurn(self: OverboardServiceClient, side: Side, inputName: string?)
+	if IsLocalSwimming() then
+		self:SetHeldTurn(inputName or `Button{side}`, side)
+	end
+end
+
+-- A turn key (or on-screen button) was let go.
+function OverboardServiceClient.ReleaseTurn(self: OverboardServiceClient, side: Side, inputName: string?)
+	self:SetHeldTurn(inputName or `Button{side}`, nil)
+end
+
+-- Records that `input` is now holding a turn to `side`, or nothing (nil), and tells the
+-- server if that changes which way to turn.
+function OverboardServiceClient.SetHeldTurn(self: OverboardServiceClient, input: string, side: Side?)
+	for index = #self.HeldTurns, 1, -1 do
+		if self.HeldTurns[index].Input == input then
+			if self.HeldTurns[index].Side == side then
+				return -- already held that way
+			end
+			table.remove(self.HeldTurns, index)
+		end
+	end
+	if side then
+		table.insert(self.HeldTurns, { Input = input, Side = side })
+	end
+	self:UpdateTurnDirection()
+end
+
+-- Tells the server which way to turn (the last turn key pressed that's still held), if
+-- that changed.
+function OverboardServiceClient.UpdateTurnDirection(self: OverboardServiceClient)
+	local lastHeld = self.HeldTurns[#self.HeldTurns]
+	local direction = if lastHeld then SIDE_DIRECTIONS[lastHeld.Side] else 0
+	local remote = self.RequestSwimTurnRemote
+	if direction == self.TurnDirection or not remote then
+		return
+	end
+	self.TurnDirection = direction
+	remote:FireServer(direction)
+end
+
+-- Seconds until the local player comes round, or nil if they aren't knocked out.
+function OverboardServiceClient.GetSecondsUntilWake(self: OverboardServiceClient): number?
+	return GetSecondsUntil(OverboardServiceShared.WAKE_TIME_ATTRIBUTE)
+end
+
+-- Seconds the local player has left to get back aboard, or nil if they aren't swimming.
+function OverboardServiceClient.GetSecondsUntilGiveUp(self: OverboardServiceClient): number?
+	return GetSecondsUntil(OverboardServiceShared.GIVE_UP_TIME_ATTRIBUTE)
+end
+
+function OverboardServiceClient.Update(self: OverboardServiceClient)
+	local time = os.clock()
+	for _, player in Players:GetPlayers() do
+		local state = OverboardServiceShared.GetState(player)
+		local character = player.Character
+		local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+		if state == "Swimming" and character and humanoid then
+			self:PoseSwimmer(player, character, humanoid, time)
+		end
+		self:SetDazed(player, state == "KnockedOut")
+	end
+	for player in self.DazedEffects do
+		if not player.Parent then
+			self:SetDazed(player, false)
+		end
+	end
+end
+
+-- Poses one swimmer, doggy-paddling.
+function OverboardServiceClient.PoseSwimmer(
+	self: OverboardServiceClient,
+	player: Player,
+	character: Model,
+	humanoid: Humanoid,
+	time: number
+)
+	local existingRig = self.Rigs[character]
+	local rig: RigPose.Rig = if existingRig and RigPose.IsCurrent(existingRig)
+		then existingRig
+		else RigPose.FindRig(character, humanoid)
+	self.Rigs[character] = rig
+	local beat = time + player.UserId % 10 -- each swimmer at their own beat
+
+	-- Leaning forward into the water
+	RigPose.PoseJoint(rig.Root, CFrame.Angles(-OverboardConfig.SWIM_LEAN, 0, 0))
+
+	-- Arms reaching forward and paddling, one after the other
+	local paddle = math.sin(beat * OverboardConfig.PADDLE_SPEED) * OverboardConfig.PADDLE_ANGLE
+	RigPose.PoseJoint(rig.RightShoulder, CFrame.Angles(OverboardConfig.PADDLE_REACH + paddle, 0, 0))
+	RigPose.PoseJoint(rig.LeftShoulder, CFrame.Angles(OverboardConfig.PADDLE_REACH - paddle, 0, 0))
+	local elbowBend = CFrame.Angles(OverboardConfig.ELBOW_BEND, 0, 0)
+	RigPose.PoseJoint(rig.RightElbow, elbowBend)
+	RigPose.PoseJoint(rig.LeftElbow, elbowBend)
+
+	-- Legs kicking behind
+	local kick = math.sin(beat * OverboardConfig.KICK_SPEED) * OverboardConfig.KICK_ANGLE
+	RigPose.PoseJoint(rig.RightHip, CFrame.Angles(kick, 0, 0))
+	RigPose.PoseJoint(rig.LeftHip, CFrame.Angles(-kick, 0, 0))
+	local kneeBend = CFrame.Angles(-OverboardConfig.KNEE_BEND, 0, 0)
+	RigPose.PoseJoint(rig.RightKnee, kneeBend)
+	RigPose.PoseJoint(rig.LeftKnee, kneeBend)
+end
+
+-- Shows or hides the dazed effect over `player`'s head.
+function OverboardServiceClient.SetDazed(self: OverboardServiceClient, player: Player, isDazed: boolean)
+	local existing = self.DazedEffects[player]
+	local character = player.Character
+	local head = if character then character:FindFirstChild("Head") else nil
+	if isDazed and existing and head and existing.Parent == head then
+		return -- already showing
+	end
+	if existing then
+		existing:Destroy()
+		self.DazedEffects[player] = nil
+	end
+	local template = self.DazedTemplate
+	if not isDazed or not template or not head or not head:IsA("BasePart") then
+		return
+	end
+	local attachment = Instance.new("Attachment")
+	attachment.Name = DAZED_NAME
+	attachment.Position = Vector3.new(0, head.Size.Y / 2, 0)
+	template:Clone().Parent = attachment
+	attachment.Parent = head
+	self.DazedEffects[player] = attachment
+end
+
+return OverboardServiceClient :: OverboardServiceClient
+]==],
+	},
+	{
+		ParentPath = { "ReplicatedStorage", "Shared", "Services", "OverboardService" },
+		Name = "OverboardServiceShared",
+		ClassName = "ModuleScript",
+		Source = [==[
+--!strict
+-- ModuleScript: ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared
+--
+-- Names and helpers both halves of OverboardService (and other services) agree on.
+
+export type OverboardState = "KnockedOut" | "Swimming" -- limp in the water, or swimming back to their boat
+export type LeftBehindReason = "TooLong" | "Fell" -- ran out of time to get back aboard, or fell off the river
+
+local OverboardServiceShared = {
+	SERVICE_NAME = "OverboardService",
+	COLLISION_GROUP = "Swimmers", -- overboard players bump into the map and obstacles, but not boats or each other
+
+	-- Attributes on each Player, kept up to date by the server, for clients and UI
+	STATE_ATTRIBUTE = "Overboard", -- an OverboardState while they're off their boat (missing = aboard, or not on the river)
+	WAKE_TIME_ATTRIBUTE = "WakeTime", -- server time (workspace:GetServerTimeNow()) a knocked-out player comes round
+	GIVE_UP_TIME_ATTRIBUTE = "GiveUpTime", -- server time a swimmer is sent back to their checkpoint if they're not aboard
+
+	-- Remotes
+	REQUEST_SWIM_TURN = "RequestSwimTurn", -- RemoteEvent client -> server (direction: number): -1 turn left, 1 turn right, 0 stop turning
+	NOTIFY_LEFT_BEHIND = "NotifyLeftBehind", -- RemoteEvent to a swimmer sent back to their checkpoint (reason: LeftBehindReason)
+}
+
+-- Whether `player` is overboard right now, and how.
+function OverboardServiceShared.GetState(player: Player): OverboardState?
+	local state = player:GetAttribute(OverboardServiceShared.STATE_ATTRIBUTE)
+	if state == "KnockedOut" then
+		return "KnockedOut"
+	elseif state == "Swimming" then
+		return "Swimming"
+	end
+	return nil
+end
+
+return OverboardServiceShared
 ]==],
 	},
 	{
@@ -5810,6 +7340,20 @@ end
 -- left at identity). Roblox's own weld would sit them on the seat.
 function RiderSpots.GetSeatWeldC0(spot: RiderSpot, angle: number): CFrame
 	return spot.SeatCFrame:Inverse() * CFrame.Angles(0, angle, 0) * spot.HangCFrame
+end
+
+-- The slide angle along `spot`'s stretch of the edge that hangs a rider closest to
+-- `position` (in the PrimaryPart's space), and how far (studs) `position` is from where
+-- that would hang them. Used to grab back on after being knocked off.
+function RiderSpots.GetClosestSlide(spot: RiderSpot, position: Vector3): (number, number)
+	local seatAngle = math.atan2(spot.HangCFrame.X, spot.HangCFrame.Z)
+	local angle = RiderSpots.GetAngleDifference(seatAngle, math.atan2(position.X, position.Z))
+	local minAngle, maxAngle = spot.MinAngle, spot.MaxAngle
+	if minAngle and maxAngle then
+		angle = math.clamp(angle, minAngle, maxAngle)
+	end
+	local hangPosition = (CFrame.Angles(0, angle, 0) * spot.HangCFrame).Position
+	return angle, (position - hangPosition).Magnitude
 end
 
 -- The shortest way round from angle `from` to angle `to` (radians, -pi to pi).

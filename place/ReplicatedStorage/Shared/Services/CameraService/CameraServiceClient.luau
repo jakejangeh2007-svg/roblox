@@ -9,6 +9,10 @@
 -- The camera rides at the height of the boat's middle, so it bobs gently with the
 -- waves but doesn't swing up and down as the boat rocks. A hard bump or a big splash
 -- shakes it.
+--
+-- Knocked off your boat (OverboardService), it shakes and follows you as you fly and lie
+-- limp in the water; once you come round and swim, it sits behind you so farting pushes
+-- you up the screen, the same as on the boat. It glides between all of these.
 
 local ContextActionService = game:GetService("ContextActionService")
 local Players = game:GetService("Players")
@@ -17,6 +21,7 @@ local RunService = game:GetService("RunService")
 
 local BoatServiceShared = require(ReplicatedStorage.Shared.Services.BoatService.BoatServiceShared)
 local CameraConfig = require(ReplicatedStorage.Shared.Modules.Game.CameraConfig)
+local OverboardServiceShared = require(ReplicatedStorage.Shared.Services.OverboardService.OverboardServiceShared)
 
 local localPlayer = Players.LocalPlayer
 
@@ -47,6 +52,23 @@ local function GetRiddenBoat(): (Model?, BasePart?)
 	return boatModel, rootPart or seat
 end
 
+-- The local player's HumanoidRootPart while they're overboard, and how.
+local function GetOverboardRootPart(): (BasePart?, OverboardServiceShared.OverboardState?)
+	local state: OverboardServiceShared.OverboardState? = OverboardServiceShared.GetState(localPlayer)
+	local character = localPlayer.Character
+	local rootPart = if character then character:FindFirstChild("HumanoidRootPart") else nil
+	if not state or not rootPart or not rootPart:IsA("BasePart") then
+		return nil, nil
+	end
+	return rootPart, state
+end
+
+-- `vector` flat on the water, made unit length (straight ahead if it's straight up or down).
+local function FlatUnit(vector: Vector3): Vector3
+	local flat = Vector3.new(vector.X, 0, vector.Z)
+	return if flat.Magnitude > 1e-6 then flat.Unit else -Vector3.zAxis
+end
+
 function CameraServiceClient.Init(self: CameraServiceClient)
 	self.SeatCamEnabled = true
 	self.ShakeAmount = 0
@@ -64,6 +86,11 @@ function CameraServiceClient.Init(self: CameraServiceClient)
 		end
 		return Enum.ContextActionResult.Sink
 	end, false, Enum.KeyCode.V, Enum.KeyCode.ButtonY)
+	localPlayer:GetAttributeChangedSignal(OverboardServiceShared.STATE_ATTRIBUTE):Connect(function()
+		if OverboardServiceShared.GetState(localPlayer) == "KnockedOut" then
+			self:Shake(CameraConfig.KNOCK_OFF_SHAKE)
+		end
+	end)
 end
 
 -- Shakes the camera. Bigger numbers shake harder; it dies down by itself.
@@ -91,8 +118,11 @@ end
 
 function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number)
 	local camera = workspace.CurrentCamera
-	local boatModel, riderPart = GetRiddenBoat()
-	if not self.SeatCamEnabled or not boatModel or not riderPart then
+	local goal: CFrame? = nil
+	if self.SeatCamEnabled then
+		goal = self:GetSeatCamGoal() or self:GetOverboardCamGoal(camera)
+	end
+	if not goal then
 		if camera.CameraType == Enum.CameraType.Scriptable then
 			camera.CameraType = Enum.CameraType.Custom
 		end
@@ -101,16 +131,10 @@ function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number
 		self.LastBoatVelocity = nil
 		return
 	end
-	self:ShakeOnImpact(boatModel)
 
-	local boatPosition = boatModel:GetPivot().Position
-	local facing = BoatServiceShared.GetRiderFacing(boatPosition, riderPart.CFrame)
-	local riderPosition = Vector3.new(riderPart.Position.X, boatPosition.Y, riderPart.Position.Z)
-	local eye = riderPosition - facing * CameraConfig.SEAT_CAM_BACK + Vector3.yAxis * CameraConfig.SEAT_CAM_UP
-	local goal = CFrame.lookAt(eye, boatPosition + facing * CameraConfig.SEAT_CAM_LOOK_AHEAD)
-
+	-- Glides from wherever the camera was (switching between cams included).
 	local smoothing = 1 - math.exp(-CameraConfig.SEAT_CAM_SMOOTHING * deltaTime)
-	local current = (self.SmoothedCFrame or goal):Lerp(goal, smoothing)
+	local current = (self.SmoothedCFrame or camera.CFrame):Lerp(goal, smoothing)
 	self.SmoothedCFrame = current
 
 	if self.ShakeAmount > 0 then
@@ -122,6 +146,43 @@ function CameraServiceClient.Update(self: CameraServiceClient, deltaTime: number
 
 	camera.CameraType = Enum.CameraType.Scriptable
 	camera.CFrame = current
+end
+
+-- Where the Seat Cam wants to be while the local player rides a boat on the river: behind
+-- them, looking across the boat. Nil when they aren't riding.
+function CameraServiceClient.GetSeatCamGoal(self: CameraServiceClient): CFrame?
+	local boatModel, riderPart = GetRiddenBoat()
+	if not boatModel or not riderPart then
+		self.LastBoatModel = nil
+		self.LastBoatVelocity = nil
+		return nil
+	end
+	self:ShakeOnImpact(boatModel)
+
+	local boatPosition = boatModel:GetPivot().Position
+	local facing = BoatServiceShared.GetRiderFacing(boatPosition, riderPart.CFrame)
+	local riderPosition = Vector3.new(riderPart.Position.X, boatPosition.Y, riderPart.Position.Z)
+	local eye = riderPosition - facing * CameraConfig.SEAT_CAM_BACK + Vector3.yAxis * CameraConfig.SEAT_CAM_UP
+	return CFrame.lookAt(eye, boatPosition + facing * CameraConfig.SEAT_CAM_LOOK_AHEAD)
+end
+
+-- Where the camera wants to be while the local player is overboard: following them from
+-- where it is while they're knocked out, behind them while they swim. Nil when they
+-- aren't overboard.
+function CameraServiceClient.GetOverboardCamGoal(self: CameraServiceClient, camera: Camera): CFrame?
+	local rootPart, state = GetOverboardRootPart()
+	if not rootPart then
+		return nil
+	end
+	local position = rootPart.Position
+	if state == "KnockedOut" then
+		local fromThem = FlatUnit(camera.CFrame.Position - position)
+		local eye = position + fromThem * CameraConfig.KNOCKOUT_CAM_BACK + Vector3.yAxis * CameraConfig.KNOCKOUT_CAM_UP
+		return CFrame.lookAt(eye, position)
+	end
+	local heading = FlatUnit(rootPart.CFrame.LookVector)
+	local eye = position - heading * CameraConfig.SWIM_CAM_BACK + Vector3.yAxis * CameraConfig.SWIM_CAM_UP
+	return CFrame.lookAt(eye, position + heading * CameraConfig.SWIM_CAM_LOOK_AHEAD)
 end
 
 return CameraServiceClient :: CameraServiceClient

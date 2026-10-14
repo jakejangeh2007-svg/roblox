@@ -105,6 +105,8 @@ To playtest before the real map, boats and menus exist:
      it to start early (party leader only, sitting in the boat).
    - Fart with **W**, slide round the edge with **A / D** (or the arrow keys). Fall off a
      river, or hit something red, to test wiping.
+   - Let a swinging door or the sliding gate hit you, or ram a wall, to get knocked off.
+     Swim back with **W** and turn with **A / D**.
    - **E** at the yellow posts on each platform teleports there, once unlocked.
    - Anything that didn't work is explained in Output, starting with `[TestKit]`.
 4. Use **Test → Clients and Servers** with 2+ players to test together.
@@ -126,24 +128,25 @@ ReplicatedStorage
       DockService         DockServiceClient, DockServiceShared
       FartService         FartServiceClient, FartServiceShared, FartPhysics
       ObstacleService     ObstacleServiceShared
+      OverboardService    OverboardServiceClient, OverboardServiceShared
       RiderService        RiderServiceClient, RiderServiceShared, RiderSpots
     Classes
     Modules
       Core                Attributes, Remotes
       Game                BoatConfig, CameraConfig, CheckpointConfig, DataConfig, DockConfig,
-                          FartConfig, ObstacleConfig, RiderConfig, WaterConfig
+                          FartConfig, ObstacleConfig, OverboardConfig, RiderConfig, WaterConfig
       Math                Cycle, Geometry
       Platform
   Assets                you build everything in here
     Boats                 boat templates
     Obstacles             obstacle templates (see Obstacles)
-    VFX                   FartCloud (a ParticleEmitter)
+    VFX                   FartCloud, Dazed (ParticleEmitters)
     Sounds
       Farts               fart Sounds
   UI                      top-level UI initializer
     HUD
     Menus
-  Packages                Signal, TableUtil
+  Packages                RigPose, Signal, TableUtil
 
 ServerScriptService
   Server                  startup script
@@ -154,9 +157,10 @@ ServerScriptService
     DockService           DockServiceServer
     FartService           FartServiceServer
     ObstacleService       ObstacleServiceServer
+    OverboardService      OverboardServiceServer
     RiderService          RiderServiceServer
     WaterService          WaterServiceServer
-  Classes                 Boat, Dock, Hull, Location
+  Classes                 Boat, Dock, Hull, Location, Ragdoll, Swimmer
     Obstacles             ObstacleRig, Spinner, Swinger, Slider, WindFan
 
 StarterPlayer.StarterPlayerScripts
@@ -196,6 +200,8 @@ Workspace
    farts, the water under it and the wind from any fans (see *How boats move*). A boat
    that **falls off** the river or is **popped** by a hazard freezes for `WIPE_DELAY`,
    then it's removed and its crew goes back to their checkpoint to spawn a new boat.
+   A rider that something solid hits is **knocked off**: they're still in the crew, and
+   have to swim back (see *Getting knocked off*).
 6. When a boat on the river enters a checkpoint's **Zone**, that checkpoint and every
    one before it are **unlocked** and saved for everyone aboard. From then on they
    respawn there.
@@ -213,6 +219,8 @@ Every number is in the config modules in `ReplicatedStorage.Shared.Modules.Game`
 | Fart | `W`, `↑`, `Space` | `RT` | farts straight out behind you: pushes the boat the way you face |
 | Slide left | `A`, `←`, `Q` | `LB`, left stick left | slides you left round the edge of the boat |
 | Slide right | `D`, `→`, `E` | `RB`, left stick right | slides you right round the edge of the boat |
+| Swim (knocked off) | `W`, `↑`, `Space` | `RT` | farts you forward, the way you face |
+| Turn (knocked off) | `A` / `D`, `←` / `→`, `Q` / `E` | `LB` / `RB`, left stick | turns you left / right while you swim |
 
 Riders **hang on to the outside of the raft**, arms over the side and legs kicking in the
 water, facing its middle, and **fart straight off it**. A fart pushes the boat from where
@@ -256,6 +264,38 @@ farting always pushes the boat up your screen. It bobs gently with the boat and 
 hard bumps and splashes.
 `V` (or `Y` on a controller) switches to the normal camera.
 Touch devices need on-screen buttons, which are UI, so they come with the menus.
+
+## Getting knocked off
+
+Riders hang off the outside of the raft, so they're the first thing to hit anything.
+**Anything solid that hits a rider hard enough knocks them off**: a swinging door, a gate
+coming down, a wall or a rock you ram, an obstacle's post. It counts when it's coming at
+them at `KNOCK_OFF_SPEED` (7 studs/s) or more, compared to how they're moving, so
+sliding along a wall doesn't knock you off but running into one does. Spikes and other
+`Hazard` parts still pop the whole boat instead. Only parts count: Terrain doesn't knock
+riders off, so build rocks and walls you want to be dangerous out of parts. **OverboardService** runs it all on the
+server, and every number is in `OverboardConfig`.
+
+1. **Knocked off:** you fly off what hit you, up and away from the boat, tumbling. Your
+   seat is kept for you and you're still in the crew. The boat gets lighter.
+2. **Knocked out:** you're a limp ragdoll floating in the water for 3 seconds
+   (`KNOCKOUT_TIME`), with a dazed effect over your head. Currents carry you off.
+3. **Swimming:** you come round facing your boat. **Fart to swim** (`W`, same gas, same
+   build-up, at half the push: `FART_PUSH_SCALE`) the way you face, and **turn with A / D**
+   (or the arrows, Q / E, LB / RB, the left stick). Swimmers top out at 14 studs/s
+   (`TOP_SPEED`), slower than a boat, so the crew may need to slow down or come back for you.
+   The camera sits behind you, so farting pushes you up the screen.
+4. **Back aboard:** swim to within 3 studs (`GRAB_DISTANCE`) of **your own stretch** of
+   your boat's edge and you grab straight back on, there. You can't be knocked off again
+   for 1.5 seconds (`REBOARD_GRACE_TIME`).
+
+If you're not back aboard within 30 seconds of coming round (`SWIM_TIME_LIMIT`), or you
+fall off the river, you're out of the crew and go back to your checkpoint; your crew
+carries on without you. If the boat is wiped or finishes while you're swimming, you go
+with the rest of the crew.
+
+Swimmers bump into the map and get shoved by moving obstacles, but pass through boats
+and each other. The server runs their physics, so where everyone is stays its call.
 
 ## How boats move
 
@@ -359,7 +399,9 @@ Workspace
 Obstacles are built by hand (or from templates) and run by **ObstacleService** on the
 server. The moving ones are driven by physics constraints the server runs, so they shove
 boats properly, nothing can stop them, and they move smoothly for every player. Their
-moving parts hit boats but pass through the map, riders and each other.
+moving parts hit boats and shove swimmers, but pass through the map, riders and each
+other. Anything that isn't a hazard knocks riders off when it hits them (see *Getting
+knocked off*).
 
 | Kind | What it does | For example |
 | ---- | ------------ | ----------- |
@@ -459,6 +501,12 @@ EmissionDirection to Back), straight out behind them, off the raft.
 over hand as they slide, legs kicking), so it needs no animation assets and works for R15
 and R6. Its angles are in `RiderConfig`.
 
+**Knocked off:** `ReplicatedStorage.Assets.VFX.Dazed` is a ParticleEmitter shown over a
+knocked-out player's head (the test kit makes yellow sparkles until you make your own).
+The ragdoll is physics. Swimmers are posed in code too, doggy-paddling (leaning forward,
+arms paddling, legs kicking); their angles are in `OverboardConfig`. Their farts come out
+of the same butt attachment.
+
 ## For the UI (to be built by hand)
 
 The client halves have everything the menus need:
@@ -481,6 +529,10 @@ The client halves have everything the menus need:
 | Farting on and off (e.g. button glow) | `FartServiceClient.FartStarted` and `FartStopped` |
 | RIP screen | `BoatServiceClient.BoatWiped` fires with why: `"Fell"` off the river or `"Popped"` by a hazard |
 | A fan is blowing (e.g. a warning) | the WindFan Model's `Blowing` attribute |
+| Knocked off / swimming / back aboard | `OverboardServiceClient.StateChanged` fires `("KnockedOut")`, `("Swimming")` or `(nil)`; any player's state is their `Overboard` attribute |
+| "Waking up in..." / "Get back aboard in..." | `OverboardServiceClient:GetSecondsUntilWake()` and `GetSecondsUntilGiveUp()` (from the player's `WakeTime` and `GiveUpTime` attributes) |
+| "You got left behind" | `OverboardServiceClient.LeftBehind` fires with why: `"TooLong"` or `"Fell"` |
+| Touch turn buttons (swimming) | call `OverboardServiceClient:PressTurn("Left")` (or `"Right"`) on press and `ReleaseTurn` on release; the fart button swims |
 
 ## Saving
 

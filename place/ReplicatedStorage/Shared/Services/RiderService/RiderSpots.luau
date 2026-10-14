@@ -74,6 +74,20 @@ function RiderSpots.GetSeatWeldC0(spot: RiderSpot, angle: number): CFrame
 	return spot.SeatCFrame:Inverse() * CFrame.Angles(0, angle, 0) * spot.HangCFrame
 end
 
+-- The slide angle along `spot`'s stretch of the edge that hangs a rider closest to
+-- `position` (in the PrimaryPart's space), and how far (studs) `position` is from where
+-- that would hang them. Used to grab back on after being knocked off.
+function RiderSpots.GetClosestSlide(spot: RiderSpot, position: Vector3): (number, number)
+	local seatAngle = math.atan2(spot.HangCFrame.X, spot.HangCFrame.Z)
+	local angle = RiderSpots.GetAngleDifference(seatAngle, math.atan2(position.X, position.Z))
+	local minAngle, maxAngle = spot.MinAngle, spot.MaxAngle
+	if minAngle and maxAngle then
+		angle = math.clamp(angle, minAngle, maxAngle)
+	end
+	local hangPosition = (CFrame.Angles(0, angle, 0) * spot.HangCFrame).Position
+	return angle, (position - hangPosition).Magnitude
+end
+
 -- The shortest way round from angle `from` to angle `to` (radians, -pi to pi).
 function RiderSpots.GetAngleDifference(from: number, to: number): number
 	return (to - from + math.pi) % FULL_TURN - math.pi

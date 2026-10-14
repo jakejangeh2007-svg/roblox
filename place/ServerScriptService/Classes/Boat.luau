@@ -16,6 +16,8 @@
 -- getting from their seat halfway to the next seat each way (a lone seat gets the whole
 -- way round). RiderService moves them. They weigh what they weigh, but while they're on
 -- a boat they don't bump into anything, so only the hull touches the world.
+-- A rider knocked off on the river (OverboardService) is still part of the crew, and
+-- their seat is kept for them until they swim back and grab on again, or give up.
 --
 -- Template contract (a Model built by hand, with no scripts inside):
 --   PrimaryPart   must be set: a flat part in the middle of the boat, at the height the
@@ -59,6 +61,8 @@ type BoatMembers = {
 	RiderSpots: { [BasePart]: RiderSpots.RiderSpot }, -- where each seat's rider hangs on and can slide
 	RiderSlides: { [Seat]: number }, -- how far round the edge each seat's rider has slid (radians)
 	RiderParts: { [Player]: { [BasePart]: string } }, -- each rider's body parts and the collision group to put back
+	Overboard: { [Player]: Seat }, -- crew knocked off on the river, and the seat kept for each of them
+	Reboarding: { [Seat]: Player }, -- who is grabbing back on at each seat right now
 	LaunchCFrame: CFrame,
 	LastCheckpointIndex: number, -- the location it launched from, then each checkpoint it reaches
 	JoinDeadline: number, -- server time the join timer runs out
@@ -177,6 +181,8 @@ function Boat.new(
 			RiderSpots = {},
 			RiderSlides = {},
 			RiderParts = {},
+			Overboard = {},
+			Reboarding = {},
 			LaunchCFrame = launchCFrame,
 			LastCheckpointIndex = startIndex,
 			JoinDeadline = workspace:GetServerTimeNow() + BoatConfig.JOIN_TIME,
@@ -221,13 +227,13 @@ function Boat.new(
 			end)
 		)
 		-- Roblox welds a rider to their seat when they sit; once it has, move them to
-		-- hang on outside it.
+		-- hang on outside it, where OnSeatChanged put them.
 		table.insert(
 			self.Connections,
 			seat.ChildAdded:Connect(function(child)
 				if child.Name == "SeatWeld" then
 					task.defer(function()
-						self:SetRiderSlide(seat, 0)
+						self:SetRiderSlide(seat, self:GetRiderSlide(seat))
 					end)
 				end
 			end)
@@ -309,15 +315,20 @@ function Boat.OnSeatChanged(self: Boat, seat: Seat)
 	local isLaunched = self.State == "Launched"
 	local humanoid = seat.Occupant
 	local rider = GetPlayerInSeat(seat)
-	if humanoid and (isLaunched or not rider) then
-		-- Only players ride, and nobody climbs aboard after launch.
+	local isReboarding = rider ~= nil and self.Reboarding[seat] == rider
+	self.Reboarding[seat] = nil
+	if humanoid and ((isLaunched and not isReboarding) or not rider) then
+		-- Only players ride, and nobody climbs aboard after launch (apart from crew
+		-- grabbing back on after being knocked off).
 		EjectFromSeat(seat)
 		return
 	end
 	if rider then
 		self.SeatRiders[seat] = rider
 		self:PrepareRider(rider)
-		self:SetRiderSlide(seat, 0)
+		-- Someone grabbing back on was put where they grabbed (by Reboard); anyone else
+		-- starts at their seat.
+		self:SetRiderSlide(seat, if isReboarding then self:GetRiderSlide(seat) else 0)
 	end
 
 	if isLaunched then
@@ -486,12 +497,68 @@ function Boat.Freeze(self: Boat)
 	end
 end
 
--- After launch: anyone in the crew who is no longer seated has left the boat.
+-- Knocks `player` off this boat on the river: they let go, but stay in the crew, and
+-- their seat is kept for them. Returns that seat, or nil if they weren't hanging on here.
+function Boat.KnockOff(self: Boat, player: Player): Seat?
+	local seat = self:GetSeatOf(player)
+	if self.State ~= "Launched" or not seat then
+		return nil
+	end
+	self.Overboard[player] = seat
+	self.SeatRiders[seat] = nil
+	self:ReleaseRider(player)
+	EjectFromSeat(seat)
+	return seat
+end
+
+-- Whether `player` is in the crew but knocked off.
+function Boat.IsOverboard(self: Boat, player: Player): boolean
+	return if self.Overboard[player] then true else false
+end
+
+-- The seat kept for `player` while they're knocked off, if they are.
+function Boat.GetOverboardSeat(self: Boat, player: Player): Seat?
+	return self.Overboard[player]
+end
+
+-- Puts knocked-off `player` back on at their seat, `angle` radians round the edge from it
+-- (see RiderSpots). Returns false if they can't grab on (they aren't overboard, the boat
+-- isn't floating, or their character isn't alive).
+function Boat.Reboard(self: Boat, player: Player, angle: number): boolean
+	local seat = self.Overboard[player]
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	if not seat or not self:IsFloating() or seat.Occupant or not humanoid or humanoid.Health <= 0 then
+		return false
+	end
+	self.Overboard[player] = nil
+	self.Reboarding[seat] = player
+	self.RiderSlides[seat] = angle
+	seat:Sit(humanoid)
+	if not seat:FindFirstChild("SeatWeld") then
+		-- Roblox wouldn't sit them: they're still overboard.
+		self.Reboarding[seat] = nil
+		self.Overboard[player] = seat
+		return false
+	end
+	return true
+end
+
+-- Takes knocked-off `player` out of the crew (they gave up, or fell off the river).
+function Boat.RemoveFromCrew(self: Boat, player: Player)
+	if self.Overboard[player] then
+		self.Overboard[player] = nil
+		self:RemoveMissingCrew()
+	end
+end
+
+-- After launch: anyone in the crew who is no longer seated, and wasn't knocked off, has
+-- left the boat.
 function Boat.RemoveMissingCrew(self: Boat)
 	local seatedPlayers = self:GetSeatedPlayers()
 	for index = #self.Crew, 1, -1 do
 		local player = self.Crew[index]
-		if not table.find(seatedPlayers, player) then
+		if not table.find(seatedPlayers, player) and not self.Overboard[player] then
 			table.remove(self.Crew, index)
 			self.CrewMemberLeft:Fire(player)
 		end
@@ -517,6 +584,8 @@ function Boat.Destroy(self: Boat)
 		self:ReleaseRider(player)
 	end
 	table.clear(self.SeatRiders)
+	table.clear(self.Overboard)
+	table.clear(self.Reboarding)
 	if wasLaunched then
 		for _, player in self.Crew do
 			self.CrewMemberLeft:Fire(player)
